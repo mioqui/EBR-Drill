@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("EBR Drill Analytics")
-st.caption("Sandvik iSURE® Round Report Analysis · El Brocal")
+st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v14.4")
 
 st.info(
     "Carga uno o varios reportes PDF de iSURE®. "
@@ -90,8 +90,16 @@ st.markdown(
 # FUNCIONES AUXILIARES
 # ==========================================================
 
+CACHE_SCHEMA_VERSION = "v14_4_compact_header"
+
+
 def hash_archivo(uploaded_file) -> str:
-    return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+    contenido = uploaded_file.getvalue()
+
+    return hashlib.sha256(
+        contenido
+        + CACHE_SCHEMA_VERSION.encode("utf-8")
+    ).hexdigest()
 
 
 def crear_excel(
@@ -243,6 +251,27 @@ def fmt_pct(valor):
     if valor is None or pd.isna(valor):
         return "-"
     return f"{valor:.1f}%"
+
+
+def clasificar_tipo_disparo(barrenos_realizados):
+    """
+    Clasificación operativa por número de barrenos realizados:
+
+    FRENTE: >= 45
+    SELLADA: 25 a 44
+    ESTOCADA Y/O CORRECCIONES: < 25
+    """
+    if barrenos_realizados is None or pd.isna(barrenos_realizados):
+        return "SIN CLASIFICAR"
+
+    n = int(barrenos_realizados)
+
+    if n >= 45:
+        return "FRENTE"
+    elif n >= 25:
+        return "SELLADA"
+    else:
+        return "ESTOCADA Y/O CORRECCIONES"
 
 
 def calcular_kpi_movimiento_desde_brazos(
@@ -402,13 +431,27 @@ def anotar_puntos_sin_solape(
     df_plot,
     x_col,
     y_col,
+    etiqueta_extra_col=None,
 ):
     """
     Anota todos los puntos alternando arriba/abajo.
     Si detecta valores muy cercanos, aumenta el desplazamiento.
     """
+    columnas_puntos = [
+        x_col,
+        y_col,
+    ]
+
+    if (
+        etiqueta_extra_col
+        and etiqueta_extra_col in df_plot.columns
+    ):
+        columnas_puntos.append(
+            etiqueta_extra_col
+        )
+
     puntos = df_plot[
-        [x_col, y_col]
+        columnas_puntos
     ].copy()
 
     for i, fila in enumerate(
@@ -424,6 +467,25 @@ def anotar_puntos_sin_solape(
             fila,
             y_col
         )
+
+        texto_etiqueta = f"{y:.1f}%"
+
+        if (
+            etiqueta_extra_col
+            and etiqueta_extra_col in puntos.columns
+        ):
+            valor_extra = getattr(
+                fila,
+                etiqueta_extra_col
+            )
+
+            if (
+                valor_extra is not None
+                and not pd.isna(valor_extra)
+            ):
+                texto_etiqueta += (
+                    f"\n{int(valor_extra)} tal."
+                )
 
         offset_y = (
             10
@@ -469,7 +531,7 @@ def anotar_puntos_sin_solape(
             )
 
         ax.annotate(
-            f"{y:.1f}%",
+            texto_etiqueta,
             xy=(x, y),
             xytext=(0, offset_y),
             textcoords="offset points",
@@ -499,6 +561,11 @@ def generar_grafico_tendencia_automatico(
     df_auto: pd.DataFrame,
 ):
     df_plot = df_auto.copy()
+
+    if "Considerado_KPI_Automatizacion" in df_plot.columns:
+        df_plot = df_plot[
+            df_plot["Considerado_KPI_Automatizacion"] == True
+        ].copy()
 
     df_plot = df_plot[
         df_plot[
@@ -650,6 +717,7 @@ def generar_grafico_tendencia_automatico(
             grupo,
             "X",
             "Pct_Movimiento_Automatico_Brazos",
+            etiqueta_extra_col="Barrenos_Realizados",
         )
 
     aplicar_formato_eje_fechas(
@@ -785,8 +853,9 @@ def generar_grafico_tendencia_automatico(
         0.5,
         0.018,
         (
-            "Nota: el porcentaje global del Jumbo se calcula a partir de los tiempos "
-            "individuales de ambos brazos: Σ(Auto B1 + Auto B2) / "
+            "Nota: el KPI considera solo disparos FRENTE (>=45 barrenos). "
+            "El porcentaje global del Jumbo se calcula con los tiempos individuales "
+            "de ambos brazos: Σ(Auto B1 + Auto B2) / "
             "Σ(Auto B1 + Auto B2 + Manual B1 + Manual B2) × 100."
         ),
         ha="center",
@@ -823,6 +892,11 @@ def generar_grafico_brazos_por_jumbo(
     df_plot = df_auto[
         df_auto["Jumbo"] == jumbo
     ].copy()
+
+    if "Considerado_KPI_Automatizacion" in df_plot.columns:
+        df_plot = df_plot[
+            df_plot["Considerado_KPI_Automatizacion"] == True
+        ].copy()
 
     df_plot = df_plot[
         df_plot[
@@ -937,6 +1011,7 @@ def generar_grafico_brazos_por_jumbo(
             grupo,
             "X",
             columna,
+            etiqueta_extra_col="Barrenos_Realizados",
         )
 
     aplicar_formato_eje_fechas(
@@ -1180,9 +1255,9 @@ def generar_grafico_brazos_por_jumbo(
         0.5,
         0.018,
         (
-            "Nota: el porcentaje global por brazo está ponderado por "
-            "sus minutos de movimiento: Σ Automático / "
-            "(Σ Automático + Σ Manual) × 100."
+            "Nota: el KPI considera solo disparos FRENTE (>=45 barrenos). "
+            "El porcentaje global por brazo está ponderado por sus minutos de movimiento: "
+            "Σ Automático / (Σ Automático + Σ Manual) × 100."
         ),
         ha="center",
         va="bottom",
@@ -1299,6 +1374,10 @@ def guardar_resultado_en_cache(
                 ],
             "png_bytes":
                 png_bytes,
+            "plano_nav_png":
+                resultado.get(
+                    "plano_nav_png"
+                ),
             "nombre_png":
                 nombre_png,
             "error":
@@ -1477,9 +1556,23 @@ if archivos:
             "png_bytes"
         ]
 
+        # Imagen del plano de navegación extraída de la
+        # primera página del reporte iSURE.
+        plano_nav_png = resultado.get(
+            "plano_nav_png"
+        )
+
         nombre_png = resultado[
             "nombre_png"
         ]
+
+        # Asignación defensiva del plano de navegación.
+        # Se repite aquí para evitar cualquier variable sin definir
+        # incluso si cambia la estructura previa del resultado/cache.
+        plano_nav_png = resultado.get(
+            "plano_nav_png",
+            None,
+        )
 
         titulo_expander = (
             f"{metadata['Jumbo']} | "
@@ -1492,115 +1585,192 @@ if archivos:
             titulo_expander,
             expanded=False,
         ):
-            c1, c2, c3, c4 = (
-                st.columns(
-                    4
+            # ==================================================
+            # CABECERA COMPACTA
+            # La información continúa en la columna izquierda
+            # mientras el plano de navegación ocupa la derecha.
+            # Esto evita que la altura de la miniatura genere
+            # un gran espacio vacío antes de la clasificación.
+            # ==================================================
+
+            col_info, col_plano = st.columns(
+                [4.6, 1.25],
+                gap="medium",
+            )
+
+            with col_info:
+                c1, c2, c3, c4 = st.columns(
+                    [1.0, 1.0, 0.85, 1.0]
                 )
-            )
 
-            c1.metric(
-                "Jumbo",
-                metadata[
-                    "Jumbo"
-                ]
-                or "-",
-            )
+                c1.metric(
+                    "Jumbo",
+                    metadata[
+                        "Jumbo"
+                    ]
+                    or "-",
+                )
 
-            c2.metric(
-                "Nº de serie",
-                metadata[
-                    "Numero_Serie"
-                ]
-                or "-",
-            )
+                c2.metric(
+                    "Nº de serie",
+                    metadata[
+                        "Numero_Serie"
+                    ]
+                    or "-",
+                )
 
-            c3.metric(
-                "Ciclo",
-                metadata[
-                    "Ciclo"
-                ]
-                or "-",
-            )
+                c3.metric(
+                    "Ciclo",
+                    metadata[
+                        "Ciclo"
+                    ]
+                    or "-",
+                )
 
-            c4.metric(
-                "Metros perforados",
+                c4.metric(
+                    "Metros perforados",
+                    (
+                        f"{metadata['Metros_Perforados']:.2f} m"
+                        if metadata[
+                            "Metros_Perforados"
+                        ]
+                        is not None
+                        else "-"
+                    ),
+                )
+
+                barrenos_realizados = metadata.get(
+                    "Barrenos_Realizados"
+                )
+
+                tipo_disparo = clasificar_tipo_disparo(
+                    barrenos_realizados
+                )
+
+                considerado_kpi = (
+                    tipo_disparo == "FRENTE"
+                )
+
+                st.markdown(
+                    "#### Clasificación del disparo"
+                )
+
+                d1, d2, d3 = st.columns(
+                    [1.15, 1.0, 1.0]
+                )
+
+                d1.metric(
+                    "Tipo de disparo",
+                    tipo_disparo,
+                )
+
+                d2.metric(
+                    "Barrenos realizados",
+                    (
+                        int(barrenos_realizados)
+                        if barrenos_realizados is not None
+                        else "-"
+                    ),
+                )
+
+                d3.metric(
+                    "Considerado en KPI Auto",
+                    "Sí" if considerado_kpi else "No",
+                )
+
+                fuente_barrenos = metadata.get(
+                    "Fuente_Barrenos_Realizados"
+                )
+
+                if fuente_barrenos:
+                    st.caption(
+                        f"Fuente del número de barrenos: {fuente_barrenos}. "
+                        "Para la clasificación se excluyen los barrenos Reaming."
+                    )
+
+                st.markdown(
+                    "#### Uso automático del movimiento de brazos"
+                )
+
+                m1, m2, m3, m4 = st.columns(
+                    [1.0, 1.0, 1.0, 1.0]
+                )
+
                 (
-                    f"{metadata['Metros_Perforados']:.2f} m"
-                    if metadata[
-                        "Metros_Perforados"
-                    ]
-                    is not None
-                    else "-"
-                ),
-            )
-
-            st.markdown(
-                "#### Uso automático del movimiento de brazos"
-            )
-
-            m1, m2, m3, m4 = (
-                st.columns(
-                    4
+                    auto_brazos_min,
+                    manual_brazos_min,
+                    pct_auto_brazos,
+                    pct_manual_brazos,
+                ) = calcular_kpi_movimiento_desde_brazos(
+                    movimiento[
+                        "Auto_Brazo1_min"
+                    ],
+                    movimiento[
+                        "Auto_Brazo2_min"
+                    ],
+                    movimiento[
+                        "Manual_Brazo1_min"
+                    ],
+                    movimiento[
+                        "Manual_Brazo2_min"
+                    ],
                 )
-            )
 
-            (
-                auto_brazos_min,
-                manual_brazos_min,
-                pct_auto_brazos,
-                pct_manual_brazos,
-            ) = calcular_kpi_movimiento_desde_brazos(
-                movimiento[
-                    "Auto_Brazo1_min"
-                ],
-                movimiento[
-                    "Auto_Brazo2_min"
-                ],
-                movimiento[
-                    "Manual_Brazo1_min"
-                ],
-                movimiento[
-                    "Manual_Brazo2_min"
-                ],
-            )
+                m1.metric(
+                    "Movimiento automático",
+                    fmt_pct(
+                        pct_auto_brazos
+                    ),
+                )
 
-            m1.metric(
-                "Movimiento automático",
-                fmt_pct(
-                    pct_auto_brazos
-                ),
-            )
+                m2.metric(
+                    "Movimiento manual",
+                    fmt_pct(
+                        pct_manual_brazos
+                    ),
+                )
 
-            m2.metric(
-                "Movimiento manual",
-                fmt_pct(
-                    pct_manual_brazos
-                ),
-            )
+                m3.metric(
+                    "Brazo 1 automático",
+                    fmt_pct(
+                        movimiento[
+                            "Pct_Automatico_Brazo1"
+                        ]
+                    ),
+                )
 
-            m3.metric(
-                "Brazo 1 automático",
-                fmt_pct(
-                    movimiento[
-                        "Pct_Automatico_Brazo1"
-                    ]
-                ),
-            )
+                m4.metric(
+                    "Brazo 2 automático",
+                    fmt_pct(
+                        movimiento[
+                            "Pct_Automatico_Brazo2"
+                        ]
+                    ),
+                )
 
-            m4.metric(
-                "Brazo 2 automático",
-                fmt_pct(
-                    movimiento[
-                        "Pct_Automatico_Brazo2"
-                    ]
-                ),
-            )
+                st.caption(
+                    "Base de cálculo reconciliada: tiempos individuales de ambos brazos. "
+                    "% Auto = (Auto B1 + Auto B2) / "
+                    "(Auto B1 + Auto B2 + Manual B1 + Manual B2). "
+                    "Los gráficos y KPI consolidados consideran únicamente "
+                    "disparos FRENTE (>=45 barrenos)."
+                )
 
-            st.caption(
-                "Base de cálculo reconciliada: tiempos individuales de ambos brazos. "
-                "% Auto = (Auto B1 + Auto B2) / "
-                "(Auto B1 + Auto B2 + Manual B1 + Manual B2)."
-            )
+                if not considerado_kpi:
+                    st.info(
+                        f"Este reporte está clasificado como {tipo_disparo} "
+                        f"({barrenos_realizados if barrenos_realizados is not None else '-'} barrenos) "
+                        "y no se considera en el KPI consolidado de automatización."
+                    )
+
+            with col_plano:
+                if plano_nav_png is not None:
+                    st.image(
+                        plano_nav_png,
+                        use_container_width=True,
+                    )
+                else:
+                    st.empty()
 
             st.image(
                 png_bytes,
@@ -1747,6 +1917,8 @@ if archivos:
             "Jumbo",
             "Numero_Serie",
             "Ciclo",
+            "Barrenos_Realizados",
+            "Fuente_Barrenos_Realizados",
             "Auto_Brazo1_min",
             "Auto_Brazo2_min",
             "Auto_Total_min",
@@ -1771,6 +1943,35 @@ if archivos:
                 ]
             ].copy()
         )
+
+        # --------------------------------------------------
+        # CLASIFICACIÓN DEL TIPO DE DISPARO
+        # --------------------------------------------------
+
+        if "Barrenos_Realizados" in df_automatico.columns:
+            df_automatico[
+                "Tipo_Disparo"
+            ] = df_automatico[
+                "Barrenos_Realizados"
+            ].apply(
+                clasificar_tipo_disparo
+            )
+
+            df_automatico[
+                "Considerado_KPI_Automatizacion"
+            ] = (
+                df_automatico[
+                    "Tipo_Disparo"
+                ] == "FRENTE"
+            )
+        else:
+            df_automatico[
+                "Tipo_Disparo"
+            ] = "SIN CLASIFICAR"
+
+            df_automatico[
+                "Considerado_KPI_Automatizacion"
+            ] = False
 
         # --------------------------------------------------
         # KPI RECONCILIADO DESDE LOS TIEMPOS DE LOS BRAZOS
@@ -2004,6 +2205,32 @@ if archivos:
         # --------------------------------------------------
 
         st.markdown(
+            "#### Clasificación de disparos"
+        )
+
+        if "Tipo_Disparo" in df_automatico.columns:
+            resumen_disparos = (
+                df_automatico[
+                    "Tipo_Disparo"
+                ]
+                .value_counts(
+                    dropna=False
+                )
+                .rename_axis(
+                    "Tipo_Disparo"
+                )
+                .reset_index(
+                    name="N_Reportes"
+                )
+            )
+
+            st.dataframe(
+                resumen_disparos,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown(
             "#### Uso automático por ciclo"
         )
 
@@ -2014,6 +2241,10 @@ if archivos:
                 "Fecha_Inicio",
                 "Jumbo",
                 "Ciclo",
+                "Barrenos_Realizados",
+                "Fuente_Barrenos_Realizados",
+                "Tipo_Disparo",
+                "Considerado_KPI_Automatizacion",
                 "Auto_Total_Brazos_min",
                 "Manual_Total_Brazos_min",
                 "Pct_Movimiento_Automatico_Brazos",

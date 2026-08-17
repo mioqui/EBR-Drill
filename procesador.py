@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from io import BytesIO
 import math
 import re
 from typing import Dict, List, Tuple, Optional
@@ -60,47 +61,132 @@ def leer_metadatos(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict
         "Metros_Perforados": None,
         "Barrenos_Realizados": None,
         "Barrenos_Planificados": None,
+        "Fuente_Barrenos_Realizados": None,
     }
 
-    with pdfplumber.open(pdf_path) as pdf:
-        texto = pdf.pages[0].extract_text() or ""
+    textos_paginas = []
 
-    m = re.search(r"Ciclo\s+(\d+)", texto, re.IGNORECASE)
+    with pdfplumber.open(pdf_path) as pdf:
+        for pagina in pdf.pages[:4]:
+            textos_paginas.append(
+                pagina.extract_text() or ""
+            )
+
+    texto = "\n".join(textos_paginas)
+    texto_normalizado = re.sub(
+        r"\s+",
+        " ",
+        texto,
+    )
+
+    m = re.search(
+        r"Ciclo\s*:?\s*(\d+)",
+        texto_normalizado,
+        re.IGNORECASE,
+    )
     if m:
         datos["Ciclo"] = int(m.group(1))
 
-    m = re.search(r"N[º°o]?\s*de\s*serie\s+([A-Za-z0-9-]+)", texto, re.IGNORECASE)
+    m = re.search(
+        r"N[º°o]?\s*de\s*serie\s*:?\s*([A-Za-z0-9-]+)",
+        texto_normalizado,
+        re.IGNORECASE,
+    )
     if m:
-        serie_base = _normalizar_serie(m.group(1))
+        serie_base = _normalizar_serie(
+            m.group(1)
+        )
         datos["Numero_Serie"] = serie_base
-        datos["Jumbo"] = identificar_jumbo(serie_base)
+        datos["Jumbo"] = identificar_jumbo(
+            serie_base
+        )
 
-    m = re.search(r"Iniciado\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d{2}:\d{2}:\d{2})", texto, re.IGNORECASE)
+    m = re.search(
+        r"Iniciado\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",
+        texto_normalizado,
+        re.IGNORECASE,
+    )
     if m:
         datos["Fecha_Inicio"] = m.group(1)
         datos["Hora_Inicio"] = m.group(2)
 
-    m = re.search(r"Plan de perforación\s+([^\n]+)", texto, re.IGNORECASE)
-    if m:
-        plan = limpiar_texto(m.group(1))
-        plan = re.split(r"\s+Plan de bulonaje\b", plan, maxsplit=1, flags=re.IGNORECASE)[0]
-        datos["Plan_Perforacion"] = plan
-
-    m = re.search(r"Metros perforados\s*\[m\]\s*([0-9.]+)", texto, re.IGNORECASE)
-    if m:
-        datos["Metros_Perforados"] = float(m.group(1))
-
     m = re.search(
-        r"Barrenos de perforación\s+en frentes.*?Planificado:\s*(\d+).*?Realizado:\s*(\d+)",
-        texto,
-        re.IGNORECASE | re.DOTALL,
+        r"Plan\s+de\s+perforaci[oó]n\s*:?\s*(.+?)(?=\s+Plan\s+de\s+bulonaje\b|\s+Metros\s+perforados\b|$)",
+        texto_normalizado,
+        re.IGNORECASE,
     )
     if m:
-        datos["Barrenos_Planificados"] = int(m.group(1))
-        datos["Barrenos_Realizados"] = int(m.group(2))
+        datos["Plan_Perforacion"] = limpiar_texto(
+            m.group(1)
+        )
+
+    m = re.search(
+        r"Metros\s+perforados\s*\[m\]\s*:?\s*([0-9]+(?:\.[0-9]+)?)",
+        texto_normalizado,
+        re.IGNORECASE,
+    )
+    if m:
+        datos["Metros_Perforados"] = float(
+            m.group(1)
+        )
+
+    # ------------------------------------------------------
+    # Barrenos de perforación en frentes
+    # ------------------------------------------------------
+    # Se toleran saltos de línea y pequeñas variaciones
+    # en la extracción de texto de iSURE.
+    patrones_inicio = [
+        r"Barrenos?\s+de\s+perforaci[oó]n\s+en\s+frentes?",
+        r"Barrenos?\s+de\s+perforaci[oó]n.*?\bfrentes?\b",
+        r"Barrenos?.{0,80}\bfrentes?\b",
+    ]
+
+    bloque = None
+
+    for patron in patrones_inicio:
+        m_inicio = re.search(
+            patron,
+            texto_normalizado,
+            re.IGNORECASE,
+        )
+
+        if m_inicio:
+            bloque = texto_normalizado[
+                m_inicio.start():
+                m_inicio.start() + 800
+            ]
+            break
+
+    if bloque:
+        m_plan = re.search(
+            r"Planificad[oa]\s*:?\s*(\d+)",
+            bloque,
+            re.IGNORECASE,
+        )
+
+        m_real = re.search(
+            r"Realizad[oa]\s*:?\s*(\d+)",
+            bloque,
+            re.IGNORECASE,
+        )
+
+        if m_plan:
+            datos["Barrenos_Planificados"] = int(
+                m_plan.group(1)
+            )
+
+        if m_real:
+            datos["Barrenos_Realizados"] = int(
+                m_real.group(1)
+            )
+            datos[
+                "Fuente_Barrenos_Realizados"
+            ] = (
+                "Reporte iSURE - "
+                "barrenos de perforación en frentes"
+            )
 
     return datos
-
 
 def leer_movimiento_brazos(pdf_path: Path) -> Dict:
     resultado = {
@@ -450,6 +536,39 @@ def generar_grafico(df: pd.DataFrame, metadatos: Dict):
     return fig
 
 
+
+def extraer_plano_navegacion_png(pdf_path: Path, resolution: int = 170) -> Optional[bytes]:
+    """
+    Extrae de la primera hoja la imagen "Barrenos perforados, Plano de navegación"
+    para mostrarla como miniatura en la cabecera del reporte.
+
+    Se usa un recorte relativo porque la ubicación del plano es bastante
+    consistente en los reportes iSURE revisados.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                return None
+
+            page = pdf.pages[0]
+
+            bbox = (
+                page.width * 0.515,
+                page.height * 0.150,
+                page.width * 0.958,
+                page.height * 0.482,
+            )
+
+            recorte = page.crop(bbox)
+            imagen = recorte.to_image(resolution=resolution)
+
+            buffer = BytesIO()
+            imagen.save(buffer, format='PNG')
+            buffer.seek(0)
+            return buffer.getvalue()
+    except Exception:
+        return None
+
 def procesar_pdf(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
     metadatos = leer_metadatos(pdf_path, nombre_archivo=nombre_archivo)
     movimiento = leer_movimiento_brazos(pdf_path)
@@ -459,11 +578,27 @@ def procesar_pdf(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
     if df.empty:
         raise ValueError("No se encontraron barrenos ejecutados en la tabla de detalle.")
 
+    # Fallback para clasificación del disparo:
+    # si iSURE no expone claramente "Barrenos realizados en frentes",
+    # contar los barrenos ejecutados excluyendo Reaming.
+    if metadatos.get("Barrenos_Realizados") is None:
+        metadatos["Barrenos_Realizados"] = int(
+            (
+                df["Tipo"].astype(str)
+                != "Reaming"
+            ).sum()
+        )
+
+        metadatos[
+            "Fuente_Barrenos_Realizados"
+        ] = "Detalle extraído - excluye Reaming"
+
     validacion = construir_validacion(df, esperados, metadatos)
     resumen_ciclo = construir_resumen_ciclo(df, esperados, metadatos)
     resumen_reporte = construir_resumen_reporte(metadatos, esperados, df, pagina_tipos, paginas_detalle, movimiento)
     extras = df[df["Extra"]].copy()
     fig = generar_grafico(df, metadatos)
+    plano_nav_png = extraer_plano_navegacion_png(pdf_path)
 
     return {
         "metadata": metadatos,
@@ -475,4 +610,5 @@ def procesar_pdf(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
         "resumen_reporte": resumen_reporte,
         "extras": extras,
         "fig": fig,
+        "plano_nav_png": plano_nav_png,
     }
