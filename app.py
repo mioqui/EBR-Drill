@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("EBR Drill Analytics")
-st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v14.4")
+st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.3-Beeswarm")
 
 st.info(
     "Carga uno o varios reportes PDF de iSURE®. "
@@ -60,26 +60,25 @@ def limpiar_analisis():
 st.markdown(
     """
     <style>
-    [data-testid="stFileUploader"] {
-        font-size: 1rem;
-    }
-
-    [data-testid="stFileUploader"] button {
-        min-width: 44px !important;
-        min-height: 44px !important;
-        font-size: 1.15rem !important;
-        border-radius: 8px !important;
-    }
-
-    [data-testid="stFileUploader"] button svg {
-        width: 24px !important;
-        height: 24px !important;
-    }
-
-    [data-testid="stFileUploaderFile"] {
-        margin-right: 6px !important;
-        margin-bottom: 6px !important;
-    }
+    .block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; }
+    [data-testid="stFileUploader"] { font-size: 0.90rem; }
+    [data-testid="stFileUploader"] button { min-width: 40px !important; min-height: 40px !important; font-size: 1.0rem !important; border-radius: 8px !important; }
+    [data-testid="stFileUploader"] button svg { width: 21px !important; height: 21px !important; }
+    [data-testid="stFileUploaderFile"] { margin-right: 4px !important; margin-bottom: 4px !important; }
+    [data-testid="stExpander"] summary { font-size: 0.88rem !important; font-weight: 600 !important; padding-top: 0.35rem !important; padding-bottom: 0.35rem !important; }
+    [data-testid="stMetric"] { padding: 0.05rem 0 !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.72rem !important; line-height: 1.05 !important; margin-bottom: 0.06rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.20rem !important; line-height: 1.05 !important; font-weight: 600 !important; }
+    h1 { font-size: 1.70rem !important; margin-bottom: 0.2rem !important; }
+    h2 { font-size: 1.15rem !important; margin-top: 0.65rem !important; margin-bottom: 0.3rem !important; }
+    h3 { font-size: 0.98rem !important; margin-top: 0.50rem !important; margin-bottom: 0.22rem !important; }
+    h4 { font-size: 0.90rem !important; margin-top: 0.42rem !important; margin-bottom: 0.18rem !important; }
+    [data-testid="stCaptionContainer"] { font-size: 0.70rem !important; line-height: 1.20 !important; }
+    [data-testid="stAlert"] { padding: 0.42rem 0.60rem !important; font-size: 0.76rem !important; }
+    [data-testid="stDataFrame"] div[role="grid"] { font-size: 0.76rem !important; }
+    .stDownloadButton button, .stButton button { min-height: 2.05rem !important; padding: 0.30rem 0.65rem !important; font-size: 0.78rem !important; }
+    div[data-testid="stVerticalBlock"] > div { gap: 0.36rem !important; }
+    hr { margin-top: 0.30rem !important; margin-bottom: 0.40rem !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -90,7 +89,7 @@ st.markdown(
 # FUNCIONES AUXILIARES
 # ==========================================================
 
-CACHE_SCHEMA_VERSION = "v14_4_compact_header"
+CACHE_SCHEMA_VERSION = "v15_3_beeswarm"
 
 
 def hash_archivo(uploaded_file) -> str:
@@ -1651,9 +1650,7 @@ if archivos:
                     tipo_disparo == "FRENTE"
                 )
 
-                st.markdown(
-                    "#### Clasificación del disparo"
-                )
+                st.markdown("### Clasificación del disparo")
 
                 d1, d2, d3 = st.columns(
                     [1.15, 1.0, 1.0]
@@ -1688,9 +1685,7 @@ if archivos:
                         "Para la clasificación se excluyen los barrenos Reaming."
                     )
 
-                st.markdown(
-                    "#### Uso automático del movimiento de brazos"
-                )
+                st.markdown("### Uso automático del movimiento de brazos")
 
                 m1, m2, m3, m4 = st.columns(
                     [1.0, 1.0, 1.0, 1.0]
@@ -1772,10 +1767,15 @@ if archivos:
                 else:
                     st.empty()
 
-            st.image(
-                png_bytes,
-                use_container_width=True,
+            col_graf_izq, col_graf, col_graf_der = st.columns(
+                [0.08, 0.84, 0.08]
             )
+
+            with col_graf:
+                st.image(
+                    png_bytes,
+                    use_container_width=True,
+                )
 
             st.download_button(
                 label="Descargar gráfico PNG",
@@ -1786,65 +1786,61 @@ if archivos:
                 on_click="ignore",
             )
 
-            st.markdown(
-                "#### Validación"
-            )
-
-            st.dataframe(
-                validacion[
-                    [
-                        "Tipo",
-                        "Esperado",
-                        "Encontrado",
-                        "Diferencia",
-                        "Estado",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            if (
-                validacion[
-                    "Estado"
-                ]
-                == "REVISAR"
-            ).any():
-                st.warning(
-                    "Este ciclo presenta diferencias "
-                    "entre el resumen 'TIPOS DE BARRENO' "
-                    "y los barrenos extraídos."
-                )
-            else:
-                st.success(
-                    "La extracción reconcilia con el "
-                    "resumen 'TIPOS DE BARRENO'."
-                )
-
-            if not extras.empty:
-                st.markdown(
-                    "#### Barrenos extra"
-                )
-
-                columnas_extras = [
-                    col
-                    for col in [
-                        "ID",
-                        "Tipo",
-                        "Longitud_roca_m",
-                        "Beta_grados",
-                    ]
-                    if col
-                    in extras.columns
-                ]
-
+            with st.expander(
+                "Validación",
+                expanded=False,
+            ):
                 st.dataframe(
-                    extras[
-                        columnas_extras
+                    validacion[
+                        [
+                            "Tipo",
+                            "Esperado",
+                            "Encontrado",
+                            "Diferencia",
+                            "Estado",
+                        ]
                     ],
                     use_container_width=True,
                     hide_index=True,
+                    height=220,
                 )
+
+                if (validacion["Estado"] == "REVISAR").any():
+                    st.warning(
+                        "Este ciclo presenta diferencias entre el resumen "
+                        "'TIPOS DE BARRENO' y los barrenos extraídos."
+                    )
+                else:
+                    st.success(
+                        "La extracción reconcilia con el resumen 'TIPOS DE BARRENO'."
+                    )
+
+            with st.expander(
+                f"Barrenos extra ({len(extras)})",
+                expanded=False,
+            ):
+                if not extras.empty:
+                    columnas_extras = [
+                        col
+                        for col in [
+                            "ID",
+                            "Tipo",
+                            "Longitud_roca_m",
+                            "Beta_grados",
+                        ]
+                        if col in extras.columns
+                    ]
+
+                    st.dataframe(
+                        extras[columnas_extras],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=165,
+                    )
+                else:
+                    st.caption(
+                        "No se identificaron barrenos extra en este ciclo."
+                    )
 
     # ======================================================
     # CONSOLIDADO

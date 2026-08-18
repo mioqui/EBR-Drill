@@ -464,74 +464,407 @@ def construir_resumen_reporte(metadatos: Dict, esperados: Dict[str, int], df: pd
     }
 
 
+
+
 def generar_grafico(df: pd.DataFrame, metadatos: Dict):
+    """
+    Versión BEESWARM SIMPLE.
+
+    Los puntos se distribuyen horizontalmente solo cuando hay
+    riesgo de solape visual. La posición Y permanece intacta.
+
+    La lógica usa carriles simétricos:
+    0, +1, -1, +2, -2...
+    """
     if df.empty:
         raise ValueError("No hay datos para generar el gráfico.")
 
-    tipos_grafico = [tipo for tipo in ORDEN_TIPOS if not df[df["Tipo"] == tipo].empty]
-    fig, ax = plt.subplots(figsize=(14, 8))
-    datos_boxplot = [df.loc[df["Tipo"] == tipo, "Longitud_roca_m"].values for tipo in tipos_grafico]
+    tipos_grafico = [
+        tipo
+        for tipo in ORDEN_TIPOS
+        if not df[df["Tipo"] == tipo].empty
+    ]
+
+    fig, ax = plt.subplots(figsize=(10.8, 5.35), dpi=160)
+
+    datos_boxplot = [
+        df.loc[
+            df["Tipo"] == tipo,
+            "Longitud_roca_m",
+        ].values
+        for tipo in tipos_grafico
+    ]
 
     ax.boxplot(
         datos_boxplot,
-        tick_labels=[f"{tipo}\n(n={len(df[df['Tipo'] == tipo])})" for tipo in tipos_grafico],
-        widths=0.50,
+        tick_labels=[
+            f"{tipo}\n(n={len(df[df['Tipo'] == tipo])})"
+            for tipo in tipos_grafico
+        ],
+        widths=0.44,
         showmeans=False,
         showfliers=False,
         whis=(0, 100),
-        medianprops={"color": "tab:orange", "linewidth": 1.5},
-        boxprops={"color": "black"},
-        whiskerprops={"color": "black", "linewidth": 1.2},
-        capprops={"color": "black", "linewidth": 1.2},
+        medianprops={
+            "color": "tab:orange",
+            "linewidth": 1.5,
+        },
+        boxprops={
+            "color": "black",
+        },
+        whiskerprops={
+            "color": "black",
+            "linewidth": 1.0,
+        },
+        capprops={
+            "color": "black",
+            "linewidth": 1.0,
+        },
     )
 
-    for posicion, tipo in enumerate(tipos_grafico, start=1):
-        grupo = df[df["Tipo"] == tipo].copy()
-        for _, subgrupo in grupo.groupby("Longitud_roca_m", sort=True):
-            n = len(subgrupo)
-            offsets = [0.0] if n == 1 else np.linspace(-0.06, 0.06, n)
-            for offset, (_, fila) in zip(offsets, subgrupo.iterrows()):
-                x = posicion + offset
-                y = fila["Longitud_roca_m"]
-                if fila["Extra"]:
-                    ax.scatter(x, y, s=95, facecolor="yellow", edgecolor="black", linewidth=1.5, zorder=5)
-                    ax.annotate(f"{fila['ID']} extra", xy=(x, y), xytext=(8, 0), textcoords="offset points", va="center", fontsize=9)
-                else:
-                    ax.scatter(x, y, s=60, facecolor="black", edgecolor="gray", linewidth=0.8, zorder=4)
+    def carriles_beeswarm(
+        valores_y,
+        separacion_y,
+        paso_x=0.038,
+        max_x=0.16,
+    ):
+        """
+        Asigna un desplazamiento horizontal a cada Y evitando
+        que puntos cercanos queden en el mismo carril.
+        """
+        indices = np.argsort(
+            valores_y
+        )
 
-    for posicion, tipo in enumerate(tipos_grafico, start=1):
-        valores = df.loc[df["Tipo"] == tipo, "Longitud_roca_m"]
+        offsets = np.zeros(
+            len(valores_y),
+            dtype=float,
+        )
+
+        asignados = []
+
+        secuencia = [0]
+
+        for k in range(1, 20):
+            secuencia.extend(
+                [
+                    k,
+                    -k,
+                ]
+            )
+
+        for idx in indices:
+            y = valores_y[idx]
+
+            vecinos = [
+                (
+                    y_prev,
+                    lane_prev,
+                )
+                for (
+                    y_prev,
+                    lane_prev,
+                )
+                in asignados
+                if abs(
+                    y
+                    - y_prev
+                )
+                < separacion_y
+            ]
+
+            usados = {
+                lane_prev
+                for (
+                    _,
+                    lane_prev,
+                )
+                in vecinos
+            }
+
+            lane = next(
+                lane_candidate
+                for lane_candidate
+                in secuencia
+                if lane_candidate
+                not in usados
+            )
+
+            x_offset = (
+                lane
+                * paso_x
+            )
+
+            x_offset = max(
+                -max_x,
+                min(
+                    max_x,
+                    x_offset,
+                ),
+            )
+
+            offsets[idx] = (
+                x_offset
+            )
+
+            asignados.append(
+                (
+                    y,
+                    lane,
+                )
+            )
+
+        return offsets
+
+    min_global = df[
+        "Longitud_roca_m"
+    ].min()
+
+    max_global = df[
+        "Longitud_roca_m"
+    ].max()
+
+    rango_global = max(
+        0.5,
+        max_global
+        - min_global,
+    )
+
+    # Distancia vertical aproximada a partir de la cual
+    # visualmente los marcadores empiezan a tocarse.
+    separacion_y = max(
+        0.045,
+        rango_global * 0.017,
+    )
+
+    for posicion, tipo in enumerate(
+        tipos_grafico,
+        start=1,
+    ):
+        grupo = df[
+            df["Tipo"] == tipo
+        ].copy()
+
+        grupo = grupo.sort_values(
+            [
+                "Longitud_roca_m",
+                "Extra",
+                "ID",
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+        valores_y = grupo[
+            "Longitud_roca_m"
+        ].to_numpy(
+            dtype=float
+        )
+
+        offsets = carriles_beeswarm(
+            valores_y,
+            separacion_y=separacion_y,
+            paso_x=0.040,
+            max_x=0.16,
+        )
+
+        for i, fila in grupo.iterrows():
+            x = (
+                posicion
+                + offsets[i]
+            )
+
+            y = fila[
+                "Longitud_roca_m"
+            ]
+
+            if fila["Extra"]:
+                ax.scatter(
+                    x,
+                    y,
+                    s=58,
+                    facecolor="yellow",
+                    edgecolor=(
+                        0,
+                        0,
+                        0,
+                        0.90,
+                    ),
+                    linewidth=0.45,
+                    alpha=0.95,
+                    zorder=5,
+                )
+
+                ax.annotate(
+                    f"{fila['ID']} extra",
+                    xy=(x, y),
+                    xytext=(4, 0),
+                    textcoords="offset points",
+                    va="center",
+                    ha="left",
+                    fontsize=6.1,
+                    color="#2b2b2b",
+                )
+
+            else:
+                ax.scatter(
+                    x,
+                    y,
+                    s=38,
+                    facecolor=(
+                        0,
+                        0,
+                        0,
+                        0.58,
+                    ),
+                    edgecolor=(
+                        0.0,
+                        0.45,
+                        0.12,
+                        0.85,
+                    ),
+                    linewidth=0.35,
+                    zorder=4,
+                )
+
+    for posicion, tipo in enumerate(
+        tipos_grafico,
+        start=1,
+    ):
+        valores = df.loc[
+            df["Tipo"] == tipo,
+            "Longitud_roca_m",
+        ]
+
         ax.text(
             posicion,
             valores.max() + 0.08,
-            f"Min {valores.min():.2f} | Máx {valores.max():.2f}\nProm {valores.mean():.2f} | Med {valores.median():.2f}",
+            (
+                f"Min {valores.min():.2f} | "
+                f"Máx {valores.max():.2f}\n"
+                f"Prom {valores.mean():.2f} | "
+                f"Med {valores.median():.2f}"
+            ),
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=7.0,
         )
 
     leyenda = [
-        Line2D([0], [0], marker="o", linestyle="None", markersize=7, markerfacecolor="black", markeredgecolor="black", label="Punto: valor individual de cada barreno"),
-        Patch(facecolor="white", edgecolor="black", label="Caja: 50% central de los datos (Q1-Q3)"),
-        Line2D([0], [0], linestyle="-", linewidth=2, color="tab:orange", label="Línea dentro de la caja: mediana"),
-        Line2D([0], [0], linestyle="-", linewidth=1.2, color="black", label="Bigotes: mínimo y máximo real"),
-        Line2D([0], [0], marker="o", markerfacecolor="yellow", markeredgecolor="black", linestyle="None", markersize=9, label="Punto resaltado: barreno extra (no programado)"),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markersize=6.4,
+            markerfacecolor=(
+                0,
+                0,
+                0,
+                0.58,
+            ),
+            markeredgecolor=(
+                0.0,
+                0.45,
+                0.12,
+                0.85,
+            ),
+            markeredgewidth=0.35,
+            label="Punto: valor de cada barreno",
+        ),
+        Patch(
+            facecolor="white",
+            edgecolor="black",
+            label="Caja: 50% central de los datos (Q1-Q3)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            linestyle="-",
+            linewidth=1.6,
+            color="tab:orange",
+            label="Mediana",
+        ),
+        Line2D(
+            [0],
+            [0],
+            linestyle="-",
+            linewidth=1.0,
+            color="black",
+            label="Bigotes: mínimo y máximo real",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markersize=7.0,
+            markerfacecolor="yellow",
+            markeredgecolor="black",
+            markeredgewidth=0.45,
+            label="Barreno extra (no programado)",
+        ),
     ]
-    ax.legend(handles=leyenda, loc="lower left", fontsize=9, title="Leyenda del gráfico")
 
-    min_global = df["Longitud_roca_m"].min()
-    max_global = df["Longitud_roca_m"].max()
-    rango = max_global - min_global
-    ax.set_ylim(min_global - max(0.15, rango * 0.08), max_global + max(0.25, rango * 0.12))
+    ax.legend(
+        handles=leyenda,
+        loc="lower left",
+        fontsize=6.5,
+        title="Leyenda",
+        title_fontsize=6.5,
+        framealpha=0.95,
+        borderpad=0.5,
+        handletextpad=0.6,
+        labelspacing=0.35,
+    )
+
+    rango = (
+        max_global
+        - min_global
+    )
+
+    ax.set_ylim(
+        min_global
+        - max(
+            0.15,
+            rango * 0.08,
+        ),
+        max_global
+        + max(
+            0.25,
+            rango * 0.12,
+        ),
+    )
 
     ax.set_title(
         "Distribución de longitud perforada en roca por tipo de barreno\n"
-        f"{metadatos.get('Jumbo') or 'JUMBO'} | Serie {metadatos.get('Numero_Serie') or '-'} | Ciclo {metadatos.get('Ciclo') or '-'} | {metadatos.get('Fecha_Inicio') or '-'}",
-        fontsize=14,
+        f"{metadatos.get('Jumbo') or 'JUMBO'} | "
+        f"Serie {metadatos.get('Numero_Serie') or '-'} | "
+        f"Ciclo {metadatos.get('Ciclo') or '-'} | "
+        f"{metadatos.get('Fecha_Inicio') or '-'}",
+        fontsize=10.5,
     )
-    ax.set_xlabel("Tipo de barreno")
-    ax.set_ylabel("Longitud perforada en roca (m)")
-    ax.grid(True, alpha=0.5)
+
+    ax.set_xlabel(
+        "Tipo de barreno",
+        fontsize=8.0,
+    )
+
+    ax.set_ylabel(
+        "Longitud perforada en roca (m)",
+        fontsize=8.0,
+    )
+
+    ax.tick_params(
+        axis="both",
+        labelsize=7.4,
+    )
+
+    ax.grid(
+        True,
+        alpha=0.35,
+    )
+
     fig.tight_layout()
     return fig
 
