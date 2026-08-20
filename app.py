@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("EBR Drill Analytics")
-st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.4-CutTrend")
+st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.3-Beeswarm")
 
 st.info(
     "Carga uno o varios reportes PDF de iSURE®. "
@@ -89,7 +89,7 @@ st.markdown(
 # FUNCIONES AUXILIARES
 # ==========================================================
 
-CACHE_SCHEMA_VERSION = "v15_4_cut_trend"
+CACHE_SCHEMA_VERSION = "v15_3_beeswarm"
 
 
 def hash_archivo(uploaded_file) -> str:
@@ -425,56 +425,279 @@ def aplicar_formato_eje_fechas(
     )
 
 
-def anotar_puntos_sin_solape(
+def anotar_etiquetas_sin_solape(
     ax,
+    puntos,
+):
+    """
+    Distribuye las etiquetas de TODOS los puntos del gráfico evitando
+    solapes entre series.
+
+    Cada elemento de ``puntos`` debe contener:
+        x, y, texto
+
+    La lógica prueba posiciones alrededor del punto (arriba, abajo y
+    desplazamientos laterales) y elige la primera que no colisiona con
+    las etiquetas ya ubicadas. Si todas colisionan, escoge la posición
+    con menor área de solape.
+    """
+    if not puntos:
+        return
+
+    fig = ax.figure
+
+    # Necesario para medir el tamaño real de cada etiqueta en pantalla.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox_ejes = ax.get_window_extent(renderer=renderer)
+
+    # Separación visual extra entre etiquetas, expresada como expansión
+    # de su caja en píxeles.
+    cajas_ocupadas = []
+
+    candidatos_arriba = [
+        (0, 12),
+        (-20, 14),
+        (20, 14),
+        (0, 27),
+        (-34, 24),
+        (34, 24),
+        (0, -18),
+        (-20, -20),
+        (20, -20),
+        (0, -34),
+        (-36, -32),
+        (36, -32),
+    ]
+
+    candidatos_abajo = [
+        (0, -18),
+        (-20, -20),
+        (20, -20),
+        (0, -34),
+        (-34, -32),
+        (34, -32),
+        (0, 12),
+        (-20, 14),
+        (20, 14),
+        (0, 27),
+        (-36, 24),
+        (36, 24),
+    ]
+
+    def area_solape(a, b):
+        ancho = max(
+            0.0,
+            min(a.x1, b.x1)
+            - max(a.x0, b.x0),
+        )
+        alto = max(
+            0.0,
+            min(a.y1, b.y1)
+            - max(a.y0, b.y0),
+        )
+        return ancho * alto
+
+    # Orden estable: primero por X y luego por Y. De esta manera los
+    # puntos de una misma fecha se resuelven juntos.
+    puntos_ordenados = sorted(
+        puntos,
+        key=lambda p: (
+            float(p["x"]),
+            float(p["y"]),
+            str(p.get("serie", "")),
+        ),
+    )
+
+    for i, punto in enumerate(puntos_ordenados):
+        x = float(punto["x"])
+        y = float(punto["y"])
+        texto = str(punto["texto"])
+
+        # Alternar la preferencia inicial ayuda a separar etiquetas de
+        # dos series que caen exactamente sobre el mismo punto.
+        candidatos = (
+            candidatos_arriba
+            if i % 2 == 0
+            else candidatos_abajo
+        )
+
+        anotacion = ax.annotate(
+            texto,
+            xy=(x, y),
+            xytext=candidatos[0],
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8.5,
+            fontweight="medium",
+            annotation_clip=True,
+            arrowprops={
+                "arrowstyle": "-",
+                "linewidth": 0.55,
+                "alpha": 0.38,
+            },
+        )
+
+        mejor = None
+        menor_solape = None
+
+        for dx, dy in candidatos:
+            anotacion.set_position(
+                (dx, dy)
+            )
+            anotacion.set_va(
+                "bottom"
+                if dy >= 0
+                else "top"
+            )
+
+            caja = anotacion.get_window_extent(
+                renderer=renderer
+            )
+
+            # Amplía un poco la caja para dejar aire entre textos.
+            caja_segura = caja.expanded(
+                1.10,
+                1.18,
+            )
+
+            # Evitar que el texto se salga del área útil del gráfico.
+            margen = 3.0
+            dentro_ejes = (
+                caja_segura.x0
+                >= bbox_ejes.x0 + margen
+                and caja_segura.x1
+                <= bbox_ejes.x1 - margen
+                and caja_segura.y0
+                >= bbox_ejes.y0 + margen
+                and caja_segura.y1
+                <= bbox_ejes.y1 - margen
+            )
+
+            if not dentro_ejes:
+                continue
+
+            solape_total = sum(
+                area_solape(
+                    caja_segura,
+                    ocupada,
+                )
+                for ocupada
+                in cajas_ocupadas
+            )
+
+            if solape_total == 0:
+                mejor = (
+                    dx,
+                    dy,
+                    caja_segura,
+                )
+                break
+
+            if (
+                menor_solape is None
+                or solape_total
+                < menor_solape[0]
+            ):
+                menor_solape = (
+                    solape_total,
+                    dx,
+                    dy,
+                    caja_segura,
+                )
+
+        if mejor is None:
+            if menor_solape is not None:
+                _, dx, dy, caja_segura = (
+                    menor_solape
+                )
+                mejor = (
+                    dx,
+                    dy,
+                    caja_segura,
+                )
+            else:
+                # Fallback muy defensivo.
+                dx, dy = candidatos[0]
+                anotacion.set_position(
+                    (dx, dy)
+                )
+                anotacion.set_va(
+                    "bottom"
+                    if dy >= 0
+                    else "top"
+                )
+                caja_segura = (
+                    anotacion
+                    .get_window_extent(
+                        renderer=renderer
+                    )
+                    .expanded(
+                        1.10,
+                        1.18,
+                    )
+                )
+                mejor = (
+                    dx,
+                    dy,
+                    caja_segura,
+                )
+
+        dx, dy, caja_final = mejor
+
+        anotacion.set_position(
+            (dx, dy)
+        )
+        anotacion.set_va(
+            "bottom"
+            if dy >= 0
+            else "top"
+        )
+
+        # La línea guía solo se muestra cuando la etiqueta fue desplazada
+        # de forma apreciable.
+        if anotacion.arrow_patch is not None:
+            anotacion.arrow_patch.set_visible(
+                abs(dx) >= 18
+                or abs(dy) >= 24
+            )
+
+        cajas_ocupadas.append(
+            caja_final
+        )
+
+
+def crear_puntos_etiquetas(
     df_plot,
     x_col,
     y_col,
     etiqueta_extra_col=None,
+    serie=None,
 ):
-    """
-    Anota todos los puntos alternando arriba/abajo.
-    Si detecta valores muy cercanos, aumenta el desplazamiento.
-    """
-    columnas_puntos = [
-        x_col,
-        y_col,
-    ]
+    """Convierte una serie del DataFrame en etiquetas para el solver."""
+    puntos = []
 
-    if (
-        etiqueta_extra_col
-        and etiqueta_extra_col in df_plot.columns
-    ):
-        columnas_puntos.append(
-            etiqueta_extra_col
-        )
+    for _, fila in df_plot.iterrows():
+        x = fila.get(x_col)
+        y = fila.get(y_col)
 
-    puntos = df_plot[
-        columnas_puntos
-    ].copy()
+        if (
+            x is None
+            or y is None
+            or pd.isna(x)
+            or pd.isna(y)
+        ):
+            continue
 
-    for i, fila in enumerate(
-        puntos.itertuples(
-            index=False
-        )
-    ):
-        x = getattr(
-            fila,
-            x_col
-        )
-        y = getattr(
-            fila,
-            y_col
-        )
-
-        texto_etiqueta = f"{y:.1f}%"
+        texto = f"{float(y):.1f}%"
 
         if (
             etiqueta_extra_col
-            and etiqueta_extra_col in puntos.columns
+            and etiqueta_extra_col
+            in df_plot.columns
         ):
-            valor_extra = getattr(
-                fila,
+            valor_extra = fila.get(
                 etiqueta_extra_col
             )
 
@@ -482,74 +705,20 @@ def anotar_puntos_sin_solape(
                 valor_extra is not None
                 and not pd.isna(valor_extra)
             ):
-                texto_etiqueta += (
+                texto += (
                     f"\n{int(valor_extra)} tal."
                 )
 
-        offset_y = (
-            10
-            if i % 2 == 0
-            else -15
+        puntos.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "texto": texto,
+                "serie": serie or "",
+            }
         )
 
-        va = (
-            "bottom"
-            if offset_y > 0
-            else "top"
-        )
-
-        cercanos = df_plot[
-            (
-                abs(
-                    df_plot[
-                        x_col
-                    ] - x
-                )
-                < 0.18
-            )
-            & (
-                abs(
-                    df_plot[
-                        y_col
-                    ] - y
-                )
-                < 4
-            )
-        ]
-
-        if len(cercanos) > 1:
-            offset_y = (
-                17
-                if i % 2 == 0
-                else -22
-            )
-            va = (
-                "bottom"
-                if offset_y > 0
-                else "top"
-            )
-
-        ax.annotate(
-            texto_etiqueta,
-            xy=(x, y),
-            xytext=(0, offset_y),
-            textcoords="offset points",
-            ha="center",
-            va=va,
-            fontsize=8.5,
-            fontweight="medium",
-            arrowprops=(
-                {
-                    "arrowstyle": "-",
-                    "linewidth": 0.6,
-                    "alpha": 0.45,
-                }
-                if abs(
-                    offset_y
-                ) >= 17
-                else None
-            ),
-        )
+    return puntos
 
 
 # ==========================================================
@@ -692,6 +861,8 @@ def generar_grafico_tendencia_automatico(
                 )
             )
 
+    puntos_etiquetas = []
+
     for jumbo, grupo in df_plot.groupby(
         "Jumbo",
         dropna=False,
@@ -711,12 +882,14 @@ def generar_grafico_tendencia_automatico(
             label=str(jumbo),
         )
 
-        anotar_puntos_sin_solape(
-            ax,
-            grupo,
-            "X",
-            "Pct_Movimiento_Automatico_Brazos",
-            etiqueta_extra_col="Barrenos_Realizados",
+        puntos_etiquetas.extend(
+            crear_puntos_etiquetas(
+                grupo,
+                "X",
+                "Pct_Movimiento_Automatico_Brazos",
+                etiqueta_extra_col="Barrenos_Realizados",
+                serie=str(jumbo),
+            )
         )
 
     aplicar_formato_eje_fechas(
@@ -873,376 +1046,132 @@ def generar_grafico_tendencia_automatico(
         ]
     )
 
+    # Resolver conjuntamente las etiquetas de todos los Jumbos.
+    anotar_etiquetas_sin_solape(
+        ax,
+        puntos_etiquetas,
+    )
+
     return fig
 
 
-
 # ==========================================================
-# GRÁFICO GENERAL: MEDIANA DE LONGITUD DE BARRENOS CUT
+# GRÁFICO: EVOLUCIÓN DE LA MEDIANA DE BARRENOS CUT
 # ==========================================================
 
-def generar_grafico_tendencia_mediana_cut(
+def generar_grafico_mediana_cut(
     df_resumen: pd.DataFrame,
 ):
     """
-    Evolución por ciclo/round de la mediana de la columna
-    Longitud para los barrenos tipo Cut.
+    Muestra la evolución de la mediana de longitud perforada
+    de los barrenos Cut para cada ciclo.
 
-    Cada punto representa un PDF/ciclo y las líneas se separan
-    por Jumbo. Se consideran todos los ciclos que contengan
-    barrenos Cut, independientemente de la clasificación del
-    disparo.
+    Cada Jumbo se representa como una serie independiente.
     """
     if df_resumen is None or df_resumen.empty:
         return None
 
-    columnas_requeridas = [
+    columnas_requeridas = {
+        "Tipo",
+        "Mediana",
         "Fecha_Inicio",
         "Hora_Inicio",
         "Jumbo",
         "Ciclo",
-        "Tipo",
-        "N",
-        "Mediana",
-    ]
+    }
 
-    if not all(
-        columna in df_resumen.columns
-        for columna in columnas_requeridas
-    ):
+    if not columnas_requeridas.issubset(df_resumen.columns):
         return None
 
     df_plot = df_resumen.copy()
 
-    # ------------------------------------------------------
-    # SOLO BARRENOS TIPO CUT
-    # ------------------------------------------------------
+    # Tipo puede ser categórico; convertir a texto evita problemas
+    # al filtrar y conserva únicamente los barrenos Cut.
     df_plot = df_plot[
-        df_plot[
-            "Tipo"
-        ]
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        .eq("cut")
+        df_plot["Tipo"].astype(str).str.lower() == "cut"
+    ].copy()
+
+    df_plot = df_plot[
+        df_plot["Mediana"].notna()
     ].copy()
 
     if df_plot.empty:
         return None
 
-    df_plot[
-        "Mediana"
-    ] = pd.to_numeric(
-        df_plot[
-            "Mediana"
-        ],
-        errors="coerce",
-    )
-
-    df_plot[
-        "N"
-    ] = pd.to_numeric(
-        df_plot[
-            "N"
-        ],
-        errors="coerce",
-    )
-
-    df_plot = df_plot[
-        df_plot[
-            "Mediana"
-        ].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    # ------------------------------------------------------
-    # FECHA + HORA DEL CICLO
-    # ------------------------------------------------------
-    df_plot[
-        "FechaHora"
-    ] = pd.to_datetime(
+    df_plot["FechaHora"] = pd.to_datetime(
         (
-            df_plot[
-                "Fecha_Inicio"
-            ].fillna("")
+            df_plot["Fecha_Inicio"].fillna("")
             + " "
-            + df_plot[
-                "Hora_Inicio"
-            ].fillna("")
+            + df_plot["Hora_Inicio"].fillna("")
         ),
         format="%d/%m/%Y %H:%M:%S",
         errors="coerce",
     )
 
+    # Fallback si no existe hora válida.
+    faltantes = df_plot["FechaHora"].isna()
+    if faltantes.any():
+        df_plot.loc[faltantes, "FechaHora"] = pd.to_datetime(
+            df_plot.loc[faltantes, "Fecha_Inicio"],
+            format="%d/%m/%Y",
+            errors="coerce",
+        )
+
     df_plot = df_plot[
-        df_plot[
-            "FechaHora"
-        ].notna()
+        df_plot["FechaHora"].notna()
     ].copy()
 
     if df_plot.empty:
         return None
 
-    df_plot[
-        "Fecha"
-    ] = (
-        df_plot[
-            "FechaHora"
-        ].dt.normalize()
-    )
+    df_plot["Fecha"] = df_plot["FechaHora"].dt.normalize()
 
     df_plot = df_plot.sort_values(
-        [
-            "FechaHora",
-            "Jumbo",
-            "Ciclo",
-        ]
-    ).reset_index(
-        drop=True
-    )
+        ["FechaHora", "Jumbo", "Ciclo"]
+    ).reset_index(drop=True)
 
-    fechas, posiciones = (
-        preparar_eje_fechas(
-            df_plot
-        )
-    )
+    fechas, posiciones = preparar_eje_fechas(df_plot)
+    df_plot["X"] = [posiciones[idx] for idx in df_plot.index]
 
-    df_plot[
-        "X"
-    ] = [
-        posiciones[idx]
-        for idx in df_plot.index
-    ]
+    fig, ax = plt.subplots(figsize=(14, 6.2))
+    puntos_etiquetas = []
 
-    # ------------------------------------------------------
-    # GRÁFICO
-    # ------------------------------------------------------
-    fig, ax = plt.subplots(
-        figsize=(14, 6.4)
-    )
-
-    for jumbo, grupo in df_plot.groupby(
-        "Jumbo",
-        dropna=False,
-    ):
-        grupo = grupo.sort_values(
-            "FechaHora"
-        )
+    for jumbo, grupo in df_plot.groupby("Jumbo", dropna=False):
+        grupo = grupo.sort_values("FechaHora")
 
         ax.plot(
-            grupo[
-                "X"
-            ],
-            grupo[
-                "Mediana"
-            ],
+            grupo["X"],
+            grupo["Mediana"],
             marker="o",
             markersize=6,
             linewidth=2.0,
             label=str(jumbo),
         )
 
-        # --------------------------------------------------
-        # ETIQUETA: MEDIANA + CICLO + N CUT
-        # --------------------------------------------------
-        for i, fila in enumerate(
-            grupo.itertuples(
-                index=False
+        for _, fila in grupo.iterrows():
+            ciclo = fila.get("Ciclo")
+            ciclo_txt = (
+                f"Ciclo {int(ciclo)}"
+                if pd.notna(ciclo)
+                else "Ciclo -"
             )
-        ):
-            mediana = float(
-                fila.Mediana
-            )
+            puntos_etiquetas.append({
+                "x": fila["X"],
+                "y": fila["Mediana"],
+                "texto": f"{fila['Mediana']:.2f} m\n{ciclo_txt}",
+                "serie": str(jumbo),
+            })
 
-            ciclo = fila.Ciclo
-            n_cut = fila.N
+    aplicar_formato_eje_fechas(ax, fechas)
 
-            if (
-                ciclo is not None
-                and not pd.isna(ciclo)
-            ):
-                try:
-                    ciclo_txt = (
-                        f"C{int(float(ciclo))}"
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    ciclo_txt = (
-                        f"C{ciclo}"
-                    )
-            else:
-                ciclo_txt = "C-"
-
-            n_txt = (
-                f"n={int(n_cut)}"
-                if (
-                    n_cut is not None
-                    and not pd.isna(n_cut)
-                )
-                else "n=-"
-            )
-
-            texto = (
-                f"{mediana:.2f} m\n"
-                f"{ciclo_txt} | {n_txt}"
-            )
-
-            offset_y = (
-                11
-                if i % 2 == 0
-                else -17
-            )
-
-            va = (
-                "bottom"
-                if offset_y > 0
-                else "top"
-            )
-
-            cercanos = grupo[
-                (
-                    abs(
-                        grupo[
-                            "X"
-                        ]
-                        - fila.X
-                    )
-                    < 0.18
-                )
-                &
-                (
-                    abs(
-                        grupo[
-                            "Mediana"
-                        ]
-                        - mediana
-                    )
-                    < 0.12
-                )
-            ]
-
-            if len(cercanos) > 1:
-                offset_y = (
-                    18
-                    if i % 2 == 0
-                    else -24
-                )
-
-                va = (
-                    "bottom"
-                    if offset_y > 0
-                    else "top"
-                )
-
-            ax.annotate(
-                texto,
-                xy=(
-                    fila.X,
-                    mediana,
-                ),
-                xytext=(
-                    0,
-                    offset_y,
-                ),
-                textcoords="offset points",
-                ha="center",
-                va=va,
-                fontsize=8.3,
-                fontweight="medium",
-                arrowprops=(
-                    {
-                        "arrowstyle": "-",
-                        "linewidth": 0.6,
-                        "alpha": 0.45,
-                    }
-                    if abs(
-                        offset_y
-                    ) >= 18
-                    else None
-                ),
-            )
-
-    aplicar_formato_eje_fechas(
-        ax,
-        fechas,
-    )
-
-    # ------------------------------------------------------
-    # ESCALA Y DINÁMICA
-    # No se coloca línea de 4.5 m porque esta gráfica usa
-    # Longitud perforada, no Profundidad / Set.
-    # ------------------------------------------------------
-    min_y = float(
-        df_plot[
-            "Mediana"
-        ].min()
-    )
-
-    max_y = float(
-        df_plot[
-            "Mediana"
-        ].max()
-    )
-
-    rango_y = max(
-        0.25,
-        max_y - min_y,
-    )
-
-    margen_y = max(
-        0.18,
-        rango_y * 0.22,
-    )
-
-    limite_inferior = max(
-        0.0,
-        math.floor(
-            (
-                min_y
-                - margen_y
-            )
-            * 10
-        )
-        / 10,
-    )
-
-    limite_superior = (
-        math.ceil(
-            (
-                max_y
-                + margen_y
-            )
-            * 10
-        )
-        / 10
-    )
-
-    if (
-        limite_superior
-        - limite_inferior
-        < 0.6
-    ):
-        centro = (
-            min_y
-            + max_y
-        ) / 2
-
-        limite_inferior = max(
-            0.0,
-            centro - 0.30,
-        )
-
-        limite_superior = (
-            centro + 0.30
-        )
+    min_y = float(df_plot["Mediana"].min())
+    max_y = float(df_plot["Mediana"].max())
+    rango = max(max_y - min_y, 0.20)
+    margen = max(0.12, rango * 0.20)
 
     ax.set_ylim(
-        limite_inferior,
-        limite_superior,
+        max(0, min_y - margen),
+        max_y + margen,
     )
 
     ax.set_title(
@@ -1250,68 +1179,29 @@ def generar_grafico_tendencia_mediana_cut(
         fontsize=15,
         pad=18,
     )
+    ax.set_xlabel("Fecha", labelpad=10)
+    ax.set_ylabel("Mediana longitud Cut (m)", labelpad=10)
 
-    ax.set_xlabel(
-        "Fecha",
-        labelpad=10,
-    )
+    ax.grid(axis="y", alpha=0.22)
+    ax.grid(axis="x", visible=False)
 
-    ax.set_ylabel(
-        "Mediana de longitud Cut (m)",
-        labelpad=10,
-    )
+    if df_plot["Jumbo"].nunique(dropna=False) > 1:
+        ax.legend(
+            title="Jumbo",
+            frameon=False,
+            loc="upper right",
+        )
 
-    ax.grid(
-        axis="y",
-        alpha=0.22,
-    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
-    ax.grid(
-        axis="x",
-        visible=False,
-    )
+    fig.tight_layout(rect=[0, 0.03, 1, 0.96])
 
-    ax.legend(
-        title="Jumbo",
-        frameon=False,
-        loc="upper right",
-    )
-
-    ax.spines[
-        "top"
-    ].set_visible(False)
-
-    ax.spines[
-        "right"
-    ].set_visible(False)
-
-    # ------------------------------------------------------
-    # NOTA METODOLÓGICA
-    # ------------------------------------------------------
-    fig.text(
-        0.5,
-        0.018,
-        (
-            "Nota: cada punto corresponde a un PDF/ciclo y representa la "
-            "mediana de la columna Longitud de los barrenos tipo Cut. "
-            "n = número de barrenos Cut ejecutados en el ciclo. "
-            "No se usa 4.5 m como línea objetivo porque 4.5 m corresponde "
-            "al Set/Profundidad de referencia y no a la Longitud física "
-            "perforada desde una cara irregular."
-        ),
-        ha="center",
-        va="bottom",
-        fontsize=8.3,
-        color="dimgray",
-    )
-
-    fig.tight_layout(
-        rect=[
-            0,
-            0.065,
-            1,
-            0.98,
-        ]
+    # Reutiliza la lógica de distribución de etiquetas para evitar
+    # que medianas cercanas se solapen entre ciclos o Jumbos.
+    anotar_etiquetas_sin_solape(
+        ax,
+        puntos_etiquetas,
     )
 
     return fig
@@ -1427,6 +1317,8 @@ def generar_grafico_brazos_por_jumbo(
         ),
     ]
 
+    puntos_etiquetas = []
+
     for nombre_serie, columna in series:
         grupo = df_plot[
             df_plot[
@@ -1446,12 +1338,14 @@ def generar_grafico_brazos_por_jumbo(
             label=nombre_serie,
         )
 
-        anotar_puntos_sin_solape(
-            ax,
-            grupo,
-            "X",
-            columna,
-            etiqueta_extra_col="Barrenos_Realizados",
+        puntos_etiquetas.extend(
+            crear_puntos_etiquetas(
+                grupo,
+                "X",
+                columna,
+                etiqueta_extra_col="Barrenos_Realizados",
+                serie=nombre_serie,
+            )
         )
 
     aplicar_formato_eje_fechas(
@@ -1712,6 +1606,14 @@ def generar_grafico_brazos_por_jumbo(
             1,
             0.89,
         ]
+    )
+
+    # Resolver conjuntamente las etiquetas de Brazo 1 y Brazo 2.
+    # Los puntos muy próximos se distribuyen arriba/abajo/lateralmente
+    # y se agrega una línea guía solo cuando el desplazamiento es mayor.
+    anotar_etiquetas_sin_solape(
+        ax,
+        puntos_etiquetas,
     )
 
     return fig
@@ -2576,50 +2478,6 @@ if archivos:
             )
 
         # --------------------------------------------------
-        # EVOLUCIÓN DE LA MEDIANA DE LONGITUD CUT
-        # --------------------------------------------------
-
-        st.subheader(
-            "Evolución de longitud de barrenos Cut"
-        )
-
-        fig_cut = (
-            generar_grafico_tendencia_mediana_cut(
-                df_resumen
-            )
-        )
-
-        tendencia_cut_png = None
-
-        if fig_cut is not None:
-            st.pyplot(
-                fig_cut,
-                use_container_width=True,
-            )
-
-            tendencia_cut_png = (
-                figura_a_png(
-                    fig_cut
-                )
-            )
-
-            plt.close(
-                fig_cut
-            )
-
-            st.caption(
-                "Cada punto representa un PDF/ciclo. "
-                "La serie utiliza la mediana de la columna Longitud "
-                "de los barrenos tipo Cut; n indica la cantidad de Cut "
-                "ejecutados en ese ciclo."
-            )
-        else:
-            st.info(
-                "No se encontraron barrenos tipo Cut "
-                "suficientes para generar la tendencia."
-            )
-
-        # --------------------------------------------------
         # GRÁFICOS POR EQUIPO: BRAZO 1 VS BRAZO 2
         # --------------------------------------------------
 
@@ -2751,28 +2609,37 @@ if archivos:
         )
 
         # --------------------------------------------------
-        # TABLAS PERFORACIÓN
+        # EVOLUCIÓN MEDIANA DE BARRENOS CUT
         # --------------------------------------------------
 
         st.markdown(
-            "#### Resumen de reportes"
+            "#### Evolución de la mediana de barrenos Cut"
         )
 
-        st.dataframe(
-            df_reportes,
-            use_container_width=True,
-            hide_index=True,
+        fig_cut = generar_grafico_mediana_cut(
+            df_resumen
         )
 
-        st.markdown(
-            "#### Resumen por ciclo y tipo"
-        )
+        mediana_cut_png = None
 
-        st.dataframe(
-            df_resumen,
-            use_container_width=True,
-            hide_index=True,
-        )
+        if fig_cut is not None:
+            st.pyplot(
+                fig_cut,
+                use_container_width=True,
+            )
+
+            mediana_cut_png = figura_a_png(
+                fig_cut
+            )
+
+            plt.close(
+                fig_cut
+            )
+        else:
+            st.info(
+                "No se encontraron datos suficientes de barrenos Cut "
+                "para generar la evolución de la mediana."
+            )
 
         # --------------------------------------------------
         # DESCARGAS
@@ -2811,14 +2678,11 @@ if archivos:
                 )
             )
 
-        if (
-            tendencia_cut_png
-            is not None
-        ):
+        if mediana_cut_png is not None:
             graficos_zip.append(
                 (
-                    "Evolucion_Mediana_Longitud_Cut.png",
-                    tendencia_cut_png,
+                    "Evolucion_Mediana_Barrenos_Cut.png",
+                    mediana_cut_png,
                 )
             )
 
