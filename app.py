@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("EBR Drill Analytics")
-st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.3-Beeswarm")
+st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.4-CutTrend")
 
 st.info(
     "Carga uno o varios reportes PDF de iSURE®. "
@@ -89,7 +89,7 @@ st.markdown(
 # FUNCIONES AUXILIARES
 # ==========================================================
 
-CACHE_SCHEMA_VERSION = "v15_3_beeswarm"
+CACHE_SCHEMA_VERSION = "v15_4_cut_trend"
 
 
 def hash_archivo(uploaded_file) -> str:
@@ -870,6 +870,447 @@ def generar_grafico_tendencia_automatico(
             0.055,
             1,
             0.89,
+        ]
+    )
+
+    return fig
+
+
+
+# ==========================================================
+# GRÁFICO GENERAL: MEDIANA DE LONGITUD DE BARRENOS CUT
+# ==========================================================
+
+def generar_grafico_tendencia_mediana_cut(
+    df_resumen: pd.DataFrame,
+):
+    """
+    Evolución por ciclo/round de la mediana de la columna
+    Longitud para los barrenos tipo Cut.
+
+    Cada punto representa un PDF/ciclo y las líneas se separan
+    por Jumbo. Se consideran todos los ciclos que contengan
+    barrenos Cut, independientemente de la clasificación del
+    disparo.
+    """
+    if df_resumen is None or df_resumen.empty:
+        return None
+
+    columnas_requeridas = [
+        "Fecha_Inicio",
+        "Hora_Inicio",
+        "Jumbo",
+        "Ciclo",
+        "Tipo",
+        "N",
+        "Mediana",
+    ]
+
+    if not all(
+        columna in df_resumen.columns
+        for columna in columnas_requeridas
+    ):
+        return None
+
+    df_plot = df_resumen.copy()
+
+    # ------------------------------------------------------
+    # SOLO BARRENOS TIPO CUT
+    # ------------------------------------------------------
+    df_plot = df_plot[
+        df_plot[
+            "Tipo"
+        ]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("cut")
+    ].copy()
+
+    if df_plot.empty:
+        return None
+
+    df_plot[
+        "Mediana"
+    ] = pd.to_numeric(
+        df_plot[
+            "Mediana"
+        ],
+        errors="coerce",
+    )
+
+    df_plot[
+        "N"
+    ] = pd.to_numeric(
+        df_plot[
+            "N"
+        ],
+        errors="coerce",
+    )
+
+    df_plot = df_plot[
+        df_plot[
+            "Mediana"
+        ].notna()
+    ].copy()
+
+    if df_plot.empty:
+        return None
+
+    # ------------------------------------------------------
+    # FECHA + HORA DEL CICLO
+    # ------------------------------------------------------
+    df_plot[
+        "FechaHora"
+    ] = pd.to_datetime(
+        (
+            df_plot[
+                "Fecha_Inicio"
+            ].fillna("")
+            + " "
+            + df_plot[
+                "Hora_Inicio"
+            ].fillna("")
+        ),
+        format="%d/%m/%Y %H:%M:%S",
+        errors="coerce",
+    )
+
+    df_plot = df_plot[
+        df_plot[
+            "FechaHora"
+        ].notna()
+    ].copy()
+
+    if df_plot.empty:
+        return None
+
+    df_plot[
+        "Fecha"
+    ] = (
+        df_plot[
+            "FechaHora"
+        ].dt.normalize()
+    )
+
+    df_plot = df_plot.sort_values(
+        [
+            "FechaHora",
+            "Jumbo",
+            "Ciclo",
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    fechas, posiciones = (
+        preparar_eje_fechas(
+            df_plot
+        )
+    )
+
+    df_plot[
+        "X"
+    ] = [
+        posiciones[idx]
+        for idx in df_plot.index
+    ]
+
+    # ------------------------------------------------------
+    # GRÁFICO
+    # ------------------------------------------------------
+    fig, ax = plt.subplots(
+        figsize=(14, 6.4)
+    )
+
+    for jumbo, grupo in df_plot.groupby(
+        "Jumbo",
+        dropna=False,
+    ):
+        grupo = grupo.sort_values(
+            "FechaHora"
+        )
+
+        ax.plot(
+            grupo[
+                "X"
+            ],
+            grupo[
+                "Mediana"
+            ],
+            marker="o",
+            markersize=6,
+            linewidth=2.0,
+            label=str(jumbo),
+        )
+
+        # --------------------------------------------------
+        # ETIQUETA: MEDIANA + CICLO + N CUT
+        # --------------------------------------------------
+        for i, fila in enumerate(
+            grupo.itertuples(
+                index=False
+            )
+        ):
+            mediana = float(
+                fila.Mediana
+            )
+
+            ciclo = fila.Ciclo
+            n_cut = fila.N
+
+            if (
+                ciclo is not None
+                and not pd.isna(ciclo)
+            ):
+                try:
+                    ciclo_txt = (
+                        f"C{int(float(ciclo))}"
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    ciclo_txt = (
+                        f"C{ciclo}"
+                    )
+            else:
+                ciclo_txt = "C-"
+
+            n_txt = (
+                f"n={int(n_cut)}"
+                if (
+                    n_cut is not None
+                    and not pd.isna(n_cut)
+                )
+                else "n=-"
+            )
+
+            texto = (
+                f"{mediana:.2f} m\n"
+                f"{ciclo_txt} | {n_txt}"
+            )
+
+            offset_y = (
+                11
+                if i % 2 == 0
+                else -17
+            )
+
+            va = (
+                "bottom"
+                if offset_y > 0
+                else "top"
+            )
+
+            cercanos = grupo[
+                (
+                    abs(
+                        grupo[
+                            "X"
+                        ]
+                        - fila.X
+                    )
+                    < 0.18
+                )
+                &
+                (
+                    abs(
+                        grupo[
+                            "Mediana"
+                        ]
+                        - mediana
+                    )
+                    < 0.12
+                )
+            ]
+
+            if len(cercanos) > 1:
+                offset_y = (
+                    18
+                    if i % 2 == 0
+                    else -24
+                )
+
+                va = (
+                    "bottom"
+                    if offset_y > 0
+                    else "top"
+                )
+
+            ax.annotate(
+                texto,
+                xy=(
+                    fila.X,
+                    mediana,
+                ),
+                xytext=(
+                    0,
+                    offset_y,
+                ),
+                textcoords="offset points",
+                ha="center",
+                va=va,
+                fontsize=8.3,
+                fontweight="medium",
+                arrowprops=(
+                    {
+                        "arrowstyle": "-",
+                        "linewidth": 0.6,
+                        "alpha": 0.45,
+                    }
+                    if abs(
+                        offset_y
+                    ) >= 18
+                    else None
+                ),
+            )
+
+    aplicar_formato_eje_fechas(
+        ax,
+        fechas,
+    )
+
+    # ------------------------------------------------------
+    # ESCALA Y DINÁMICA
+    # No se coloca línea de 4.5 m porque esta gráfica usa
+    # Longitud perforada, no Profundidad / Set.
+    # ------------------------------------------------------
+    min_y = float(
+        df_plot[
+            "Mediana"
+        ].min()
+    )
+
+    max_y = float(
+        df_plot[
+            "Mediana"
+        ].max()
+    )
+
+    rango_y = max(
+        0.25,
+        max_y - min_y,
+    )
+
+    margen_y = max(
+        0.18,
+        rango_y * 0.22,
+    )
+
+    limite_inferior = max(
+        0.0,
+        math.floor(
+            (
+                min_y
+                - margen_y
+            )
+            * 10
+        )
+        / 10,
+    )
+
+    limite_superior = (
+        math.ceil(
+            (
+                max_y
+                + margen_y
+            )
+            * 10
+        )
+        / 10
+    )
+
+    if (
+        limite_superior
+        - limite_inferior
+        < 0.6
+    ):
+        centro = (
+            min_y
+            + max_y
+        ) / 2
+
+        limite_inferior = max(
+            0.0,
+            centro - 0.30,
+        )
+
+        limite_superior = (
+            centro + 0.30
+        )
+
+    ax.set_ylim(
+        limite_inferior,
+        limite_superior,
+    )
+
+    ax.set_title(
+        "Evolución de la mediana de longitud de barrenos Cut",
+        fontsize=15,
+        pad=18,
+    )
+
+    ax.set_xlabel(
+        "Fecha",
+        labelpad=10,
+    )
+
+    ax.set_ylabel(
+        "Mediana de longitud Cut (m)",
+        labelpad=10,
+    )
+
+    ax.grid(
+        axis="y",
+        alpha=0.22,
+    )
+
+    ax.grid(
+        axis="x",
+        visible=False,
+    )
+
+    ax.legend(
+        title="Jumbo",
+        frameon=False,
+        loc="upper right",
+    )
+
+    ax.spines[
+        "top"
+    ].set_visible(False)
+
+    ax.spines[
+        "right"
+    ].set_visible(False)
+
+    # ------------------------------------------------------
+    # NOTA METODOLÓGICA
+    # ------------------------------------------------------
+    fig.text(
+        0.5,
+        0.018,
+        (
+            "Nota: cada punto corresponde a un PDF/ciclo y representa la "
+            "mediana de la columna Longitud de los barrenos tipo Cut. "
+            "n = número de barrenos Cut ejecutados en el ciclo. "
+            "No se usa 4.5 m como línea objetivo porque 4.5 m corresponde "
+            "al Set/Profundidad de referencia y no a la Longitud física "
+            "perforada desde una cara irregular."
+        ),
+        ha="center",
+        va="bottom",
+        fontsize=8.3,
+        color="dimgray",
+    )
+
+    fig.tight_layout(
+        rect=[
+            0,
+            0.065,
+            1,
+            0.98,
         ]
     )
 
@@ -2135,6 +2576,50 @@ if archivos:
             )
 
         # --------------------------------------------------
+        # EVOLUCIÓN DE LA MEDIANA DE LONGITUD CUT
+        # --------------------------------------------------
+
+        st.subheader(
+            "Evolución de longitud de barrenos Cut"
+        )
+
+        fig_cut = (
+            generar_grafico_tendencia_mediana_cut(
+                df_resumen
+            )
+        )
+
+        tendencia_cut_png = None
+
+        if fig_cut is not None:
+            st.pyplot(
+                fig_cut,
+                use_container_width=True,
+            )
+
+            tendencia_cut_png = (
+                figura_a_png(
+                    fig_cut
+                )
+            )
+
+            plt.close(
+                fig_cut
+            )
+
+            st.caption(
+                "Cada punto representa un PDF/ciclo. "
+                "La serie utiliza la mediana de la columna Longitud "
+                "de los barrenos tipo Cut; n indica la cantidad de Cut "
+                "ejecutados en ese ciclo."
+            )
+        else:
+            st.info(
+                "No se encontraron barrenos tipo Cut "
+                "suficientes para generar la tendencia."
+            )
+
+        # --------------------------------------------------
         # GRÁFICOS POR EQUIPO: BRAZO 1 VS BRAZO 2
         # --------------------------------------------------
 
@@ -2323,6 +2808,17 @@ if archivos:
                 (
                     "Evolucion_Movimiento_Automatico.png",
                     tendencia_png,
+                )
+            )
+
+        if (
+            tendencia_cut_png
+            is not None
+        ):
+            graficos_zip.append(
+                (
+                    "Evolucion_Mediana_Longitud_Cut.png",
+                    tendencia_cut_png,
                 )
             )
 
