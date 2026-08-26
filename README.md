@@ -1,24 +1,26 @@
 # EBR Drill Analytics
 
-**EBR Drill Analytics** is a Streamlit application for analyzing Sandvik iSURE® drilling round reports from El Brocal.
+**EBR Drill Analytics** is a Streamlit application for analyzing drilling round data from underground jumbo drilling equipment.
 
-The app processes one or multiple PDF reports, identifies the drilling jumbo, extracts drilled-hole information, validates the extracted records against the **TIPOS DE BARRENO** summary, displays a boxplot for each cycle, and generates a consolidated Excel workbook.
+The application processes one or multiple PDF and ZDA files, identifies drilling equipment and cycles, extracts and validates hole-level data, and provides consolidated analysis of drilling performance.
 
-> This is an internal analytical tool and is not an official Sandvik product.
+Key capabilities include drilling automation analysis by jumbo and boom, drilled-length analysis by hole type, cycle-time monitoring, drilling-round classification, spatial reconstruction of drilling patterns from ZDA data, and export of consolidated results to Excel.
+
+> This is an internal analytical tool intended to support operational analysis and review.
 
 ## Main features
 
-- Upload one or multiple iSURE® PDF reports.
-- Automatic jumbo identification:
-  - `125D114796` → `JUMB001`
-  - `125D98943` → `JUMB002`
-- Reads cycle metadata:
+- Upload and process one or multiple PDF and ZDA files.
+- Automatically identifies drilling equipment from serial numbers.
+  - Known equipment aliases are mapped where configured.
+  - New or unknown serial numbers are preserved as unique equipment instead of being grouped under a generic identifier.
+- Reads cycle metadata, including:
   - cycle number
   - start date/time
   - serial number
   - drilling plan
+  - section
   - drilled metres
-- Reads the **TIPOS DE BARRENO** summary automatically.
 - Extracts drilled-hole detail by type:
   - Bottom
   - Easer
@@ -26,21 +28,79 @@ The app processes one or multiple PDF reports, identifies the drilling jumbo, ex
   - Contour
   - Reaming
   - Casing
-- Identifies extra/non-planned holes (`E1`, `E2`, etc.).
-- Calculates:
-  - minimum
-  - maximum
-  - average
-  - median
-  - preliminary axial length
-- Generates a boxplot for each drilling cycle.
-- Reconciles expected vs. extracted holes.
+- Classifies drilling rounds using front-hole counts:
+  - `FRENTE` > 45 holes
+  - `SELLADA` 25–45 holes
+  - `ESTOCADA Y/O CORRECCIONES` < 25 holes
+- Uses front-hole types (`Bottom + Easer + Cut + Contour`) for round classification.
+  - `Reaming` and `Casing` are not included in the front-hole count used for this classification.
+- Analyzes drilling automation:
+  - overall automatic movement by jumbo
+  - automatic movement by boom
+  - comparison between Boom 1 and Boom 2
+- Analyzes drilled length in Cut holes:
+  - cycle-level median
+  - global median by jumbo
+- Analyzes drilling-cycle timing from ZDA data:
+  - real drilling start
+  - real drilling end
+  - drilling duration
+  - average start time by jumbo and shift
+- Reconstructs a reference drilling pattern from ZDA spatial data.
+  - The reference contour is adjusted according to the detected drilling section.
+  - The plot automatically expands when holes extend beyond the standard display area.
+- Displays per-file and per-cycle validation details.
+- Provides dynamic global filters by:
+  - jumbo
+  - drilling-round classification
 - Exports a consolidated Excel workbook with:
+  - `BD-PERFO`
   - `Resumen_Reportes`
   - `Resumen_Ciclos`
-  - `Detalle_Barrenos`
-  - `Validacion`
-  - `Barrenos_Extra`
+
+## Excel output
+
+### `BD-PERFO`
+
+Operational database by drilling cycle, including available fields such as:
+
+- operational month
+- date and shift
+- operator
+- jumbo
+- level / block / heading
+- drilling-round classification
+- section
+- rock class
+- explosive type
+- drilling and movement times
+- automatic/manual movement indicators
+- number of drilled holes
+- cycle number
+- automatic movement percentages
+- Cut-hole median and average drilled length
+- first-hole / first-hammer timing fields when available
+
+The operational month uses a 26–25 reporting period. For example:
+
+- August: July 26 to August 25
+- September: August 26 to September 25
+
+### `Resumen_Reportes`
+
+One row per processed PDF or ZDA cycle, with cycle metadata, drilling totals, validation status, drilling-round classification, automation indicators, timing information, and reading-quality fields.
+
+### `Resumen_Ciclos`
+
+Cycle-level summary by hole type, including available statistics such as:
+
+- count
+- minimum
+- maximum
+- average
+- median
+- expected vs. extracted values
+- validation status
 
 ## Repository structure
 
@@ -81,17 +141,14 @@ Streamlit will open the application in the browser.
 7. Deploy the application.
 8. Keep the app private while testing operational reports, subject to company information-security policies.
 
-## Important validation rule
+## Validation
 
-The application compares extracted holes with the counts reported in the PDF page **TIPOS DE BARRENO**.
+The application performs consistency checks between extracted drilling data and the information available in the source files.
 
 If a cycle displays `REVISAR`, the extracted data should not be considered validated until the discrepancy is reviewed.
 
 ## Data handling
 
-When deployed on Streamlit Community Cloud, uploaded PDFs are processed on the Streamlit-hosted server. Confirm that this is acceptable under your organization's information-security requirements before using operational or sensitive reports.
+When deployed on Streamlit Community Cloud, uploaded PDF and ZDA files are processed on the Streamlit-hosted server.
 
-## Trademark note
-
-Sandvik and iSURE® are trademarks/products of Sandvik.  
-EBR Drill Analytics is an independent analytical application and is not affiliated with or endorsed by Sandvik.
+Confirm that this is acceptable under your organization's information-security requirements before using operational, confidential, or sensitive files.
