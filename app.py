@@ -6,6 +6,9 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 import tempfile
 import re
+import gc
+import shutil
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -15,16 +18,22 @@ from plotly.colors import qualitative
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-from procesador import procesar_archivo, clasificar_tipo_disparo_v33
+from procesador import (
+    procesar_archivo,
+    clasificar_tipo_disparo_v33,
+    generar_grafico,
+    generar_plano_zda_png,
+    extraer_plano_navegacion_png,
+)
 
 
 # ==========================================================
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.42-PYTHON-RESULTADOS-EXPANDERS"
+APP_VERSION_INTERNAL = "V34.45-PYTHON-NAVEGACION-CICLOS"
 PUBLIC_VERSION = "v1.0"
-CACHE_SCHEMA_VERSION = "v34_25_python_pdf_zda_publicacion_20260825"
+CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
 COLORES = qualitative.Plotly
 
@@ -81,6 +90,21 @@ if "uploader_version" not in st.session_state:
     st.session_state.uploader_version = 0
 if "procesados" not in st.session_state:
     st.session_state.procesados = {}
+if "session_disk_id" not in st.session_state:
+    st.session_state.session_disk_id = uuid.uuid4().hex
+if "staged_queue" not in st.session_state:
+    st.session_state.staged_queue = []
+if "auto_process_staged" not in st.session_state:
+    st.session_state.auto_process_staged = False
+
+
+def _session_work_dir() -> Path:
+    root = Path(tempfile.gettempdir()) / "ebr_drill_massive"
+    path = root / st.session_state.session_disk_id
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "uploads").mkdir(exist_ok=True)
+    (path / "visuals").mkdir(exist_ok=True)
+    return path
 
 
 # Streamlit vuelve a ejecutar el script completo ante cualquier cambio de widget.
@@ -94,8 +118,23 @@ else:
 
 
 def limpiar_analisis():
+    work_dir = None
+    try:
+        work_dir = _session_work_dir()
+    except Exception:
+        pass
+
     st.session_state.procesados = {}
+    st.session_state.staged_queue = []
+    st.session_state.auto_process_staged = False
     st.session_state.uploader_version += 1
+
+    if work_dir and work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    # Nuevo directorio limpio para la misma sesión.
+    st.session_state.session_disk_id = uuid.uuid4().hex
+
     for key in list(st.session_state.keys()):
         if key.startswith((
             "global_",
@@ -107,6 +146,7 @@ def limpiar_analisis():
             "class_",
             "lbl_",
             "desglosar_",
+            "detalle_ciclo_",
         )):
             del st.session_state[key]
 
@@ -289,9 +329,63 @@ def seccion_desde_plan_texto(plan_perforacion):
 
 
 def hash_archivo(uploaded_file) -> str:
-    return hashlib.sha256(
-        uploaded_file.getvalue() + CACHE_SCHEMA_VERSION.encode("utf-8")
-    ).hexdigest()
+    # Evita uploaded_file.getvalue(), que crea una copia completa del archivo
+    # en RAM. getbuffer() entrega una vista de memoria sin duplicar el ZDA/PDF.
+    h = hashlib.sha256()
+    h.update(uploaded_file.getbuffer())
+    h.update(CACHE_SCHEMA_VERSION.encode("utf-8"))
+    return h.hexdigest()
+
+
+def hash_archivo_en_disco(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    h.update(CACHE_SCHEMA_VERSION.encode("utf-8"))
+    return h.hexdigest()
+
+
+def preparar_archivos_en_disco(uploaded_files):
+    """
+    Primera fase del modo masivo.
+
+    Copia los UploadedFile a disco temporal SIN procesarlos todavía.
+    Después se fuerza un rerun para que Streamlit libere del uploader los
+    bytes de los 100–150 ZDA antes de comenzar el parsing intensivo.
+    """
+    uploads_dir = _session_work_dir() / "uploads"
+    nuevos = []
+
+    for n, archivo in enumerate(uploaded_files, start=1):
+        suffix = Path(archivo.name).suffix.lower()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(archivo.name).name)
+        disk_path = uploads_dir / f"{uuid.uuid4().hex[:10]}_{safe_name}"
+
+        archivo.seek(0)
+        with disk_path.open("wb") as out:
+            shutil.copyfileobj(archivo, out, length=1024 * 1024)
+
+        clave = hash_archivo_en_disco(disk_path)
+        if clave in st.session_state.procesados:
+            disk_path.unlink(missing_ok=True)
+            continue
+
+        # Evitar duplicar el mismo archivo en una cola ya preparada.
+        if any(x.get("clave") == clave for x in st.session_state.staged_queue):
+            disk_path.unlink(missing_ok=True)
+            continue
+
+        item = {
+            "clave": clave,
+            "nombre": archivo.name,
+            "path": str(disk_path),
+            "size": disk_path.stat().st_size,
+        }
+        st.session_state.staged_queue.append(item)
+        nuevos.append(item)
+
+    return nuevos
 
 
 def fmt(valor, dec=1, sufijo=""):
@@ -760,7 +854,7 @@ def construir_bd_perfo(df_reportes, df_detalle):
     return pd.DataFrame(rows, columns=BD_PERFO_COLUMNS)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=1)
 def crear_excel_publicacion(df_bd_perfo, df_reportes, df_resumen):
     buffer = BytesIO()
 
@@ -1211,81 +1305,115 @@ def grafico_zda_timeline(rows: pd.DataFrame, mostrar_etiquetas: bool):
 
 
 # ==========================================================
-# PROCESAMIENTO / CACHE
+# PROCESAMIENTO MASIVO / CACHE
 # ==========================================================
 
 
-def guardar_resultado_en_cache(archivo, clave):
-    suffix = Path(archivo.name).suffix.lower()
-    temp_path = None
+def guardar_resultado_desde_disco(item):
+    """Procesa un archivo ya liberado del uploader y conserva solo resultados."""
+    clave = item["clave"]
+    path = Path(item["path"])
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-            temp.write(archivo.getbuffer())
-            temp_path = Path(temp.name)
-        resultado = procesar_archivo(temp_path, nombre_archivo=archivo.name)
-        fig = resultado.get("fig")
-        png = None
+        resultado = procesar_archivo(
+            path,
+            nombre_archivo=item["nombre"],
+            generar_visuales=False,
+        )
+
+        # Visuales diferidos: nunca se crean durante el lote masivo.
+        fig = resultado.pop("fig", None)
         if fig is not None:
-            png = figura_a_png(fig)
             plt.close(fig)
-        resultado["png_bytes"] = png
-        resultado["nombre_archivo"] = archivo.name
+            del fig
+        resultado.pop("plano_nav_png", None)
+        resultado.pop("png_bytes", None)
+
+        resultado["nombre_archivo"] = item["nombre"]
         resultado["error"] = None
+        resultado["_cache_key"] = clave
+        resultado["_source_path"] = str(path)
+
         st.session_state.procesados[clave] = resultado
     except Exception as exc:
         st.session_state.procesados[clave] = {
-            "nombre_archivo": archivo.name,
+            "nombre_archivo": item["nombre"],
+            "_cache_key": clave,
+            "_source_path": str(path),
             "error": str(exc),
         }
-    finally:
-        if temp_path and temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+
+
+def _visual_paths(cache_key):
+    visual_dir = _session_work_dir() / "visuals"
+    return (
+        visual_dir / f"{cache_key}_boxplot.png",
+        visual_dir / f"{cache_key}_plano.png",
+    )
+
+
+def asegurar_visuales_resultado(r):
+    """Genera boxplot/plano solo cuando el usuario solicita ese ciclo."""
+    cache_key = r.get("_cache_key") or hashlib.sha1(
+        str(r.get("nombre_archivo", "")).encode("utf-8")
+    ).hexdigest()
+    box_path, nav_path = _visual_paths(cache_key)
+
+    detalle = r.get("detalle")
+    rep = r.get("resumen_reporte") or {}
+    metadata = r.get("metadata") or rep
+    fuente = str(rep.get("Fuente") or r.get("fuente") or "PDF").upper()
+    source_path = Path(r.get("_source_path") or "")
+
+    if not box_path.exists() and isinstance(detalle, pd.DataFrame) and not detalle.empty:
+        fig = generar_grafico(detalle, metadata)
+        fig.savefig(box_path, format="png", dpi=170, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        del fig
+        gc.collect()
+
+    if not nav_path.exists():
+        nav_bytes = None
+        if fuente == "ZDA" and isinstance(detalle, pd.DataFrame) and not detalle.empty:
+            nav_bytes = generar_plano_zda_png(detalle, metadata, resolution=150)
+        elif fuente == "PDF" and source_path.exists():
+            nav_bytes = extraer_plano_navegacion_png(source_path, resolution=150)
+
+        if nav_bytes:
+            nav_path.write_bytes(nav_bytes)
+            del nav_bytes
+            gc.collect()
+
+    return box_path if box_path.exists() else None, nav_path if nav_path.exists() else None
 
 
 # ==========================================================
-# CARGA
+# CARGA MASIVA EN DOS FASES
 # ==========================================================
 
 st.subheader("Archivos")
 
 archivos = st.file_uploader(
-    "Seleccionar o agregar archivos PDF / ZDA",
+    "Seleccionar archivos PDF / ZDA",
     type=["pdf", "zda"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state.uploader_version}",
+    help=(
+        "Modo masivo: al presionar Procesar, primero se copian los archivos a "
+        "disco temporal y se libera el uploader. Luego se procesan uno por uno."
+    ),
 )
 
 seleccion = archivos or []
-seleccion_claves = [(hash_archivo(a), a) for a in seleccion]
-
-pendientes = [
-    (k, a)
-    for k, a in seleccion_claves
-    if (
-        k not in st.session_state.procesados
-        or st.session_state.procesados[k].get("error")
-    )
-]
-
-n_pdf = sum(
-    Path(a.name).suffix.lower() == ".pdf"
-    for _, a in pendientes
-)
-n_zda = sum(
-    Path(a.name).suffix.lower() == ".zda"
-    for _, a in pendientes
-)
+total_upload_mb = sum(int(getattr(a, "size", 0) or 0) for a in seleccion) / (1024 * 1024)
 
 col_process, col_clear = st.columns(2)
-
 with col_process:
     procesar = st.button(
-        "Procesar / recalcular",
+        "Procesar lote",
         type="primary",
         use_container_width=True,
         disabled=not seleccion,
     )
-
 with col_clear:
     st.button(
         "Limpiar",
@@ -1294,33 +1422,51 @@ with col_clear:
     )
 
 st.caption(
-    f"Archivos seleccionados: {len(seleccion)} · "
-    f"Pendientes: {len(pendientes)} · PDF pendientes: {n_pdf} · ZDA pendientes: {n_zda}"
+    f"Seleccionados: {len(seleccion)} · Tamaño del lote: {total_upload_mb:,.1f} MB · "
+    f"Procesados acumulados: {len(st.session_state.procesados)}"
 )
 
-if procesar and seleccion:
-    # Si hay archivos nuevos/pendientes, procesa solo esos.
-    # Si todos ya estaban procesados, el mismo botón recalcula la selección actual.
-    objetivos = pendientes if pendientes else seleccion_claves
+if seleccion and total_upload_mb >= 700:
+    st.warning(
+        "El lote cargado supera aproximadamente 700 MB. El modo masivo libera los "
+        "archivos antes del parsing, pero Streamlit Community Cloud debe recibir primero "
+        "todo el lote en el uploader. Si la carga por sí sola supera la memoria disponible, "
+        "será necesario dividir únicamente la etapa de carga."
+    )
 
+if procesar and seleccion:
+    estado_stage = st.empty()
+    estado_stage.write(
+        f"Preparando {len(seleccion)} archivo(s) en disco temporal..."
+    )
+    nuevos = preparar_archivos_en_disco(seleccion)
+    estado_stage.empty()
+
+    # CRÍTICO: borrar el widget ANTES de procesar. En el siguiente rerun los
+    # 150 UploadedFile ya no permanecen en memoria; sólo quedan paths en disco.
+    st.session_state.uploader_version += 1
+    st.session_state.auto_process_staged = bool(nuevos)
+    st.rerun()
+
+# Segunda fase: ya sin UploadedFile en RAM.
+if st.session_state.auto_process_staged and st.session_state.staged_queue:
+    cola = list(st.session_state.staged_queue)
     barra = st.progress(0)
     estado = st.empty()
 
-    for i, (clave, archivo) in enumerate(objetivos, start=1):
-        estado.write(
-            f"Procesando {i}/{len(objetivos)}: {archivo.name}"
-        )
-        guardar_resultado_en_cache(
-            archivo,
-            clave,
-        )
-        barra.progress(i / len(objetivos))
+    for i, item in enumerate(cola, start=1):
+        estado.write(f"Procesando {i}/{len(cola)}: {item['nombre']}")
+        guardar_resultado_desde_disco(item)
+        st.session_state.staged_queue = [
+            x for x in st.session_state.staged_queue
+            if x.get("clave") != item.get("clave")
+        ]
+        gc.collect()
+        barra.progress(i / len(cola))
 
     barra.empty()
     estado.empty()
-
-    # Reconstruye inmediatamente el sidebar con los jumbos y tipos
-    # que acaban de ser detectados.
+    st.session_state.auto_process_staged = False
     st.rerun()
 
 resultados_validos = [
@@ -1376,11 +1522,7 @@ for r in resultados_validos:
 # HTML V33 solo agrega Resumen_Ciclos de reportes cuyo conteo está OK.
 df_resumen = concatenar_dataframes(resultados_validos, "resumen_ciclo", solo_ok=True)
 df_detalle = concatenar_dataframes(resultados_validos, "detalle")
-df_validacion = concatenar_dataframes(resultados_validos, "validacion")
-df_validacion_metros = concatenar_dataframes(resultados_validos, "validacion_metros")
 df_atipicos = concatenar_dataframes(resultados_validos, "atipicos")
-df_extras = concatenar_dataframes([r for r in resultados_validos if r.get("fuente")=="PDF"], "extras")
-df_mwd = concatenar_dataframes(resultados_validos, "mwd_barrenos")
 df_automatico = df_reportes.copy()
 df_zda = df_reportes[df_reportes["Fuente"].eq("ZDA")].copy() if "Fuente" in df_reportes.columns else pd.DataFrame()
 
@@ -1916,13 +2058,95 @@ def render_resultados_section(resultados_validos):
         f"{len(resultados_validos)} archivo(s) procesado(s) acumulado(s)"
     )
 
+    # Un expander cerrado igualmente ejecuta/renderiza su contenido en Streamlit.
+    # Para no serializar decenas de imágenes/tablas a la vez, se muestran
+    # 10 ciclos por vista. La navegación se hace por ciclo, no por tamaño de página.
+    n_total = len(resultados_validos)
+    page_size = 10
+    n_pages = max(1, (n_total + page_size - 1) // page_size)
+
+    # Mantener la página actual dentro del rango válido.
+    page_key = "resultados_page_nav"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+    st.session_state[page_key] = max(
+        1,
+        min(int(st.session_state[page_key]), n_pages),
+    )
+
+    # Selector directo: permite escribir/buscar por jumbo, ciclo o fecha.
+    cycle_indices = list(range(n_total))
+
+    def _cycle_label(i):
+        rr = resultados_validos[i].get("resumen_reporte", {})
+        fuente_i = rr.get("Fuente") or resultados_validos[i].get("fuente") or ""
+        return (
+            f"{rr.get('Jumbo', '-')} · "
+            f"Ciclo {rr.get('Ciclo', '-')} · "
+            f"{rr.get('Fecha_Inicio', '-')}"
+            + (f" · {fuente_i}" if fuente_i else "")
+        )
+
+    jump_key = "resultados_jump_cycle"
+
+    def _jump_to_cycle():
+        selected_idx = st.session_state.get(jump_key)
+        if selected_idx is not None:
+            st.session_state[page_key] = int(selected_idx) // page_size + 1
+
+    st.selectbox(
+        "Ir directamente a un ciclo",
+        options=cycle_indices,
+        index=None,
+        placeholder="Buscar por jumbo, ciclo o fecha...",
+        format_func=_cycle_label,
+        key=jump_key,
+        on_change=_jump_to_cycle,
+    )
+
+    page = int(st.session_state[page_key])
+
+    nav_prev, nav_info, nav_next = st.columns([1.1, 3.0, 1.1])
+
+    with nav_prev:
+        if st.button(
+            "← Anterior",
+            key="resultados_prev",
+            disabled=page <= 1,
+            use_container_width=True,
+        ):
+            page = max(1, page - 1)
+            st.session_state[page_key] = page
+
+    with nav_next:
+        if st.button(
+            "Siguiente →",
+            key="resultados_next",
+            disabled=page >= n_pages,
+            use_container_width=True,
+        ):
+            page = min(n_pages, page + 1)
+            st.session_state[page_key] = page
+
+    start = (page - 1) * page_size
+    end = min(start + page_size, n_total)
+
+    with nav_info:
+        st.markdown(
+            f"<div style='text-align:center; padding-top:0.45rem;'>"
+            f"<strong>Ciclos {start + 1}–{end} de {n_total}</strong>"
+            f"<br><span style='color:#667085; font-size:0.86rem;'>"
+            f"Página {page} de {n_pages}</span></div>",
+            unsafe_allow_html=True,
+        )
+
     desglosar = st.checkbox(
-        "Desglosar todos",
+        "Desglosar todos los ciclos de esta página",
         value=False,
         key="desglosar_todos",
     )
 
-    for idx, r in enumerate(resultados_validos):
+    for idx, r in enumerate(resultados_validos[start:end], start=start):
         rep = r["resumen_reporte"]
         fuente = (
             rep.get("Fuente")
@@ -2033,9 +2257,21 @@ def render_resultados_section(resultados_validos):
                         rep.get("Tiempo_Perforacion_hms") or "-",
                     )
 
+            detalle_key = f"detalle_ciclo_{r.get('_cache_key', idx)}"
+            mostrar_detalle = st.toggle(
+                "Cargar gráficos y plano de este ciclo",
+                value=False,
+                key=detalle_key,
+                help="Los visuales se generan bajo demanda para mantener bajo el uso de memoria.",
+            )
+
+            box_path = nav_path = None
+            if mostrar_detalle:
+                with st.spinner("Generando/cargando visuales del ciclo..."):
+                    box_path, nav_path = asegurar_visuales_resultado(r)
+
             with col_nav:
-                nav = r.get("plano_nav_png")
-                if nav:
+                if nav_path:
                     if fuente == "ZDA":
                         st.caption(
                             "Plano reconstruido desde ZDA · "
@@ -2043,20 +2279,17 @@ def render_resultados_section(resultados_validos):
                         )
                     else:
                         st.caption("Plano de navegación del PDF")
+                    st.image(str(nav_path), use_container_width=True)
+                elif not mostrar_detalle:
+                    st.caption("Plano disponible bajo demanda")
 
-                    st.image(
-                        nav,
-                        use_container_width=True,
-                    )
-
-            if r.get("png_bytes"):
-                st.image(
-                    r["png_bytes"],
-                    use_container_width=True,
-                )
+            if box_path:
+                st.image(str(box_path), use_container_width=True)
+                with open(box_path, "rb") as fh:
+                    png_bytes = fh.read()
                 st.download_button(
                     "Descargar gráfico PNG",
-                    r["png_bytes"],
+                    png_bytes,
                     file_name=(
                         f"{rep.get('Jumbo','JUMBO')}_"
                         f"Ciclo_{rep.get('Ciclo','-')}.png"
@@ -2064,6 +2297,7 @@ def render_resultados_section(resultados_validos):
                     mime="image/png",
                     key=f"png_{idx}",
                 )
+                del png_bytes
 
             val = r.get("validacion")
             if (

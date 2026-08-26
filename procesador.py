@@ -20,7 +20,7 @@ ORDEN_TIPOS = ["Bottom", "Easer", "Cut", "Contour", "Reaming", "Casing"]
 JUMBOS = {"125D114796": "JUMB001", "125D98943": "JUMB002"}
 NUM = r"-?\d+(?:\.\d+)?"
 
-VERSION_PROCESADOR = "V34.41-Python-BARRENOS-COMPLETOS"
+VERSION_PROCESADOR = "V34.44-Python-MASIVO-DISK-BACKED"
 
 
 def limpiar_texto(texto) -> str:
@@ -929,7 +929,11 @@ def extraer_plano_navegacion_png(pdf_path: Path, resolution: int = 170) -> Optio
     except Exception:
         return None
 
-def procesar_pdf(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
+def procesar_pdf(
+    pdf_path: Path,
+    nombre_archivo: Optional[str] = None,
+    generar_visuales: bool = True,
+) -> Dict:
     metadatos = leer_metadatos(pdf_path, nombre_archivo=nombre_archivo)
     movimiento = leer_movimiento_brazos(pdf_path)
     esperados, pagina_tipos = leer_totales_tipos_barreno(pdf_path)
@@ -958,8 +962,8 @@ def procesar_pdf(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
     resumen_ciclo = construir_resumen_ciclo(df, esperados, metadatos)
     resumen_reporte = construir_resumen_reporte(metadatos, esperados, df, pagina_tipos, paginas_detalle, movimiento)
     extras = df[df["Extra"]].copy()
-    fig = generar_grafico(df, metadatos)
-    plano_nav_png = extraer_plano_navegacion_png(pdf_path)
+    fig = generar_grafico(df, metadatos) if generar_visuales else None
+    plano_nav_png = extraer_plano_navegacion_png(pdf_path) if generar_visuales else None
 
     return {
         "metadata": metadatos,
@@ -1105,10 +1109,18 @@ def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
     return resultado
 
 
-def procesar_pdf_v33(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
+def procesar_pdf_v33(
+    pdf_path: Path,
+    nombre_archivo: Optional[str] = None,
+    generar_visuales: bool = True,
+) -> Dict:
     """Usa el parser PDF Python existente y normaliza su salida al esquema V33."""
     return _enriquecer_resultado_estandar(
-        procesar_pdf(pdf_path, nombre_archivo=nombre_archivo),
+        procesar_pdf(
+            pdf_path,
+            nombre_archivo=nombre_archivo,
+            generar_visuales=generar_visuales,
+        ),
         "PDF",
     )
 
@@ -1774,7 +1786,11 @@ def generar_plano_zda_png(
 
 
 
-def procesar_zda(zda_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
+def procesar_zda(
+    zda_path: Path,
+    nombre_archivo: Optional[str] = None,
+    generar_visuales: bool = True,
+) -> Dict:
     nombre = nombre_archivo or zda_path.name
     with zipfile.ZipFile(zda_path, "r") as zf:
         names = [n for n in zf.namelist() if not n.endswith("/")]
@@ -1856,14 +1872,15 @@ def procesar_zda(zda_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
             "Codigos_Tipo_No_Reconocidos": ", ".join(f"{x['Codigo']} ({x['N']})" for x in boom_diag.get("unknown_codes", [])),
         }
 
-        # Figura por archivo: reutiliza el mismo boxplot de la versión PDF.
-        fig = generar_grafico(detalle, metadata)
+        # En modo masivo, los visuales se difieren hasta que el usuario
+        # abre/solicita el detalle de un ciclo. Esto evita crear cientos
+        # de figuras e imágenes durante el procesamiento inicial.
+        fig = generar_grafico(detalle, metadata) if generar_visuales else None
 
-        # Reconstrucción espacial para ocupar el mismo espacio visual
-        # donde los PDF muestran el plano de navegación.
-        plano_zda_png = generar_plano_zda_png(
-            detalle,
-            metadata,
+        plano_zda_png = (
+            generar_plano_zda_png(detalle, metadata)
+            if generar_visuales
+            else None
         )
 
         extras = detalle[detalle["Extra"] == True].copy() if "Extra" in detalle.columns else pd.DataFrame()
@@ -1880,11 +1897,29 @@ def procesar_zda(zda_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
     return _enriquecer_resultado_estandar(result, "ZDA")
 
 
-def procesar_archivo(path: Path, nombre_archivo: Optional[str] = None) -> Dict:
-    """Despachador V33: PDF o ZDA con una única interfaz de salida."""
+def procesar_archivo(
+    path: Path,
+    nombre_archivo: Optional[str] = None,
+    generar_visuales: bool = True,
+) -> Dict:
+    """
+    Despachador PDF/ZDA con una única interfaz de salida.
+
+    ``generar_visuales=False`` está pensado para procesamiento masivo:
+    extrae y valida los datos, pero difiere boxplots/planos hasta que
+    realmente se soliciten en la interfaz.
+    """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return procesar_pdf_v33(path, nombre_archivo=nombre_archivo)
+        return procesar_pdf_v33(
+            path,
+            nombre_archivo=nombre_archivo,
+            generar_visuales=generar_visuales,
+        )
     if suffix == ".zda":
-        return procesar_zda(path, nombre_archivo=nombre_archivo)
+        return procesar_zda(
+            path,
+            nombre_archivo=nombre_archivo,
+            generar_visuales=generar_visuales,
+        )
     raise ValueError("Formato no soportado. Use archivos .PDF o .ZDA.")
