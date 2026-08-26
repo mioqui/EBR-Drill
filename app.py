@@ -31,7 +31,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.45-PYTHON-NAVEGACION-CICLOS"
+APP_VERSION_INTERNAL = "V34.49-PYTHON-PUNTOS-LINEA-CURVA-SUAVE"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -150,17 +150,42 @@ def limpiar_analisis():
         )):
             del st.session_state[key]
 
+
+def tipo_roca_desde_plan_texto(plan_perforacion):
+    """
+    Extrae el tipo/clase de roca desde Plan_Perforacion / drill_plan.
+    Ejemplos:
+      "MALLA E.E. 4.5x4.5 III-B" -> "III-B"
+      "MALLA E.B. 5.0x5.0 IV-A"   -> "IV-A"
+
+    Se acepta cualquier número romano seguido de guion y código
+    alfanumérico para no limitar futuros valores.
+    """
+    texto = str(plan_perforacion or "").upper()
+    m = re.search(
+        r"\b([IVXLCDM]+)\s*[-–—]\s*([A-Z0-9]+)\b",
+        texto,
+        re.IGNORECASE,
+    )
+    if not m:
+        return "SIN DATO"
+
+    return f"{m.group(1).upper()}-{m.group(2).upper()}"
+
+
 # ==========================================================
 # FILTROS Y PARÁMETROS GLOBALES
 # ==========================================================
 
 def _valores_detectados_desde_cache():
     """
-    Obtiene jumbos y tipos de disparo desde los resultados ya procesados.
-    No presupone cuántos equipos existen.
+    Obtiene jumbos, tipos de disparo y tipos de roca desde los
+    resultados ya procesados. No presupone cuántos equipos ni
+    cuántas clases de roca existen.
     """
     jumbos = []
     tipos = []
+    rocas = []
 
     for r in st.session_state.procesados.values():
         if r.get("error"):
@@ -169,11 +194,16 @@ def _valores_detectados_desde_cache():
         rep = r.get("resumen_reporte") or {}
         jumbo = rep.get("Jumbo")
         tipo = rep.get("Tipo_Disparo")
+        roca = tipo_roca_desde_plan_texto(
+            rep.get("Plan_Perforacion")
+        )
 
         if jumbo and str(jumbo).strip():
             jumbos.append(str(jumbo).strip())
         if tipo and str(tipo).strip():
             tipos.append(str(tipo).strip())
+        if roca and str(roca).strip():
+            rocas.append(str(roca).strip())
 
     # Orden natural para JUMB001, JUMB002... y luego series/otros.
     def jumbo_sort_key(valor):
@@ -190,7 +220,13 @@ def _valores_detectados_desde_cache():
     tipos_extra = sorted(tipos_presentes - set(TIPOS_DISPARO))
     tipos.extend(tipos_extra)
 
-    return jumbos, tipos
+    # SIN DATO al final; los demás valores alfabéticamente.
+    rocas_presentes = set(rocas)
+    rocas = sorted(r for r in rocas_presentes if r != "SIN DATO")
+    if "SIN DATO" in rocas_presentes:
+        rocas.append("SIN DATO")
+
+    return jumbos, tipos, rocas
 
 
 def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
@@ -220,12 +256,14 @@ def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
     st.session_state[previous_options_key] = options.copy()
 
 
-jumbos_detectados, tipos_detectados = _valores_detectados_desde_cache()
+jumbos_detectados, tipos_detectados, rocas_detectadas = _valores_detectados_desde_cache()
 
 # Variables siempre definidas aunque aún no existan datos.
 global_jumbos = []
 global_tipos = []
+global_rocas = []
 global_lbl_auto = False
+global_line_auto = False
 global_lbl_arm = False
 global_lbl_cut = False
 global_lbl_zda = False
@@ -249,6 +287,11 @@ with st.sidebar:
             tipos_detectados,
             "_global_tipos_options_prev",
         )
+        _sincronizar_multiselect_dinamico(
+            "global_rocas",
+            rocas_detectadas,
+            "_global_rocas_options_prev",
+        )
 
         global_jumbos = st.multiselect(
             "Jumbos",
@@ -260,6 +303,12 @@ with st.sidebar:
             "Tipo de disparo",
             tipos_detectados,
             key="global_tipos",
+        )
+
+        global_rocas = st.multiselect(
+            "Tipo de roca",
+            rocas_detectadas,
+            key="global_rocas",
         )
 
         st.caption(
@@ -281,6 +330,15 @@ with st.sidebar:
             "Etiquetas · movimiento automático",
             value=False,
             key="opt_lbl_auto",
+        )
+        global_line_auto = st.checkbox(
+            "Línea curva · movimiento automático",
+            value=True,
+            key="opt_line_auto",
+            help=(
+                "Desmarcado: muestra solo los puntos. "
+                "Marcado: agrega una línea suavizada que conecta los ciclos."
+            ),
         )
         global_lbl_arm = st.checkbox(
             "Etiquetas · uso por brazo",
@@ -949,7 +1007,7 @@ def crear_excel_publicacion(df_bd_perfo, df_reportes, df_resumen):
 # ==========================================================
 
 
-def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool):
+def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: bool):
     if df_auto.empty:
         return None
     df = df_auto.copy()
@@ -969,12 +1027,23 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool):
         g = df[df["Jumbo"].astype(str) == jumbo].sort_values("FechaHora")
         fig.add_trace(go.Scatter(
             x=g["FechaHora"], y=g["Pct_Movimiento_Automatico_Brazos"],
-            mode="lines+markers", name=jumbo,
-            line=dict(width=3, color=COLORES[idx % len(COLORES)], shape="spline"),
-            marker=dict(size=9),
-            customdata=g[["Barrenos_Realizados"]].to_numpy(),
+            mode="lines+markers" if mostrar_linea else "markers",
+            name=jumbo,
+            line=dict(
+                width=3,
+                color=COLORES[idx % len(COLORES)],
+                shape="spline",
+                smoothing=0.35,
+            ) if mostrar_linea else None,
+            marker=dict(
+                size=9,
+                color=COLORES[idx % len(COLORES)],
+                line=dict(color="#ffffff", width=1.2),
+            ),
+            customdata=g[["Barrenos_Realizados", "Tipo_Roca"]].to_numpy(),
             hovertemplate=(f"{jumbo}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%"
-                           "<br>Barrenos: %{customdata[0]} tal.<extra></extra>"),
+                           "<br>Barrenos: %{customdata[0]} tal."
+                           "<br>Tipo de roca: %{customdata[1]}<extra></extra>"),
         ))
         auto = pd.to_numeric(g["Auto_Total_Brazos_min"], errors="coerce").sum(min_count=1)
         manual = pd.to_numeric(g["Manual_Total_Brazos_min"], errors="coerce").sum(min_count=1)
@@ -1055,7 +1124,7 @@ def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.Data
     cut = cut[cut["Mediana"].notna()].copy()
     if cut.empty:
         return cut
-    cols = [c for c in ["Jumbo","Ciclo","Fecha_Inicio","Tipo_Disparo"] if c in df_reportes.columns]
+    cols = [c for c in ["Jumbo","Ciclo","Fecha_Inicio","Tipo_Disparo","Tipo_Roca"] if c in df_reportes.columns]
     tipos = df_reportes[cols].drop_duplicates(subset=[c for c in ["Jumbo","Ciclo","Fecha_Inicio"] if c in cols])
     cut = cut.merge(tipos, on=["Jumbo","Ciclo","Fecha_Inicio"], how="left")
     cut["Tipo_Disparo"] = cut["Tipo_Disparo"].fillna("SIN CLASIFICAR")
@@ -1063,13 +1132,14 @@ def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.Data
 
 
 
-def grafico_cut(df_cut: pd.DataFrame, jumbos_visibles, tipos_visibles, mostrar_etiquetas: bool):
+def grafico_cut(df_cut: pd.DataFrame, jumbos_visibles, tipos_visibles, rocas_visibles, mostrar_etiquetas: bool):
     if df_cut.empty:
         return None
 
     df = df_cut[
         df_cut["Jumbo"].astype(str).isin([str(x) for x in jumbos_visibles])
         & df_cut["Tipo_Disparo"].isin(tipos_visibles)
+        & df_cut["Tipo_Roca"].isin(rocas_visibles)
     ].copy()
 
     if df.empty:
@@ -1513,10 +1583,12 @@ df_reportes = pd.DataFrame(report_rows)
 
 # Fuerza la clasificación V33 para PDF y ZDA con el mismo criterio.
 df_reportes["Tipo_Disparo"] = df_reportes["Barrenos_Realizados"].apply(clasificar_tipo_disparo_v33)
+df_reportes["Tipo_Roca"] = df_reportes["Plan_Perforacion"].apply(tipo_roca_desde_plan_texto)
 df_reportes["Considerado_KPI_Automatizacion"] = df_reportes["Tipo_Disparo"].eq("FRENTE")
 for r in resultados_validos:
     rr = r["resumen_reporte"]
     rr["Tipo_Disparo"] = clasificar_tipo_disparo_v33(rr.get("Barrenos_Realizados"))
+    rr["Tipo_Roca"] = tipo_roca_desde_plan_texto(rr.get("Plan_Perforacion"))
     rr["Considerado_KPI_Automatizacion"] = rr["Tipo_Disparo"] == "FRENTE"
 
 # HTML V33 solo agrega Resumen_Ciclos de reportes cuyo conteo está OK.
@@ -1553,7 +1625,9 @@ def render_automation_section(
     df_automatico: pd.DataFrame,
     sel_jumbos,
     sel_tipos,
+    sel_rocas,
     mostrar_auto: bool,
+    mostrar_linea_auto: bool,
     mostrar_arm: bool,
 ):
     if df_automatico.empty:
@@ -1565,6 +1639,7 @@ def render_automation_section(
             [str(x) for x in sel_jumbos]
         )
         & df_automatico["Tipo_Disparo"].isin(sel_tipos)
+        & df_automatico["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
     st.subheader("Evolución del movimiento automático")
@@ -1572,6 +1647,7 @@ def render_automation_section(
     fig_auto = grafico_auto(
         df_visible,
         mostrar_auto,
+        mostrar_linea_auto,
     )
 
     if fig_auto is not None:
@@ -1633,6 +1709,7 @@ def render_cut_section(
     df_reportes: pd.DataFrame,
     sel_jumbos,
     sel_tipos,
+    sel_rocas,
     mostrar_cut: bool,
 ):
     st.subheader("Evolución de la longitud perforada en barrenos Cut")
@@ -1656,6 +1733,7 @@ def render_cut_section(
         df_cut,
         sel_jumbos,
         sel_tipos,
+        sel_rocas,
         mostrar_cut,
     )
 
@@ -1680,6 +1758,7 @@ def render_zda_section(
     df_zda: pd.DataFrame,
     sel_jumbos,
     sel_tipos,
+    sel_rocas,
     mostrar_zda: bool,
 ):
     st.subheader("Tiempos de ciclo de perforación")
@@ -1722,6 +1801,7 @@ def render_zda_section(
             [str(x) for x in sel_jumbos]
         )
         & zda_all["Tipo_Disparo"].isin(sel_tipos)
+        & zda_all["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
     st.caption(
@@ -1809,12 +1889,14 @@ def render_classification_section(
     df_atipicos: pd.DataFrame,
     sel_jumbos,
     sel_tipos,
+    sel_rocas,
 ):
     filtrados = df_reportes[
         df_reportes["Jumbo"].astype(str).isin(
             [str(x) for x in sel_jumbos]
         )
         & df_reportes["Tipo_Disparo"].isin(sel_tipos)
+        & df_reportes["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
     st.caption(
@@ -1992,6 +2074,7 @@ def render_classification_section(
             [str(x) for x in sel_jumbos]
         )
         & df_automatico["Tipo_Disparo"].isin(sel_tipos)
+        & df_automatico["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
     cols_auto = [
@@ -2180,16 +2263,23 @@ def render_resultados_section(resultados_validos):
                     ),
                 )
                 m3.metric(
+                    "Tipo de roca",
+                    rep.get("Tipo_Roca")
+                    or tipo_roca_desde_plan_texto(
+                        rep.get("Plan_Perforacion")
+                    ),
+                )
+                m4.metric(
                     "Tipo de disparo",
                     rep.get("Tipo_Disparo") or "-",
                 )
-                m4.metric(
+                m5.metric(
                     "Barrenos",
                     int(rep["Barrenos_Realizados"])
                     if pd.notna(rep.get("Barrenos_Realizados"))
                     else "-",
                 )
-                m5.metric(
+                m6.metric(
                     "Metros perforados",
                     fmt(
                         rep.get("Metros_Perforados"),
@@ -2197,14 +2287,14 @@ def render_resultados_section(resultados_validos):
                         " m",
                     ),
                 )
-                m6.metric(
+
+                a0, a1, a2, a3, a4 = st.columns(5)
+                a0.metric(
                     "Lectura",
                     rep.get("Lectura_Confiable")
                     or rep.get("Estado")
                     or "-",
                 )
-
-                a1, a2, a3, a4 = st.columns(4)
                 a1.metric(
                     "Movimiento automático",
                     fmt(
@@ -2422,7 +2512,9 @@ with st.container(border=True):
         df_automatico,
         global_jumbos,
         global_tipos,
+        global_rocas,
         global_lbl_auto,
+        global_line_auto,
         global_lbl_arm,
     )
 
@@ -2432,6 +2524,7 @@ with st.container(border=True):
         df_reportes,
         global_jumbos,
         global_tipos,
+        global_rocas,
         global_lbl_cut,
     )
 
@@ -2440,6 +2533,7 @@ with st.container(border=True):
         df_zda,
         global_jumbos,
         global_tipos,
+        global_rocas,
         global_lbl_zda,
     )
 
@@ -2453,6 +2547,7 @@ with st.expander(
         df_atipicos,
         global_jumbos,
         global_tipos,
+        global_rocas,
     )
 
 with st.expander(
