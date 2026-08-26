@@ -53,7 +53,7 @@ st.markdown(
     [data-testid="stAppViewBlockContainer"],
     .block-container {
         padding-top: 3.25rem !important;
-        padding-bottom: 1rem !important;
+        padding-bottom: 6rem !important;
     }
 
     h1 {
