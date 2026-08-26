@@ -2,83 +2,66 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 import hashlib
-import math
 import tempfile
-import zipfile
+import re
 
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.colors import qualitative
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
-from procesador import procesar_pdf
+from procesador import procesar_archivo, clasificar_tipo_disparo_v33
 
 
 # ==========================================================
-# CONFIGURACIÓN DE LA APP
+# CONFIGURACIÓN
 # ==========================================================
 
-st.set_page_config(
-    page_title="EBR Drill Analytics",
-    page_icon="⛏️",
-    layout="wide",
-)
+APP_VERSION_INTERNAL = "V34.42-PYTHON-RESULTADOS-EXPANDERS"
+PUBLIC_VERSION = "v1.0"
+CACHE_SCHEMA_VERSION = "v34_25_python_pdf_zda_publicacion_20260825"
+TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
+COLORES = qualitative.Plotly
 
+st.set_page_config(page_title=f"EBR Drill Analytics · Piloto {PUBLIC_VERSION}", page_icon="⛏️", layout="wide")
 st.title("EBR Drill Analytics")
-st.caption("Sandvik iSURE® Round Report Analysis · El Brocal · v15.3-Beeswarm")
-
+st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de reportes de perforación de equipos Jumbo Sandvik")
 st.info(
-    "Carga uno o varios reportes PDF de iSURE®. "
-    "La aplicación procesa únicamente los archivos nuevos, muestra los "
-    "indicadores de perforación y uso automático del movimiento de brazos, "
-    "y genera un Excel consolidado."
+    "Consolida y analiza información de perforación de reportes PDF y ZDA, mostrando automatización por jumbo y brazo, "
+    "longitud perforada en barrenos Cut, tiempos de ciclo, clasificación de disparos y exportación de datos a Excel."
 )
-
-
-# ==========================================================
-# ESTADO DE SESIÓN
-# ==========================================================
-
-if "uploader_version" not in st.session_state:
-    st.session_state.uploader_version = 0
-
-if "procesados" not in st.session_state:
-    st.session_state.procesados = {}
-
-
-def limpiar_analisis():
-    st.session_state.procesados = {}
-    st.session_state.uploader_version += 1
-
-
-# ==========================================================
-# ESTILO DEL FILE UPLOADER
-# ==========================================================
 
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 0.8rem; padding-bottom: 0.8rem; }
-    [data-testid="stFileUploader"] { font-size: 0.90rem; }
-    [data-testid="stFileUploader"] button { min-width: 40px !important; min-height: 40px !important; font-size: 1.0rem !important; border-radius: 8px !important; }
-    [data-testid="stFileUploader"] button svg { width: 21px !important; height: 21px !important; }
-    [data-testid="stFileUploaderFile"] { margin-right: 4px !important; margin-bottom: 4px !important; }
-    [data-testid="stExpander"] summary { font-size: 0.88rem !important; font-weight: 600 !important; padding-top: 0.35rem !important; padding-bottom: 0.35rem !important; }
-    [data-testid="stMetric"] { padding: 0.05rem 0 !important; }
-    [data-testid="stMetricLabel"] { font-size: 0.72rem !important; line-height: 1.05 !important; margin-bottom: 0.06rem !important; }
-    [data-testid="stMetricValue"] { font-size: 1.20rem !important; line-height: 1.05 !important; font-weight: 600 !important; }
-    h1 { font-size: 1.70rem !important; margin-bottom: 0.2rem !important; }
-    h2 { font-size: 1.15rem !important; margin-top: 0.65rem !important; margin-bottom: 0.3rem !important; }
-    h3 { font-size: 0.98rem !important; margin-top: 0.50rem !important; margin-bottom: 0.22rem !important; }
-    h4 { font-size: 0.90rem !important; margin-top: 0.42rem !important; margin-bottom: 0.18rem !important; }
-    [data-testid="stCaptionContainer"] { font-size: 0.70rem !important; line-height: 1.20 !important; }
-    [data-testid="stAlert"] { padding: 0.42rem 0.60rem !important; font-size: 0.76rem !important; }
+    /* Reserva espacio debajo de la barra superior de Streamlit
+       para evitar que el título quede recortado/oculto por el header. */
+    [data-testid="stAppViewBlockContainer"],
+    .block-container {
+        padding-top: 3.25rem !important;
+        padding-bottom: 1rem !important;
+    }
+
+    h1 {
+        font-size: 1.75rem !important;
+        line-height: 1.20 !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.15rem !important;
+        padding-top: 0.15rem !important;
+        overflow: visible !important;
+    }
+    h2 { font-size: 1.22rem !important; margin-top: 0.7rem !important; }
+    h3 { font-size: 1.00rem !important; margin-top: 0.55rem !important; margin-bottom: 0.25rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.20rem !important; }
     [data-testid="stDataFrame"] div[role="grid"] { font-size: 0.76rem !important; }
-    .stDownloadButton button, .stButton button { min-height: 2.05rem !important; padding: 0.30rem 0.65rem !important; font-size: 0.78rem !important; }
-    div[data-testid="stVerticalBlock"] > div { gap: 0.36rem !important; }
-    hr { margin-top: 0.30rem !important; margin-bottom: 0.40rem !important; }
+    [data-testid="stExpander"] summary { font-size: 0.88rem !important; font-weight: 600 !important; }
+    .stDownloadButton button, .stButton button { min-height: 2.15rem !important; font-size: 0.80rem !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -86,2667 +69,2177 @@ st.markdown(
 
 
 # ==========================================================
-# FUNCIONES AUXILIARES
+# ESTADO
 # ==========================================================
 
-CACHE_SCHEMA_VERSION = "v15_3_beeswarm"
+if st.session_state.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
+    st.session_state.procesados = {}
+    st.session_state.uploader_version = st.session_state.get("uploader_version", 0) + 1
+    st.session_state.cache_schema_version = CACHE_SCHEMA_VERSION
+
+if "uploader_version" not in st.session_state:
+    st.session_state.uploader_version = 0
+if "procesados" not in st.session_state:
+    st.session_state.procesados = {}
+
+
+# Streamlit vuelve a ejecutar el script completo ante cualquier cambio de widget.
+# st.fragment permite que filtros y checkboxes vuelvan a ejecutar SOLO su bloque,
+# evitando recalcular Excel, otros gráficos y resultados individuales.
+if hasattr(st, "fragment"):
+    fragment = st.fragment
+else:
+    def fragment(func):
+        return func
+
+
+def limpiar_analisis():
+    st.session_state.procesados = {}
+    st.session_state.uploader_version += 1
+    for key in list(st.session_state.keys()):
+        if key.startswith((
+            "global_",
+            "_global_",
+            "opt_",
+            "auto_",
+            "cut_",
+            "zda_",
+            "class_",
+            "lbl_",
+            "desglosar_",
+        )):
+            del st.session_state[key]
+
+# ==========================================================
+# FILTROS Y PARÁMETROS GLOBALES
+# ==========================================================
+
+def _valores_detectados_desde_cache():
+    """
+    Obtiene jumbos y tipos de disparo desde los resultados ya procesados.
+    No presupone cuántos equipos existen.
+    """
+    jumbos = []
+    tipos = []
+
+    for r in st.session_state.procesados.values():
+        if r.get("error"):
+            continue
+
+        rep = r.get("resumen_reporte") or {}
+        jumbo = rep.get("Jumbo")
+        tipo = rep.get("Tipo_Disparo")
+
+        if jumbo and str(jumbo).strip():
+            jumbos.append(str(jumbo).strip())
+        if tipo and str(tipo).strip():
+            tipos.append(str(tipo).strip())
+
+    # Orden natural para JUMB001, JUMB002... y luego series/otros.
+    def jumbo_sort_key(valor):
+        m = re.fullmatch(r"JUMB(\d+)", str(valor), re.IGNORECASE)
+        if m:
+            return (0, int(m.group(1)))
+        return (1, str(valor))
+
+    jumbos = sorted(set(jumbos), key=jumbo_sort_key)
+    tipos_presentes = set(tipos)
+    tipos = [t for t in TIPOS_DISPARO if t in tipos_presentes]
+
+    # Si apareciera una clasificación futura no contemplada, no se pierde.
+    tipos_extra = sorted(tipos_presentes - set(TIPOS_DISPARO))
+    tipos.extend(tipos_extra)
+
+    return jumbos, tipos
+
+
+def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
+    """
+    Mantiene la selección del usuario y agrega automáticamente
+    cualquier opción nueva detectada tras procesar más archivos.
+    """
+    options = list(options)
+    prev_options = list(st.session_state.get(previous_options_key, []))
+
+    if key not in st.session_state:
+        st.session_state[key] = options.copy()
+    else:
+        actual = [
+            x for x in st.session_state.get(key, [])
+            if x in options
+        ]
+        nuevos = [
+            x for x in options
+            if x not in prev_options
+        ]
+        for x in nuevos:
+            if x not in actual:
+                actual.append(x)
+        st.session_state[key] = actual
+
+    st.session_state[previous_options_key] = options.copy()
+
+
+jumbos_detectados, tipos_detectados = _valores_detectados_desde_cache()
+
+# Variables siempre definidas aunque aún no existan datos.
+global_jumbos = []
+global_tipos = []
+global_lbl_auto = False
+global_lbl_arm = False
+global_lbl_cut = False
+global_lbl_zda = False
+
+with st.sidebar:
+    st.header("Filtros y parámetros")
+
+    if not jumbos_detectados:
+        st.info(
+            "Los filtros se habilitarán automáticamente después de procesar "
+            "los primeros archivos PDF/ZDA."
+        )
+    else:
+        _sincronizar_multiselect_dinamico(
+            "global_jumbos",
+            jumbos_detectados,
+            "_global_jumbos_options_prev",
+        )
+        _sincronizar_multiselect_dinamico(
+            "global_tipos",
+            tipos_detectados,
+            "_global_tipos_options_prev",
+        )
+
+        global_jumbos = st.multiselect(
+            "Jumbos",
+            jumbos_detectados,
+            key="global_jumbos",
+        )
+
+        global_tipos = st.multiselect(
+            "Tipo de disparo",
+            tipos_detectados,
+            key="global_tipos",
+        )
+
+        st.caption(
+            "Los equipos se detectan automáticamente a partir de los archivos procesados."
+        )
+        st.caption(
+            "Estos filtros se aplican a los gráficos y resúmenes consolidados."
+        )
+        st.caption(
+            "**Clasificación:** FRENTE > 45 barrenos · SELLADA 25–45 barrenos · "
+            "ESTOCADA Y/O CORRECCIONES < 25 barrenos. Conteo sobre barrenos de frente "
+            "(Bottom + Easer + Cut + Contour); Reaming y Casing no se consideran."
+        )
+
+        st.divider()
+        st.subheader("Opciones de gráficos")
+
+        global_lbl_auto = st.checkbox(
+            "Etiquetas · movimiento automático",
+            value=False,
+            key="opt_lbl_auto",
+        )
+        global_lbl_arm = st.checkbox(
+            "Etiquetas · uso por brazo",
+            value=False,
+            key="opt_lbl_arm",
+        )
+        global_lbl_cut = st.checkbox(
+            "Etiquetas · barrenos Cut",
+            value=False,
+            key="opt_lbl_cut",
+        )
+        global_lbl_zda = st.checkbox(
+            "Etiquetas · tiempos de ciclo",
+            value=False,
+            key="opt_lbl_zda",
+        )
+
+        st.caption(
+            "Los filtros no eliminan datos del Excel exportado; la exportación conserva "
+            "todos los archivos procesados."
+        )
+
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def seccion_desde_plan_texto(plan_perforacion):
+    """
+    Devuelve una etiqueta corta de sección desde Plan_Perforacion.
+    Ej.: "MALLA E.E. 4.5x4.5 III-B" -> "4.5 x 4.5"
+    """
+    texto = str(plan_perforacion or "")
+    m = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)",
+        texto,
+    )
+    if not m:
+        return "-"
+
+    a = float(m.group(1).replace(",", "."))
+    b = float(m.group(2).replace(",", "."))
+    return f"{a:.1f} x {b:.1f}"
+
+
 
 
 def hash_archivo(uploaded_file) -> str:
-    contenido = uploaded_file.getvalue()
-
     return hashlib.sha256(
-        contenido
-        + CACHE_SCHEMA_VERSION.encode("utf-8")
+        uploaded_file.getvalue() + CACHE_SCHEMA_VERSION.encode("utf-8")
     ).hexdigest()
 
 
-def crear_excel(
-    df_reportes: pd.DataFrame,
-    df_resumen: pd.DataFrame,
-    df_detalle: pd.DataFrame,
-    df_validacion: pd.DataFrame,
-    df_extras: pd.DataFrame,
-    df_automatico: pd.DataFrame,
-) -> bytes:
-    buffer = BytesIO()
-
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_reportes.to_excel(
-            writer,
-            sheet_name="Resumen_Reportes",
-            index=False,
-        )
-        df_resumen.to_excel(
-            writer,
-            sheet_name="Resumen_Ciclos",
-            index=False,
-        )
-        df_detalle.to_excel(
-            writer,
-            sheet_name="Detalle_Barrenos",
-            index=False,
-        )
-        df_validacion.to_excel(
-            writer,
-            sheet_name="Validacion",
-            index=False,
-        )
-        df_extras.to_excel(
-            writer,
-            sheet_name="Barrenos_Extra",
-            index=False,
-        )
-        df_automatico.to_excel(
-            writer,
-            sheet_name="Uso_Automatico",
-            index=False,
-        )
-
-    buffer.seek(0)
-    wb = load_workbook(buffer)
-
-    fill_header = PatternFill(
-        fill_type="solid",
-        fgColor="1F4E78",
-    )
-    font_header = Font(
-        color="FFFFFF",
-        bold=True,
-    )
-
-    for ws in wb.worksheets:
-        ws.freeze_panes = "A2"
-
-        if ws.max_row >= 1 and ws.max_column >= 1:
-            ws.auto_filter.ref = ws.dimensions
-
-        for cell in ws[1]:
-            cell.fill = fill_header
-            cell.font = font_header
-            cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center",
-            )
-
-        for columna in ws.columns:
-            letra = columna[0].column_letter
-            max_length = 0
-
-            for cell in columna:
-                if cell.value is None:
-                    continue
-
-                max_length = max(
-                    max_length,
-                    len(str(cell.value)),
-                )
-
-            ws.column_dimensions[letra].width = min(
-                max_length + 2,
-                35,
-            )
-
-    salida = BytesIO()
-    wb.save(salida)
-    salida.seek(0)
-
-    return salida.getvalue()
+def fmt(valor, dec=1, sufijo=""):
+    if valor is None or pd.isna(valor):
+        return "-"
+    return f"{float(valor):.{dec}f}{sufijo}"
 
 
 def figura_a_png(fig) -> bytes:
     buffer = BytesIO()
-
-    fig.savefig(
-        buffer,
-        format="png",
-        dpi=250,
-        bbox_inches="tight",
-    )
-
+    fig.savefig(buffer, format="png", dpi=250, bbox_inches="tight")
     buffer.seek(0)
     return buffer.getvalue()
 
 
-def crear_zip_graficos(graficos) -> bytes:
-    buffer = BytesIO()
-
-    with zipfile.ZipFile(
-        buffer,
-        mode="w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zip_file:
-        for nombre, contenido in graficos:
-            zip_file.writestr(
-                nombre,
-                contenido,
-            )
-
-    buffer.seek(0)
-    return buffer.getvalue()
+def concatenar_dataframes(resultados, key, solo_ok=False):
+    dfs = []
+    for r in resultados:
+        if solo_ok and str(r.get("resumen_reporte", {}).get("Estado")) != "OK":
+            continue
+        df = r.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            dfs.append(df)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def nombre_seguro(texto: str) -> str:
-    if not texto:
-        return "sin_nombre"
-
-    texto = str(texto)
-
-    for origen, destino in {
-        "/": "-",
-        "\\": "-",
-        ":": "-",
-        " ": "_",
-    }.items():
-        texto = texto.replace(
-            origen,
-            destino,
+def asegurar_fechahora(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["FechaHora"] = pd.to_datetime(
+        out.get("Fecha_Inicio", pd.Series(index=out.index, dtype=object)).fillna("")
+        + " "
+        + out.get("Hora_Inicio", pd.Series(index=out.index, dtype=object)).fillna(""),
+        format="%d/%m/%Y %H:%M:%S",
+        errors="coerce",
+    )
+    faltan = out["FechaHora"].isna()
+    if faltan.any() and "Fecha_Inicio" in out.columns:
+        out.loc[faltan, "FechaHora"] = pd.to_datetime(
+            out.loc[faltan, "Fecha_Inicio"], format="%d/%m/%Y", errors="coerce"
         )
-
-    return texto
-
-
-def fmt_pct(valor):
-    if valor is None or pd.isna(valor):
-        return "-"
-    return f"{valor:.1f}%"
+    return out[out["FechaHora"].notna()].sort_values(["FechaHora", "Jumbo", "Ciclo"])
 
 
-def clasificar_tipo_disparo(barrenos_realizados):
-    """
-    Clasificación operativa por número de barrenos realizados:
-
-    FRENTE: >= 45
-    SELLADA: 25 a 44
-    ESTOCADA Y/O CORRECCIONES: < 25
-    """
-    if barrenos_realizados is None or pd.isna(barrenos_realizados):
-        return "SIN CLASIFICAR"
-
-    n = int(barrenos_realizados)
-
-    if n >= 45:
-        return "FRENTE"
-    elif n >= 25:
-        return "SELLADA"
-    else:
-        return "ESTOCADA Y/O CORRECCIONES"
-
-
-def calcular_kpi_movimiento_desde_brazos(
-    auto_b1,
-    auto_b2,
-    manual_b1,
-    manual_b2,
-):
-    """
-    KPI reconciliado a partir de los tiempos individuales de ambos brazos.
-
-    % Auto Jumbo =
-        (Auto B1 + Auto B2)
-        / (Auto B1 + Auto B2 + Manual B1 + Manual B2) * 100
-    """
-    valores = [
-        auto_b1,
-        auto_b2,
-        manual_b1,
-        manual_b2,
-    ]
-
-    if any(
-        v is None or pd.isna(v)
-        for v in valores
-    ):
-        return None, None, None, None
-
-    auto_total_brazos = (
-        float(auto_b1)
-        + float(auto_b2)
-    )
-
-    manual_total_brazos = (
-        float(manual_b1)
-        + float(manual_b2)
-    )
-
-    total = (
-        auto_total_brazos
-        + manual_total_brazos
-    )
-
-    if total <= 0:
-        return (
-            auto_total_brazos,
-            manual_total_brazos,
-            None,
-            None,
-        )
-
-    pct_auto = (
-        auto_total_brazos
-        / total
-        * 100
-    )
-
-    pct_manual = (
-        manual_total_brazos
-        / total
-        * 100
-    )
-
-    return (
-        auto_total_brazos,
-        manual_total_brazos,
-        pct_auto,
-        pct_manual,
-    )
-
-
-# ==========================================================
-# HELPERS PARA GRÁFICOS DE TENDENCIA
-# ==========================================================
-
-def preparar_eje_fechas(df_plot: pd.DataFrame):
-    """
-    Asigna una posición X por fecha y distribuye varios ciclos
-    dentro del mismo día alrededor del centro de esa fecha.
-    """
-    fechas = list(
-        df_plot["Fecha"]
-        .drop_duplicates()
-        .sort_values()
-    )
-
-    posiciones = {}
-
-    for indice_dia, fecha in enumerate(fechas):
-        grupo_dia = df_plot[
-            df_plot["Fecha"] == fecha
-        ].sort_values(
-            ["FechaHora", "Jumbo", "Ciclo"]
-        )
-
-        n = len(grupo_dia)
-
-        if n == 1:
-            offsets = [0.0]
-        else:
-            paso = 0.64 / (n - 1)
-            offsets = [
-                -0.32 + (i * paso)
-                for i in range(n)
-            ]
-
-        for offset, idx in zip(
-            offsets,
-            grupo_dia.index,
-        ):
-            posiciones[idx] = (
-                indice_dia + offset
-            )
-
-    return fechas, posiciones
-
-
-def aplicar_formato_eje_fechas(
-    ax,
-    fechas,
-):
-    centros_dia = list(
-        range(len(fechas))
-    )
-
-    ax.set_xticks(
-        centros_dia
-    )
-
-    ax.set_xticklabels(
-        [
-            pd.Timestamp(
-                fecha
-            ).strftime("%d/%m")
-            for fecha in fechas
-        ],
-        fontsize=9,
-    )
-
-    for i in range(
-        len(fechas) - 1
-    ):
-        ax.axvline(
-            i + 0.5,
-            linewidth=0.8,
-            alpha=0.18,
-        )
-
-    ax.set_xlim(
-        -0.55,
-        len(fechas) - 0.45,
-    )
-
-
-def anotar_etiquetas_sin_solape(
-    ax,
-    puntos,
-):
-    """
-    Distribuye las etiquetas de TODOS los puntos del gráfico evitando
-    solapes entre series.
-
-    Cada elemento de ``puntos`` debe contener:
-        x, y, texto
-
-    La lógica prueba posiciones alrededor del punto (arriba, abajo y
-    desplazamientos laterales) y elige la primera que no colisiona con
-    las etiquetas ya ubicadas. Si todas colisionan, escoge la posición
-    con menor área de solape.
-    """
-    if not puntos:
-        return
-
-    fig = ax.figure
-
-    # Necesario para medir el tamaño real de cada etiqueta en pantalla.
-    fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
-    bbox_ejes = ax.get_window_extent(renderer=renderer)
-
-    # Separación visual extra entre etiquetas, expresada como expansión
-    # de su caja en píxeles.
-    cajas_ocupadas = []
-
-    candidatos_arriba = [
-        (0, 12),
-        (-20, 14),
-        (20, 14),
-        (0, 27),
-        (-34, 24),
-        (34, 24),
-        (0, -18),
-        (-20, -20),
-        (20, -20),
-        (0, -34),
-        (-36, -32),
-        (36, -32),
-    ]
-
-    candidatos_abajo = [
-        (0, -18),
-        (-20, -20),
-        (20, -20),
-        (0, -34),
-        (-34, -32),
-        (34, -32),
-        (0, 12),
-        (-20, 14),
-        (20, 14),
-        (0, 27),
-        (-36, 24),
-        (36, 24),
-    ]
-
-    def area_solape(a, b):
-        ancho = max(
-            0.0,
-            min(a.x1, b.x1)
-            - max(a.x0, b.x0),
-        )
-        alto = max(
-            0.0,
-            min(a.y1, b.y1)
-            - max(a.y0, b.y0),
-        )
-        return ancho * alto
-
-    # Orden estable: primero por X y luego por Y. De esta manera los
-    # puntos de una misma fecha se resuelven juntos.
-    puntos_ordenados = sorted(
-        puntos,
-        key=lambda p: (
-            float(p["x"]),
-            float(p["y"]),
-            str(p.get("serie", "")),
-        ),
-    )
-
-    for i, punto in enumerate(puntos_ordenados):
-        x = float(punto["x"])
-        y = float(punto["y"])
-        texto = str(punto["texto"])
-
-        # Alternar la preferencia inicial ayuda a separar etiquetas de
-        # dos series que caen exactamente sobre el mismo punto.
-        candidatos = (
-            candidatos_arriba
-            if i % 2 == 0
-            else candidatos_abajo
-        )
-
-        anotacion = ax.annotate(
-            texto,
-            xy=(x, y),
-            xytext=candidatos[0],
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=8.5,
-            fontweight="medium",
-            annotation_clip=True,
-            arrowprops={
-                "arrowstyle": "-",
-                "linewidth": 0.55,
-                "alpha": 0.38,
-            },
-        )
-
-        mejor = None
-        menor_solape = None
-
-        for dx, dy in candidatos:
-            anotacion.set_position(
-                (dx, dy)
-            )
-            anotacion.set_va(
-                "bottom"
-                if dy >= 0
-                else "top"
-            )
-
-            caja = anotacion.get_window_extent(
-                renderer=renderer
-            )
-
-            # Amplía un poco la caja para dejar aire entre textos.
-            caja_segura = caja.expanded(
-                1.10,
-                1.18,
-            )
-
-            # Evitar que el texto se salga del área útil del gráfico.
-            margen = 3.0
-            dentro_ejes = (
-                caja_segura.x0
-                >= bbox_ejes.x0 + margen
-                and caja_segura.x1
-                <= bbox_ejes.x1 - margen
-                and caja_segura.y0
-                >= bbox_ejes.y0 + margen
-                and caja_segura.y1
-                <= bbox_ejes.y1 - margen
-            )
-
-            if not dentro_ejes:
-                continue
-
-            solape_total = sum(
-                area_solape(
-                    caja_segura,
-                    ocupada,
-                )
-                for ocupada
-                in cajas_ocupadas
-            )
-
-            if solape_total == 0:
-                mejor = (
-                    dx,
-                    dy,
-                    caja_segura,
+def smart_annotations(points, x_window_hours=18, y_window=3.0, font_size=11):
+    """Equivalente del buildSmartAnnotations de la HTML V33."""
+    out, used = [], []
+    points = sorted(points, key=lambda p: (pd.Timestamp(p["x"]), float(p["y"])))
+    x_window = pd.Timedelta(hours=x_window_hours)
+    for i, p in enumerate(points):
+        base_sign = -1 if int(p.get("rank", i)) % 2 == 0 else 1
+        for level in range(8):
+            yshift = base_sign * (18 + level * 14)
+            clash = False
+            for u in used:
+                if (
+                    abs(pd.Timestamp(u["x"]) - pd.Timestamp(p["x"])) <= x_window
+                    and abs(float(u["y"]) - float(p["y"])) <= y_window
+                    and abs(u["yshift"] - yshift) < 14
+                ):
+                    clash = True
+                    break
+            if not clash:
+                used.append({"x": p["x"], "y": p["y"], "yshift": yshift})
+                out.append(
+                    dict(
+                        x=p["x"], y=p["y"], xref="x", yref="y",
+                        showarrow=False, yshift=yshift, text=p["text"],
+                        align="center", font=dict(size=font_size, color="#334155"),
+                        bgcolor="rgba(255,255,255,0.88)",
+                        bordercolor="rgba(203,213,225,0.95)", borderpad=3,
+                    )
                 )
                 break
+    return out
 
-            if (
-                menor_solape is None
-                or solape_total
-                < menor_solape[0]
+
+def base_layout(height=450, **kwargs):
+    layout = dict(
+        height=height,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(family="Arial, sans-serif", size=12, color="#334155"),
+        margin=dict(l=70, r=30, t=70, b=70),
+        hovermode="closest",
+        legend=dict(orientation="h", y=-0.18, x=0),
+        xaxis=dict(showgrid=True, gridcolor="#eef2f7", zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="#eef2f7", zeroline=False),
+    )
+    layout.update(kwargs)
+    return layout
+
+
+
+# ==========================================================
+# EXCEL / BD-PERFO - PUBLICACIÓN V1.0
+# ==========================================================
+
+BD_PERFO_COLUMNS = [
+    "MES","SEMANA","AÑO","FECHA","TURNO","JEFE DE TURNO","OPERADOR","JUMBO",
+    "NIVEL","BLOCK","LABOR","TIPO DISPARO","SECCIÓN","RMR","TIP. DE ROCA",
+    "TIPO EXP.","Hora 1° taladro","Tiempo de perforación efec.","Tiempo de perforación",
+    "Tiempo de movimiento ","T. mov. Manual","T.mov. Autom.","T. AUTOMÁTICO",
+    "# TALADROS","T. MANUAL","Av. Perf","Av.Top","Av.Real","Eficiencia",
+    "Obj. Automático","CONLABOR","Tipo Mat","Ciclo","%AutoDrill","% Auto B1",
+    "% Auto B2","Mediana Cut (m)","Promedio Cut (m)","Hora 1° martillo"
+]
+
+BD_JUMBO_ALIAS = {"JUMB001": "JF01", "JUMB002": "JF02"}
+BD_MESES_OPERATIVOS = [
+    "Enero","Febrero","Marzo","Abril","Mayo","Junio",
+    "Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre",
+]
+
+
+def _bd_num(v):
+    if v is None or pd.isna(v):
+        return None
+    try:
+        n = float(v)
+        return n if pd.notna(n) else None
+    except Exception:
+        return None
+
+
+def _bd_parse_datetime(row):
+    candidatos = []
+    inicio_perf = row.get("Inicio_Perforacion")
+    if inicio_perf is not None and not pd.isna(inicio_perf):
+        candidatos.append(str(inicio_perf))
+    fecha = row.get("Fecha_Inicio")
+    hora = row.get("Hora_Inicio")
+    if fecha is not None and not pd.isna(fecha):
+        candidatos.append(
+            f"{fecha} {hora if hora is not None and not pd.isna(hora) else '00:00:00'}"
+        )
+
+    for s in candidatos:
+        dt = pd.to_datetime(s, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        if pd.notna(dt):
+            return dt.to_pydatetime()
+    return None
+
+
+def _bd_mes_operativo(dt):
+    """
+    Mes operativo para la hoja BD-PERFO.
+
+    Regla:
+    - Del día 01 al 25 -> pertenece al mes calendario actual.
+    - Del día 26 al último día del mes -> pertenece al mes operativo siguiente.
+
+    Ejemplos:
+    - 26/07 al 25/08 = Agosto
+    - 26/08 al 25/09 = Septiembre
+    - 26/12 al 25/01 = Enero
+    """
+    if dt is None:
+        return None
+
+    mes_operativo = dt.month + (1 if dt.day >= 26 else 0)
+    if mes_operativo > 12:
+        mes_operativo = 1
+
+    return BD_MESES_OPERATIVOS[mes_operativo - 1]
+
+
+def _bd_turno(dt):
+    if dt is None:
+        return None
+    return "DIA" if 7 <= dt.hour < 19 else "NOCHE"
+
+
+def _bd_hora_excel(dt):
+    if dt is None:
+        return None
+    return (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400.0
+
+
+def _bd_plan_fields(plan):
+    p = "" if plan is None or pd.isna(plan) else str(plan)
+    seccion = roca = tipo_exp = None
+
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*[xX×]\s*(\d+(?:[.,]\d+)?)", p)
+    if m:
+        seccion = f"{m.group(1).replace(',', '.')}x{m.group(2).replace(',', '.')}"
+
+    m = re.search(r"\b(VI|IV|V|III|II|I)\s*-\s*([A-C])\b", p, re.IGNORECASE)
+    if m:
+        roca = f"{m.group(1).upper()}-{m.group(2).upper()}"
+
+    if re.search(r"\bE\s*\.\s*E\s*\.?", p, re.IGNORECASE):
+        tipo_exp = "Encartuchada"
+    elif re.search(r"\bE\s*\.\s*B\s*\.?", p, re.IGNORECASE):
+        tipo_exp = "Bombeable"
+
+    return seccion, roca, tipo_exp
+
+
+def _bd_labor_fields(row):
+    curve_raw = row.get("Tabla_Curvas")
+    tunnel_raw = row.get("Labor")
+    curve = "" if curve_raw is None or pd.isna(curve_raw) else str(curve_raw).strip()
+    tunnel = "" if tunnel_raw is None or pd.isna(tunnel_raw) else str(tunnel_raw).strip()
+    src = curve or tunnel
+    nivel = block = labor = None
+
+    if src:
+        m = re.search(r"\bNV\s*:?\s*(\d+)\b", src, re.IGNORECASE)
+        if m:
+            nivel = int(m.group(1))
+
+        m = re.search(r"\b(?:BLOCK|B)\s*:?\s*(\d+)\b", src, re.IGNORECASE)
+        if m:
+            block = int(m.group(1))
+
+        if curve:
+            for token in [t for t in re.split(r"\s+", curve) if t]:
+                if re.match(r"^(?:NV|B|BLOCK)\s*:?\d+$", token, re.IGNORECASE):
+                    continue
+                if re.match(r"^\d+$", token):
+                    continue
+                labor = token.upper()
+                break
+
+        if not labor and tunnel:
+            for key, value in re.findall(
+                r"\b([A-Za-z]{1,8})\s*:\s*([A-Za-z0-9._-]+)", tunnel
             ):
-                menor_solape = (
-                    solape_total,
-                    dx,
-                    dy,
-                    caja_segura,
-                )
+                if key.upper() not in {"NV","OP","T","TURN","RMR"}:
+                    labor = f"{key}{value}".upper()
+                    break
 
-        if mejor is None:
-            if menor_solape is not None:
-                _, dx, dy, caja_segura = (
-                    menor_solape
-                )
-                mejor = (
-                    dx,
-                    dy,
-                    caja_segura,
-                )
-            else:
-                # Fallback muy defensivo.
-                dx, dy = candidatos[0]
-                anotacion.set_position(
-                    (dx, dy)
-                )
-                anotacion.set_va(
-                    "bottom"
-                    if dy >= 0
-                    else "top"
-                )
-                caja_segura = (
-                    anotacion
-                    .get_window_extent(
-                        renderer=renderer
-                    )
-                    .expanded(
-                        1.10,
-                        1.18,
-                    )
-                )
-                mejor = (
-                    dx,
-                    dy,
-                    caja_segura,
-                )
-
-        dx, dy, caja_final = mejor
-
-        anotacion.set_position(
-            (dx, dy)
-        )
-        anotacion.set_va(
-            "bottom"
-            if dy >= 0
-            else "top"
-        )
-
-        # La línea guía solo se muestra cuando la etiqueta fue desplazada
-        # de forma apreciable.
-        if anotacion.arrow_patch is not None:
-            anotacion.arrow_patch.set_visible(
-                abs(dx) >= 18
-                or abs(dy) >= 24
-            )
-
-        cajas_ocupadas.append(
-            caja_final
-        )
+    return nivel, block, labor
 
 
-def crear_puntos_etiquetas(
-    df_plot,
-    x_col,
-    y_col,
-    etiqueta_extra_col=None,
-    serie=None,
-):
-    """Convierte una serie del DataFrame en etiquetas para el solver."""
-    puntos = []
+def _bd_operator_map(df_reportes):
+    out = {}
+    if df_reportes.empty or "Fuente" not in df_reportes.columns:
+        return out
 
-    for _, fila in df_plot.iterrows():
-        x = fila.get(x_col)
-        y = fila.get(y_col)
+    pdfs = df_reportes[
+        df_reportes["Fuente"].astype(str).str.upper().eq("PDF")
+    ].copy()
 
-        if (
-            x is None
-            or y is None
-            or pd.isna(x)
-            or pd.isna(y)
-        ):
+    for _, r in pdfs.iterrows():
+        op = r.get("Operario")
+        if op is None or pd.isna(op) or str(op).strip() == "":
             continue
-
-        texto = f"{float(y):.1f}%"
-
-        if (
-            etiqueta_extra_col
-            and etiqueta_extra_col
-            in df_plot.columns
-        ):
-            valor_extra = fila.get(
-                etiqueta_extra_col
-            )
-
-            if (
-                valor_extra is not None
-                and not pd.isna(valor_extra)
-            ):
-                texto += (
-                    f"\n{int(valor_extra)} tal."
-                )
-
-        puntos.append(
-            {
-                "x": float(x),
-                "y": float(y),
-                "texto": texto,
-                "serie": serie or "",
-            }
+        op = str(op).strip()
+        serie_base = re.sub(
+            r"-(?:\d+|L)$",
+            "",
+            str(r.get("Numero_Serie") or ""),
+            flags=re.IGNORECASE,
         )
-
-    return puntos
-
-
-# ==========================================================
-# GRÁFICO GENERAL: USO AUTOMÁTICO POR EQUIPO
-# ==========================================================
-
-def generar_grafico_tendencia_automatico(
-    df_auto: pd.DataFrame,
-):
-    df_plot = df_auto.copy()
-
-    if "Considerado_KPI_Automatizacion" in df_plot.columns:
-        df_plot = df_plot[
-            df_plot["Considerado_KPI_Automatizacion"] == True
-        ].copy()
-
-    df_plot = df_plot[
-        df_plot[
-            "Pct_Movimiento_Automatico_Brazos"
-        ].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    df_plot["FechaHora"] = pd.to_datetime(
-        (
-            df_plot[
-                "Fecha_Inicio"
-            ].fillna("")
-            + " "
-            + df_plot[
-                "Hora_Inicio"
-            ].fillna("")
-        ),
-        format="%d/%m/%Y %H:%M:%S",
-        errors="coerce",
-    )
-
-    df_plot = df_plot[
-        df_plot[
-            "FechaHora"
-        ].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    df_plot["Fecha"] = (
-        df_plot[
-            "FechaHora"
-        ].dt.normalize()
-    )
-
-    df_plot = df_plot.sort_values(
-        [
-            "FechaHora",
-            "Jumbo",
-            "Ciclo",
+        keys = [
+            f"{r.get('Jumbo','')}|{r.get('Ciclo','')}",
+            f"{serie_base}|{r.get('Ciclo','')}",
         ]
-    ).reset_index(
-        drop=True
-    )
+        for key in keys:
+            if key.startswith("|") or key.endswith("|"):
+                continue
+            out.setdefault(key, [])
+            if op not in out[key]:
+                out[key].append(op)
 
-    fechas, posiciones = (
-        preparar_eje_fechas(
-            df_plot
-        )
-    )
+    return {k: " / ".join(v) for k, v in out.items()}
 
-    df_plot["X"] = [
-        posiciones[idx]
-        for idx in df_plot.index
+
+def _bd_operador_para_zda(row, op_map):
+    serie_base = re.sub(
+        r"-(?:\d+|L)$",
+        "",
+        str(row.get("Numero_Serie") or ""),
+        flags=re.IGNORECASE,
+    )
+    keys = [
+        f"{row.get('Jumbo','')}|{row.get('Ciclo','')}",
+        f"{serie_base}|{row.get('Ciclo','')}",
     ]
-
-    fig, ax = plt.subplots(
-        figsize=(14, 7.0)
-    )
-
-    # ------------------------------------------------------
-    # KPI GLOBAL PONDERADO POR MINUTOS DE MOVIMIENTO
-    # % Auto global = Σ Auto / (Σ Auto + Σ Manual) × 100
-    # ------------------------------------------------------
-
-    kpis_globales = []
-
-    for jumbo, grupo in df_plot.groupby(
-        "Jumbo",
-        dropna=False,
-    ):
-        auto_total = (
-            grupo[
-                "Auto_Brazo1_min"
-            ].sum(
-                min_count=1
-            )
-            +
-            grupo[
-                "Auto_Brazo2_min"
-            ].sum(
-                min_count=1
-            )
-        )
-
-        manual_total = (
-            grupo[
-                "Manual_Brazo1_min"
-            ].sum(
-                min_count=1
-            )
-            +
-            grupo[
-                "Manual_Brazo2_min"
-            ].sum(
-                min_count=1
-            )
-        )
-
-        if (
-            pd.notna(auto_total)
-            and pd.notna(manual_total)
-            and (
-                auto_total
-                + manual_total
-            ) > 0
-        ):
-            pct_global = (
-                auto_total
-                / (
-                    auto_total
-                    + manual_total
-                )
-                * 100
-            )
-
-            kpis_globales.append(
-                (
-                    str(jumbo),
-                    pct_global,
-                )
-            )
-
-    puntos_etiquetas = []
-
-    for jumbo, grupo in df_plot.groupby(
-        "Jumbo",
-        dropna=False,
-    ):
-        grupo = grupo.sort_values(
-            "FechaHora"
-        )
-
-        ax.plot(
-            grupo["X"],
-            grupo[
-                "Pct_Movimiento_Automatico_Brazos"
-            ],
-            marker="o",
-            markersize=6,
-            linewidth=2.0,
-            label=str(jumbo),
-        )
-
-        puntos_etiquetas.extend(
-            crear_puntos_etiquetas(
-                grupo,
-                "X",
-                "Pct_Movimiento_Automatico_Brazos",
-                etiqueta_extra_col="Barrenos_Realizados",
-                serie=str(jumbo),
-            )
-        )
-
-    aplicar_formato_eje_fechas(
-        ax,
-        fechas,
-    )
-
-    max_y = float(
-        df_plot[
-            "Pct_Movimiento_Automatico_Brazos"
-        ].max()
-    )
-
-    limite_superior = max(
-        50,
-        math.ceil(
-            (max_y + 10)
-            / 10
-        )
-        * 10,
-    )
-
-    limite_superior = min(
-        100,
-        limite_superior,
-    )
-
-    ax.set_ylim(
-        0,
-        limite_superior,
-    )
-
-    ax.set_yticks(
-        range(
-            0,
-            int(
-                limite_superior
-            )
-            + 1,
-            10,
-        )
-    )
-
-    ax.set_title(
-        "Evolución del uso automático del movimiento de brazos",
-        fontsize=15,
-        pad=18,
-    )
-
-    ax.set_xlabel(
-        "Fecha",
-        labelpad=10,
-    )
-
-    ax.set_ylabel(
-        "Movimiento automático (%)",
-        labelpad=10,
-    )
-
-    ax.grid(
-        axis="y",
-        alpha=0.22,
-    )
-
-    ax.grid(
-        axis="x",
-        visible=False,
-    )
-
-    ax.legend(
-        title="Jumbo",
-        frameon=False,
-        loc="upper right",
-    )
-
-    ax.spines[
-        "top"
-    ].set_visible(False)
-
-    ax.spines[
-        "right"
-    ].set_visible(False)
-
-    # ------------------------------------------------------
-    # KPI GLOBAL EN LA PARTE SUPERIOR DEL GRÁFICO
-    # ------------------------------------------------------
-
-    if kpis_globales:
-        if len(kpis_globales) == 1:
-            posiciones_x = [0.50]
-        else:
-            posiciones_x = [
-                0.34,
-                0.66,
-            ]
-
-        for x, (
-            jumbo,
-            pct_global,
-        ) in zip(
-            posiciones_x,
-            kpis_globales,
-        ):
-            fig.text(
-                x,
-                0.945,
-                (
-                    f"{jumbo}  |  "
-                    f"Automático global: "
-                    f"{pct_global:.1f}%"
-                ),
-                ha="center",
-                va="center",
-                fontsize=10,
-                fontweight="bold",
-                bbox={
-                    "boxstyle":
-                        "round,pad=0.45",
-                    "facecolor":
-                        "white",
-                    "edgecolor":
-                        "0.75",
-                    "linewidth":
-                        0.8,
-                },
-            )
-
-    # ------------------------------------------------------
-    # NOTA METODOLÓGICA
-    # ------------------------------------------------------
-
-    fig.text(
-        0.5,
-        0.018,
-        (
-            "Nota: el KPI considera solo disparos FRENTE (>=45 barrenos). "
-            "El porcentaje global del Jumbo se calcula con los tiempos individuales "
-            "de ambos brazos: Σ(Auto B1 + Auto B2) / "
-            "Σ(Auto B1 + Auto B2 + Manual B1 + Manual B2) × 100."
-        ),
-        ha="center",
-        va="bottom",
-        fontsize=8.5,
-        color="dimgray",
-    )
-
-    # Deja espacio para los KPI superiores y la nota inferior.
-    fig.tight_layout(
-        rect=[
-            0,
-            0.055,
-            1,
-            0.89,
-        ]
-    )
-
-    # Resolver conjuntamente las etiquetas de todos los Jumbos.
-    anotar_etiquetas_sin_solape(
-        ax,
-        puntos_etiquetas,
-    )
-
-    return fig
+    for key in keys:
+        if key in op_map:
+            return op_map[key]
+    return None
 
 
-# ==========================================================
-# GRÁFICO: EVOLUCIÓN DE LA MEDIANA DE BARRENOS CUT
-# ==========================================================
+def _bd_cut_stats(df_detalle, jumbo, ciclo):
+    if df_detalle.empty or "Longitud_roca_m" not in df_detalle.columns:
+        return None, None
 
-def generar_grafico_mediana_cut(
-    df_resumen: pd.DataFrame,
-):
-    """
-    Muestra la evolución de la mediana de longitud perforada
-    de los barrenos Cut para cada ciclo.
+    mask = pd.Series(True, index=df_detalle.index)
+    if "Fuente" in df_detalle.columns:
+        mask &= df_detalle["Fuente"].astype(str).str.upper().eq("ZDA")
+    if "Jumbo" in df_detalle.columns:
+        mask &= df_detalle["Jumbo"].astype(str).eq(str(jumbo))
+    if "Ciclo" in df_detalle.columns:
+        mask &= df_detalle["Ciclo"].astype(str).eq(str(ciclo))
+    if "Tipo" in df_detalle.columns:
+        mask &= df_detalle["Tipo"].astype(str).str.upper().eq("CUT")
 
-    Cada Jumbo se representa como una serie independiente.
-    """
-    if df_resumen is None or df_resumen.empty:
+    vals = pd.to_numeric(
+        df_detalle.loc[mask, "Longitud_roca_m"], errors="coerce"
+    ).dropna()
+
+    if vals.empty:
+        return None, None
+    return float(vals.median()), float(vals.mean())
+
+
+def _bd_primer_martillo(df_detalle, jumbo, ciclo):
+    if df_detalle.empty or "Inicio_Barreno_TS" not in df_detalle.columns:
         return None
 
-    columnas_requeridas = {
-        "Tipo",
-        "Mediana",
-        "Fecha_Inicio",
-        "Hora_Inicio",
-        "Jumbo",
-        "Ciclo",
+    mask = pd.Series(True, index=df_detalle.index)
+    if "Fuente" in df_detalle.columns:
+        mask &= df_detalle["Fuente"].astype(str).str.upper().eq("ZDA")
+    if "Jumbo" in df_detalle.columns:
+        mask &= df_detalle["Jumbo"].astype(str).eq(str(jumbo))
+    if "Ciclo" in df_detalle.columns:
+        mask &= df_detalle["Ciclo"].astype(str).eq(str(ciclo))
+
+    ts = pd.to_numeric(
+        df_detalle.loc[mask, "Inicio_Barreno_TS"], errors="coerce"
+    ).dropna()
+    if ts.empty:
+        return None
+
+    d = datetime.fromtimestamp(int(ts.min()), tz=timezone.utc)
+    return (d.hour * 3600 + d.minute * 60 + d.second) / 86400.0
+
+
+def construir_bd_perfo(df_reportes, df_detalle):
+    if df_reportes.empty or "Fuente" not in df_reportes.columns:
+        return pd.DataFrame(columns=BD_PERFO_COLUMNS)
+
+    op_map = _bd_operator_map(df_reportes)
+    zda = df_reportes[
+        df_reportes["Fuente"].astype(str).str.upper().eq("ZDA")
+    ].copy()
+    rows = []
+
+    for _, r in zda.iterrows():
+        dt = _bd_parse_datetime(r)
+        seccion, roca, tipo_exp = _bd_plan_fields(r.get("Plan_Perforacion"))
+        nivel, block, labor = _bd_labor_fields(r)
+
+        auto = _bd_num(r.get("Auto_Total_Brazos_min"))
+        manual = _bd_num(r.get("Manual_Total_Brazos_min"))
+
+        if auto is None:
+            a1 = _bd_num(r.get("Auto_Brazo1_min"))
+            a2 = _bd_num(r.get("Auto_Brazo2_min"))
+            if a1 is not None and a2 is not None:
+                auto = a1 + a2
+
+        if manual is None:
+            m1 = _bd_num(r.get("Manual_Brazo1_min"))
+            m2 = _bd_num(r.get("Manual_Brazo2_min"))
+            if m1 is not None and m2 is not None:
+                manual = m1 + m2
+
+        movimiento = (
+            auto + manual
+            if auto is not None and manual is not None
+            else None
+        )
+        taladros = _bd_num(r.get("Barrenos_Realizados"))
+        t_automatico = auto * 60 / 26.5 if auto is not None else None
+        t_manual = (
+            taladros - t_automatico
+            if taladros is not None and t_automatico is not None
+            else None
+        )
+        obj_automatico = (
+            t_automatico / taladros
+            if taladros not in (None, 0) and t_automatico is not None
+            else None
+        )
+
+        auto_b1 = _bd_num(r.get("Auto_Brazo1_min"))
+        man_b1 = _bd_num(r.get("Manual_Brazo1_min"))
+        auto_b2 = _bd_num(r.get("Auto_Brazo2_min"))
+        man_b2 = _bd_num(r.get("Manual_Brazo2_min"))
+
+        pct_auto_drill = (
+            auto / (auto + manual)
+            if auto is not None and manual is not None and (auto + manual) > 0
+            else None
+        )
+        pct_auto_b1 = (
+            auto_b1 / (auto_b1 + man_b1)
+            if auto_b1 is not None and man_b1 is not None and (auto_b1 + man_b1) > 0
+            else None
+        )
+        pct_auto_b2 = (
+            auto_b2 / (auto_b2 + man_b2)
+            if auto_b2 is not None and man_b2 is not None and (auto_b2 + man_b2) > 0
+            else None
+        )
+
+        med_cut, prom_cut = _bd_cut_stats(
+            df_detalle, r.get("Jumbo"), r.get("Ciclo")
+        )
+        primer_martillo = _bd_primer_martillo(
+            df_detalle, r.get("Jumbo"), r.get("Ciclo")
+        )
+
+        conlabor = (
+            f"{labor} {block} {nivel}"
+            if labor and block is not None and nivel is not None
+            else None
+        )
+
+        tiempo_perf_s = _bd_num(r.get("Tiempo_Perforacion_s"))
+
+        rows.append({
+            "MES": _bd_mes_operativo(dt),
+            "SEMANA": None,
+            "AÑO": dt.year if dt else None,
+            "FECHA": datetime(dt.year, dt.month, dt.day) if dt else None,
+            "TURNO": _bd_turno(dt),
+            "JEFE DE TURNO": None,
+            "OPERADOR": _bd_operador_para_zda(r, op_map),
+            "JUMBO": BD_JUMBO_ALIAS.get(r.get("Jumbo"), r.get("Jumbo")),
+            "NIVEL": nivel,
+            "BLOCK": block,
+            "LABOR": labor,
+            "TIPO DISPARO": r.get("Tipo_Disparo"),
+            "SECCIÓN": seccion,
+            "RMR": None,
+            "TIP. DE ROCA": roca,
+            "TIPO EXP.": tipo_exp,
+            "Hora 1° taladro": _bd_hora_excel(dt),
+            "Tiempo de perforación efec.": None,
+            "Tiempo de perforación": (
+                tiempo_perf_s / 86400.0 if tiempo_perf_s is not None else None
+            ),
+            "Tiempo de movimiento ": (
+                movimiento / 1440.0 if movimiento is not None else None
+            ),
+            "T. mov. Manual": (
+                manual / 1440.0 if manual is not None else None
+            ),
+            "T.mov. Autom.": (
+                auto / 1440.0 if auto is not None else None
+            ),
+            "T. AUTOMÁTICO": t_automatico,
+            "# TALADROS": taladros,
+            "T. MANUAL": t_manual,
+            "Av. Perf": None,
+            "Av.Top": None,
+            "Av.Real": None,
+            "Eficiencia": None,
+            "Obj. Automático": obj_automatico,
+            "CONLABOR": conlabor,
+            "Tipo Mat": None,
+            "Ciclo": r.get("Ciclo"),
+            "%AutoDrill": pct_auto_drill,
+            "% Auto B1": pct_auto_b1,
+            "% Auto B2": pct_auto_b2,
+            "Mediana Cut (m)": med_cut,
+            "Promedio Cut (m)": prom_cut,
+            "Hora 1° martillo": primer_martillo,
+        })
+
+    return pd.DataFrame(rows, columns=BD_PERFO_COLUMNS)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def crear_excel_publicacion(df_bd_perfo, df_reportes, df_resumen):
+    buffer = BytesIO()
+
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_bd_perfo.to_excel(writer, sheet_name="BD-PERFO", index=False)
+        df_reportes.to_excel(writer, sheet_name="Resumen_Reportes", index=False)
+        df_resumen.to_excel(writer, sheet_name="Resumen_Ciclos", index=False)
+
+    buffer.seek(0)
+    wb = load_workbook(buffer)
+
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcMode = "auto"
+
+    fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    font = Font(color="FFFFFF", bold=True)
+
+    for ws_any in wb.worksheets:
+        ws_any.freeze_panes = "A2"
+        if ws_any.max_row >= 1 and ws_any.max_column >= 1:
+            ws_any.auto_filter.ref = ws_any.dimensions
+            for c in ws_any[1]:
+                c.fill = fill
+                c.font = font
+                c.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                )
+
+    ws = wb["BD-PERFO"]
+
+    formatos = {
+        "D": "dd/mm/yyyy",
+        "Q": "hh:mm:ss",
+        "R": "[h]:mm",
+        "S": "[h]:mm",
+        "T": "[h]:mm",
+        "U": "[h]:mm",
+        "V": "[h]:mm",
+        "W": "0",
+        "Y": "0",
+        "AC": "0.0%",
+        "AD": "0.0%",
+        "AH": "0.0%",
+        "AI": "0.0%",
+        "AJ": "0.0%",
+        "AK": "0.00",
+        "AL": "0.00",
+        "AM": "hh:mm:ss",
     }
 
-    if not columnas_requeridas.issubset(df_resumen.columns):
-        return None
+    for row in range(2, ws.max_row + 1):
+        ws[f"C{row}"] = f"=YEAR(D{row})"
+        ws[f"V{row}"] = f"=T{row}-U{row}"
+        ws[f"W{row}"] = f"=V{row}*86400/26.5"
+        ws[f"Y{row}"] = f"=X{row}-W{row}"
+        ws[f"AC{row}"] = f"=AB{row}/Z{row}"
+        ws[f"AD{row}"] = f"=W{row}/X{row}"
+        ws[f"AE{row}"] = f'=K{row}&" "&J{row}&" "&I{row}'
+        ws[f"AH{row}"] = f"=V{row}/T{row}"
 
-    df_plot = df_resumen.copy()
+        for col, fmt_code in formatos.items():
+            ws[f"{col}{row}"].number_format = fmt_code
 
-    # Tipo puede ser categórico; convertir a texto evita problemas
-    # al filtrar y conserva únicamente los barrenos Cut.
-    df_plot = df_plot[
-        df_plot["Tipo"].astype(str).str.lower() == "cut"
-    ].copy()
+    widths = [
+        12,10,8,12,10,18,18,10,10,10,16,24,12,10,14,16,16,24,22,22,
+        18,18,16,12,14,12,12,12,12,18,24,14,10,14,14,14,16,16,16,
+    ]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[
+            ws.cell(row=1, column=idx).column_letter
+        ].width = width
 
-    df_plot = df_plot[
-        df_plot["Mediana"].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    df_plot["FechaHora"] = pd.to_datetime(
-        (
-            df_plot["Fecha_Inicio"].fillna("")
-            + " "
-            + df_plot["Hora_Inicio"].fillna("")
-        ),
-        format="%d/%m/%Y %H:%M:%S",
-        errors="coerce",
-    )
-
-    # Fallback si no existe hora válida.
-    faltantes = df_plot["FechaHora"].isna()
-    if faltantes.any():
-        df_plot.loc[faltantes, "FechaHora"] = pd.to_datetime(
-            df_plot.loc[faltantes, "Fecha_Inicio"],
-            format="%d/%m/%Y",
-            errors="coerce",
-        )
-
-    df_plot = df_plot[
-        df_plot["FechaHora"].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    df_plot["Fecha"] = df_plot["FechaHora"].dt.normalize()
-
-    df_plot = df_plot.sort_values(
-        ["FechaHora", "Jumbo", "Ciclo"]
-    ).reset_index(drop=True)
-
-    fechas, posiciones = preparar_eje_fechas(df_plot)
-    df_plot["X"] = [posiciones[idx] for idx in df_plot.index]
-
-    fig, ax = plt.subplots(figsize=(14, 6.2))
-    puntos_etiquetas = []
-
-    for jumbo, grupo in df_plot.groupby("Jumbo", dropna=False):
-        grupo = grupo.sort_values("FechaHora")
-
-        ax.plot(
-            grupo["X"],
-            grupo["Mediana"],
-            marker="o",
-            markersize=6,
-            linewidth=2.0,
-            label=str(jumbo),
-        )
-
-        for _, fila in grupo.iterrows():
-            ciclo = fila.get("Ciclo")
-            ciclo_txt = (
-                f"Ciclo {int(ciclo)}"
-                if pd.notna(ciclo)
-                else "Ciclo -"
+    for nombre_hoja in ["Resumen_Reportes", "Resumen_Ciclos"]:
+        ws_tabla = wb[nombre_hoja]
+        for col in ws_tabla.columns:
+            letra = col[0].column_letter
+            ancho = max(
+                (len(str(c.value)) for c in col if c.value is not None),
+                default=8,
             )
-            puntos_etiquetas.append({
-                "x": fila["X"],
-                "y": fila["Mediana"],
-                "texto": f"{fila['Mediana']:.2f} m\n{ciclo_txt}",
-                "serie": str(jumbo),
-            })
+            ws_tabla.column_dimensions[letra].width = min(ancho + 2, 35)
 
-    aplicar_formato_eje_fechas(ax, fechas)
+    salida = BytesIO()
+    wb.save(salida)
+    salida.seek(0)
+    return salida.getvalue()
 
-    min_y = float(df_plot["Mediana"].min())
-    max_y = float(df_plot["Mediana"].max())
-    rango = max(max_y - min_y, 0.20)
-    margen = max(0.12, rango * 0.20)
+# ==========================================================
+# GRÁFICOS CONSOLIDADOS
+# ==========================================================
 
-    ax.set_ylim(
-        max(0, min_y - margen),
-        max_y + margen,
-    )
 
-    ax.set_title(
-        "Evolución de la mediana de longitud de barrenos Cut",
-        fontsize=15,
-        pad=18,
-    )
-    ax.set_xlabel("Fecha", labelpad=10)
-    ax.set_ylabel("Mediana longitud Cut (m)", labelpad=10)
+def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool):
+    if df_auto.empty:
+        return None
+    df = df_auto.copy()
+    # La población ya llega filtrada desde el bloque de automatización.
+    # No se fuerza FRENTE aquí para que SELLADA y ESTOCADA Y/O CORRECCIONES
+    # tengan efecto real en el filtro.
+    df = df[df["Pct_Movimiento_Automatico_Brazos"].notna()].copy()
+    df = asegurar_fechahora(df)
+    if df.empty:
+        return None
 
-    ax.grid(axis="y", alpha=0.22)
-    ax.grid(axis="x", visible=False)
-
-    if df_plot["Jumbo"].nunique(dropna=False) > 1:
-        ax.legend(
-            title="Jumbo",
-            frameon=False,
-            loc="upper right",
-        )
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    fig.tight_layout(rect=[0, 0.03, 1, 0.96])
-
-    # Reutiliza la lógica de distribución de etiquetas para evitar
-    # que medianas cercanas se solapen entre ciclos o Jumbos.
-    anotar_etiquetas_sin_solape(
-        ax,
-        puntos_etiquetas,
-    )
-
+    fig = go.Figure()
+    annotations = []
+    points = []
+    jumbos = list(df["Jumbo"].dropna().astype(str).unique())
+    for idx, jumbo in enumerate(jumbos):
+        g = df[df["Jumbo"].astype(str) == jumbo].sort_values("FechaHora")
+        fig.add_trace(go.Scatter(
+            x=g["FechaHora"], y=g["Pct_Movimiento_Automatico_Brazos"],
+            mode="lines+markers", name=jumbo,
+            line=dict(width=3, color=COLORES[idx % len(COLORES)], shape="spline"),
+            marker=dict(size=9),
+            customdata=g[["Barrenos_Realizados"]].to_numpy(),
+            hovertemplate=(f"{jumbo}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%"
+                           "<br>Barrenos: %{customdata[0]} tal.<extra></extra>"),
+        ))
+        auto = pd.to_numeric(g["Auto_Total_Brazos_min"], errors="coerce").sum(min_count=1)
+        manual = pd.to_numeric(g["Manual_Total_Brazos_min"], errors="coerce").sum(min_count=1)
+        kpi = auto / (auto + manual) * 100 if pd.notna(auto) and pd.notna(manual) and (auto + manual) > 0 else None
+        annotations.append(dict(
+            xref="paper", yref="paper", x=0.01, y=1.18 - idx*0.08, xanchor="left",
+            text=f"<b>{jumbo}</b> · Automático global: <b>{fmt(kpi,1,'%')}</b>",
+            showarrow=False, bgcolor="rgba(255,255,255,0.92)", bordercolor="#dbe3ea", borderpad=5,
+        ))
+        if mostrar_etiquetas:
+            for i, (_, r) in enumerate(g.iterrows()):
+                points.append(dict(
+                    x=r["FechaHora"], y=r["Pct_Movimiento_Automatico_Brazos"],
+                    text=f"{r['Pct_Movimiento_Automatico_Brazos']:.1f}%<br>{int(r['Barrenos_Realizados']) if pd.notna(r.get('Barrenos_Realizados')) else '-'} tal.",
+                    rank=i+idx,
+                ))
+    if mostrar_etiquetas:
+        annotations.extend(smart_annotations(points, x_window_hours=18, y_window=4, font_size=11))
+    fig.update_layout(**base_layout(
+        470, annotations=annotations, margin=dict(l=78,r=35,t=120,b=72),
+        yaxis=dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7"),
+        xaxis=dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7"),
+    ))
     return fig
 
 
-# ==========================================================
-# GRÁFICO POR JUMBO: BRAZO 1 VS BRAZO 2
-# ==========================================================
-
-def generar_grafico_brazos_por_jumbo(
-    df_auto: pd.DataFrame,
-    jumbo: str,
-):
-    """
-    Compara el porcentaje automático de Brazo 1 y Brazo 2
-    para un Jumbo específico.
-    """
-    df_plot = df_auto[
-        df_auto["Jumbo"] == jumbo
-    ].copy()
-
-    if "Considerado_KPI_Automatizacion" in df_plot.columns:
-        df_plot = df_plot[
-            df_plot["Considerado_KPI_Automatizacion"] == True
-        ].copy()
-
-    df_plot = df_plot[
-        df_plot[
-            "Pct_Automatico_Brazo1"
-        ].notna()
-        |
-        df_plot[
-            "Pct_Automatico_Brazo2"
-        ].notna()
-    ].copy()
-
-    if df_plot.empty:
+def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool):
+    df = df_auto[df_auto["Jumbo"].astype(str) == str(jumbo)].copy()
+    # La población ya llega filtrada desde el bloque de automatización.
+    df = df[df["Pct_Automatico_Brazo1"].notna() | df["Pct_Automatico_Brazo2"].notna()].copy()
+    df = asegurar_fechahora(df)
+    if df.empty:
         return None
 
-    df_plot["FechaHora"] = pd.to_datetime(
-        (
-            df_plot[
-                "Fecha_Inicio"
-            ].fillna("")
-            + " "
-            + df_plot[
-                "Hora_Inicio"
-            ].fillna("")
-        ),
-        format="%d/%m/%Y %H:%M:%S",
-        errors="coerce",
-    )
-
-    df_plot = df_plot[
-        df_plot[
-            "FechaHora"
-        ].notna()
-    ].copy()
-
-    if df_plot.empty:
-        return None
-
-    df_plot["Fecha"] = (
-        df_plot[
-            "FechaHora"
-        ].dt.normalize()
-    )
-
-    df_plot = df_plot.sort_values(
-        [
-            "FechaHora",
-            "Ciclo",
-        ]
-    ).reset_index(
-        drop=True
-    )
-
-    fechas, posiciones = (
-        preparar_eje_fechas(
-            df_plot
-        )
-    )
-
-    df_plot["X"] = [
-        posiciones[idx]
-        for idx in df_plot.index
-    ]
-
-    # Gap absoluto en puntos porcentuales
-    df_plot[
-        "Gap_Brazos_pp"
-    ] = (
-        df_plot[
-            "Pct_Automatico_Brazo1"
-        ]
-        - df_plot[
-            "Pct_Automatico_Brazo2"
-        ]
-    ).abs()
-
-    fig, ax = plt.subplots(
-        figsize=(14, 6.2)
-    )
-
+    fig = go.Figure()
+    annotations = []
+    points = []
     series = [
-        (
-            "Brazo 1",
-            "Pct_Automatico_Brazo1",
-        ),
-        (
-            "Brazo 2",
-            "Pct_Automatico_Brazo2",
-        ),
+        ("Brazo 1", "Pct_Automatico_Brazo1", "Auto_Brazo1_min", "Manual_Brazo1_min", 0),
+        ("Brazo 2", "Pct_Automatico_Brazo2", "Auto_Brazo2_min", "Manual_Brazo2_min", 1),
     ]
-
-    puntos_etiquetas = []
-
-    for nombre_serie, columna in series:
-        grupo = df_plot[
-            df_plot[
-                columna
-            ].notna()
-        ].copy()
-
-        if grupo.empty:
+    for nombre, col, auto_col, man_col, idx in series:
+        g = df[df[col].notna()].sort_values("FechaHora")
+        if g.empty:
             continue
+        auto = pd.to_numeric(g[auto_col], errors="coerce").sum(min_count=1)
+        manual = pd.to_numeric(g[man_col], errors="coerce").sum(min_count=1)
+        global_pct = auto / (auto + manual) * 100 if pd.notna(auto) and pd.notna(manual) and (auto + manual) > 0 else None
+        fig.add_trace(go.Scatter(
+            x=g["FechaHora"], y=g[col], mode="lines+markers",
+            name=f"{nombre} · Global {fmt(global_pct,1,'%')}",
+            line=dict(width=2.5, color=COLORES[idx], shape="spline"), marker=dict(size=8),
+            hovertemplate=f"{nombre}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%<extra></extra>",
+        ))
+        annotations.append(dict(
+            xref="paper", yref="paper", x=0.01 + idx*0.25, y=1.16, xanchor="left",
+            text=f"<b>{nombre} global: {fmt(global_pct,1,'%')}</b>", showarrow=False,
+            bgcolor="rgba(255,255,255,0.92)", bordercolor="#dbe3ea", borderpad=5,
+        ))
+        if mostrar_etiquetas:
+            for i, (_, r) in enumerate(g.iterrows()):
+                points.append(dict(x=r["FechaHora"], y=r[col], text=f"{r[col]:.1f}%", rank=i+idx*100))
+    if mostrar_etiquetas:
+        annotations.extend(smart_annotations(points, x_window_hours=18, y_window=4, font_size=10))
+    fig.update_layout(**base_layout(
+        430, title=dict(text=f"<b>{jumbo}</b>", x=0.01), annotations=annotations,
+        margin=dict(l=72,r=30,t=92,b=72),
+        yaxis=dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7"),
+        xaxis=dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7"),
+    ))
+    return fig
 
-        ax.plot(
-            grupo["X"],
-            grupo[columna],
-            marker="o",
-            markersize=6,
-            linewidth=2.0,
-            label=nombre_serie,
-        )
 
-        puntos_etiquetas.extend(
-            crear_puntos_etiquetas(
-                grupo,
-                "X",
-                columna,
-                etiqueta_extra_col="Barrenos_Realizados",
-                serie=nombre_serie,
-            )
-        )
+def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.DataFrame:
+    if df_resumen.empty:
+        return pd.DataFrame()
+    cut = df_resumen[df_resumen["Tipo"].astype(str).str.lower() == "cut"].copy()
+    cut = cut[cut["Mediana"].notna()].copy()
+    if cut.empty:
+        return cut
+    cols = [c for c in ["Jumbo","Ciclo","Fecha_Inicio","Tipo_Disparo"] if c in df_reportes.columns]
+    tipos = df_reportes[cols].drop_duplicates(subset=[c for c in ["Jumbo","Ciclo","Fecha_Inicio"] if c in cols])
+    cut = cut.merge(tipos, on=["Jumbo","Ciclo","Fecha_Inicio"], how="left")
+    cut["Tipo_Disparo"] = cut["Tipo_Disparo"].fillna("SIN CLASIFICAR")
+    return asegurar_fechahora(cut)
 
-    aplicar_formato_eje_fechas(
-        ax,
-        fechas,
-    )
 
-    max_y = float(
-        pd.concat(
-            [
-                df_plot[
-                    "Pct_Automatico_Brazo1"
-                ],
-                df_plot[
-                    "Pct_Automatico_Brazo2"
-                ],
-            ]
-        ).max()
-    )
 
-    limite_superior = max(
-        50,
-        math.ceil(
-            (max_y + 10)
-            / 10
-        )
-        * 10,
-    )
+def grafico_cut(df_cut: pd.DataFrame, jumbos_visibles, tipos_visibles, mostrar_etiquetas: bool):
+    if df_cut.empty:
+        return None
 
-    limite_superior = min(
-        100,
-        limite_superior,
-    )
+    df = df_cut[
+        df_cut["Jumbo"].astype(str).isin([str(x) for x in jumbos_visibles])
+        & df_cut["Tipo_Disparo"].isin(tipos_visibles)
+    ].copy()
 
-    ax.set_ylim(
-        0,
-        limite_superior,
-    )
+    if df.empty:
+        return None
 
-    ax.set_yticks(
-        range(
-            0,
-            int(
-                limite_superior
-            )
-            + 1,
-            10,
-        )
-    )
+    all_jumbos = sorted(df_cut["Jumbo"].dropna().astype(str).unique())
+    visibles = sorted(df["Jumbo"].dropna().astype(str).unique())
 
-    ax.set_title(
-        f"{jumbo} · Uso automático por brazo",
-        fontsize=15,
-        pad=18,
-    )
+    fig = go.Figure()
+    points = []
+    annotations = []
 
-    ax.set_xlabel(
-        "Fecha",
-        labelpad=10,
-    )
+    for pos_visible, jumbo in enumerate(visibles):
+        idx = all_jumbos.index(jumbo)
+        g = df[df["Jumbo"].astype(str) == jumbo].sort_values("FechaHora")
+        custom = g[["Ciclo", "Tipo_Disparo"]].to_numpy()
 
-    ax.set_ylabel(
-        "Uso automático (%)",
-        labelpad=10,
-    )
+        fig.add_trace(go.Scatter(
+            x=g["FechaHora"],
+            y=g["Mediana"],
+            mode="lines+markers",
+            name=jumbo,
+            customdata=custom,
+            line=dict(
+                width=3,
+                color=COLORES[idx % len(COLORES)],
+                shape="spline",
+            ),
+            marker=dict(size=8),
+            hovertemplate=(
+                f"{jumbo}<br>%{{x|%d/%m %H:%M}}"
+                "<br>Ciclo: %{customdata[0]}"
+                "<br>Tipo: %{customdata[1]}"
+                "<br>Mediana Cut: %{y:.2f} m<extra></extra>"
+            ),
+        ))
 
-    ax.grid(
-        axis="y",
-        alpha=0.22,
-    )
-
-    ax.grid(
-        axis="x",
-        visible=False,
-    )
-
-    ax.legend(
-        title="Brazo",
-        frameon=False,
-        loc="upper right",
-    )
-
-    ax.spines[
-        "top"
-    ].set_visible(False)
-
-    ax.spines[
-        "right"
-    ].set_visible(False)
-
-    # ------------------------------------------------------
-    # KPI GLOBAL PONDERADO POR BRAZO
-    # Brazo 1 = Σ Auto B1 / (Σ Auto B1 + Σ Manual B1)
-    # Brazo 2 = Σ Auto B2 / (Σ Auto B2 + Σ Manual B2)
-    # ------------------------------------------------------
-
-    auto_b1 = df_plot[
-        "Auto_Brazo1_min"
-    ].sum(
-        min_count=1
-    )
-
-    manual_b1 = df_plot[
-        "Manual_Brazo1_min"
-    ].sum(
-        min_count=1
-    )
-
-    auto_b2 = df_plot[
-        "Auto_Brazo2_min"
-    ].sum(
-        min_count=1
-    )
-
-    manual_b2 = df_plot[
-        "Manual_Brazo2_min"
-    ].sum(
-        min_count=1
-    )
-
-    pct_global_b1 = None
-    pct_global_b2 = None
-
-    if (
-        pd.notna(auto_b1)
-        and pd.notna(manual_b1)
-        and (
-            auto_b1
-            + manual_b1
-        ) > 0
-    ):
-        pct_global_b1 = (
-            auto_b1
-            / (
-                auto_b1
-                + manual_b1
-            )
-            * 100
-        )
-
-    if (
-        pd.notna(auto_b2)
-        and pd.notna(manual_b2)
-        and (
-            auto_b2
-            + manual_b2
-        ) > 0
-    ):
-        pct_global_b2 = (
-            auto_b2
-            / (
-                auto_b2
-                + manual_b2
-            )
-            * 100
-        )
-
-    # Gap promedio por ciclo
-    gap_promedio = (
-        df_plot[
-            "Gap_Brazos_pp"
-        ].mean()
-    )
-
-    if pd.notna(
-        gap_promedio
-    ):
-        ax.text(
-            0.01,
-            0.98,
-            f"Gap promedio entre brazos: {gap_promedio:.1f} pp",
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=9,
-        )
-
-    # KPI ponderado de cada brazo en la parte superior
-    kpis_brazos = []
-
-    if pct_global_b1 is not None:
-        kpis_brazos.append(
-            (
-                "Brazo 1",
-                pct_global_b1,
-            )
-        )
-
-    if pct_global_b2 is not None:
-        kpis_brazos.append(
-            (
-                "Brazo 2",
-                pct_global_b2,
-            )
-        )
-
-    if kpis_brazos:
-        if len(kpis_brazos) == 1:
-            posiciones_x = [
-                0.50
-            ]
-        else:
-            posiciones_x = [
-                0.34,
-                0.66,
-            ]
-
-        for x, (
-            brazo,
-            pct_global,
-        ) in zip(
-            posiciones_x,
-            kpis_brazos,
-        ):
-            fig.text(
-                x,
-                0.945,
-                (
-                    f"{brazo}  |  "
-                    f"Automático global: "
-                    f"{pct_global:.1f}%"
+        # Global coherente con la gráfica:
+        # mediana de las medianas Cut de los ciclos visibles.
+        global_cut = pd.to_numeric(g["Mediana"], errors="coerce").dropna().median()
+        if pd.notna(global_cut):
+            annotations.append(dict(
+                xref="paper",
+                yref="paper",
+                x=0.01 + pos_visible * 0.32,
+                y=1.16,
+                xanchor="left",
+                showarrow=False,
+                text=f"<b>{jumbo}</b> · Longitud global Cut: <b>{global_cut:.2f} m</b>",
+                font=dict(
+                    size=12,
+                    color=COLORES[idx % len(COLORES)],
                 ),
-                ha="center",
-                va="center",
-                fontsize=10,
-                fontweight="bold",
-                bbox={
-                    "boxstyle":
-                        "round,pad=0.45",
-                    "facecolor":
-                        "white",
-                    "edgecolor":
-                        "0.75",
-                    "linewidth":
-                        0.8,
-                },
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="#dbe3ea",
+                borderpad=5,
+            ))
+
+        if mostrar_etiquetas:
+            for i, (_, r) in enumerate(g.iterrows()):
+                points.append(dict(
+                    x=r["FechaHora"],
+                    y=r["Mediana"],
+                    text=f"{r['Mediana']:.2f} m",
+                    rank=i + idx * 50,
+                ))
+
+    if mostrar_etiquetas:
+        annotations.extend(
+            smart_annotations(
+                points,
+                x_window_hours=18,
+                y_window=0.18,
+                font_size=11,
             )
+        )
 
-    # Nota metodológica
-    fig.text(
-        0.5,
-        0.018,
-        (
-            "Nota: el KPI considera solo disparos FRENTE (>=45 barrenos). "
-            "El porcentaje global por brazo está ponderado por sus minutos de movimiento: "
-            "Σ Automático / (Σ Automático + Σ Manual) × 100."
+    fig.update_layout(**base_layout(
+        450,
+        annotations=annotations,
+        margin=dict(l=80, r=30, t=88, b=70),
+        yaxis=dict(
+            title="Mediana de longitud perforada Cut (m)",
+            gridcolor="#eef2f7",
         ),
-        ha="center",
-        va="bottom",
-        fontsize=8.5,
-        color="dimgray",
-    )
+        xaxis=dict(
+            title="Fecha",
+            tickformat="%d/%m",
+            gridcolor="#eef2f7",
+        ),
+    ))
+    return fig
 
-    fig.tight_layout(
-        rect=[
-            0,
-            0.055,
-            1,
-            0.89,
-        ]
-    )
+# ==========================================================
+# ZDA: RESÚMENES Y TIMELINE
+# ==========================================================
 
-    # Resolver conjuntamente las etiquetas de Brazo 1 y Brazo 2.
-    # Los puntos muy próximos se distribuyen arriba/abajo/lateralmente
-    # y se agrega una línea guía solo cuando el desplazamiento es mayor.
-    anotar_etiquetas_sin_solape(
-        ax,
-        puntos_etiquetas,
-    )
 
+def _utc_dt(ts):
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+
+
+def zda_operational_date(ts):
+    d = _utc_dt(ts)
+    base = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    if d.hour < 7:
+        base -= timedelta(days=1)
+    return base
+
+
+def zda_operational_hour(ts, op_date):
+    d = _utc_dt(ts)
+    day_diff = (datetime(d.year,d.month,d.day,tzinfo=timezone.utc) - op_date).days
+    return d.hour + d.minute/60 + d.second/3600 + 24*day_diff
+
+
+def zda_turno(ts):
+    d = _utc_dt(ts)
+    h = d.hour + d.minute/60 + d.second/3600
+    if 7 <= h < 19:
+        return "Día", h
+    return "Noche", h+24 if h < 7 else h
+
+
+def fmt_hora_decimal(h):
+    if h is None or pd.isna(h):
+        return "-"
+    total = int(round(float(h)*60)) % (24*60)
+    return f"{total//60:02d}:{total%60:02d}"
+
+
+def resumen_turnos_zda(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return pd.DataFrame()
+    work = rows.copy()
+    work["_turno"] = work["Inicio_Perforacion_TS"].apply(lambda x: zda_turno(x)[0])
+    work["_opHour"] = work["Inicio_Perforacion_TS"].apply(lambda x: zda_turno(x)[1])
+    work["_opDate"] = work["Inicio_Perforacion_TS"].apply(zda_operational_date)
+
+    # Primer round por jumbo, fecha operativa y turno para indicadores de inicio.
+    first_idx = work.groupby(["Jumbo","_opDate","_turno"])["Inicio_Perforacion_TS"].idxmin()
+    first = work.loc[first_idx].copy()
+    salida = []
+    for jumbo in sorted(work["Jumbo"].dropna().astype(str).unique()):
+        allj = work[work["Jumbo"].astype(str)==jumbo]
+        firstj = first[first["Jumbo"].astype(str)==jumbo]
+        day_all = allj[allj["_turno"]=="Día"]
+        night_all = allj[allj["_turno"]=="Noche"]
+        day = firstj[firstj["_turno"]=="Día"]
+        night = firstj[firstj["_turno"]=="Noche"]
+        salida.append({
+            "Jumbo": jumbo,
+            "Ciclos día": len(day_all),
+            "Inicio prom. día": fmt_hora_decimal(day["_opHour"].mean()) if not day.empty else "-",
+            "Inicio más temprano día": fmt_hora_decimal(day["_opHour"].min()) if not day.empty else "-",
+            "Inicio más tarde día": fmt_hora_decimal(day["_opHour"].max()) if not day.empty else "-",
+            "Ciclos noche": len(night_all),
+            "Inicio prom. noche": fmt_hora_decimal(night["_opHour"].mean()) if not night.empty else "-",
+            "Inicio más temprano noche": fmt_hora_decimal(night["_opHour"].min()) if not night.empty else "-",
+            "Inicio más tarde noche": fmt_hora_decimal(night["_opHour"].max()) if not night.empty else "-",
+        })
+    return pd.DataFrame(salida)
+
+
+def resumen_tipos_zda(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return pd.DataFrame()
+    jumbos = sorted(rows["Jumbo"].dropna().astype(str).unique())
+    salida = []
+    for tipo in TIPOS_DISPARO:
+        r = {"Tipo": tipo, "Total": int((rows["Tipo_Disparo"]==tipo).sum())}
+        for j in jumbos:
+            r[j] = int(((rows["Tipo_Disparo"]==tipo) & (rows["Jumbo"].astype(str)==j)).sum())
+        if r["Total"] > 0:
+            salida.append(r)
+    return pd.DataFrame(salida)
+
+
+def grafico_zda_timeline(rows: pd.DataFrame, mostrar_etiquetas: bool):
+    if rows.empty:
+        return None
+    rows = rows.sort_values("Inicio_Perforacion_TS").copy()
+    all_jumbos = sorted(rows["Jumbo"].dropna().astype(str).unique())
+    fig = go.Figure()
+    annotations = []
+    legend_done = set()
+
+    rows["_opDate"] = rows["Inicio_Perforacion_TS"].apply(zda_operational_date)
+    for op_date, grupo in rows.groupby("_opDate", sort=True):
+        grupo = grupo.sort_values("Inicio_Perforacion_TS")
+        n = len(grupo)
+        for i, (_, r) in enumerate(grupo.iterrows()):
+            offset = (i - (n-1)/2) * 0.11
+            x = op_date + timedelta(days=offset)
+            y1 = zda_operational_hour(r["Inicio_Perforacion_TS"], op_date)
+            y2 = zda_operational_hour(r["Fin_Perforacion_TS"], op_date)
+            jumbo = str(r["Jumbo"])
+            idx = all_jumbos.index(jumbo)
+            n_b = r.get("Barrenos_ZDA") if pd.notna(r.get("Barrenos_ZDA")) else r.get("Barrenos_Realizados")
+            custom = [[r.get("Ciclo"), n_b, r.get("Inicio_Perforacion"), r.get("Fin_Perforacion"), r.get("Tiempo_Perforacion_hms"), r.get("Labor") or "-", r.get("Tipo_Disparo")]] * 2
+            fig.add_trace(go.Scatter(
+                x=[x,x], y=[y1,y2], mode="lines+markers", name=jumbo,
+                legendgroup=jumbo, showlegend=jumbo not in legend_done,
+                line=dict(width=12,color=COLORES[idx%len(COLORES)]), marker=dict(size=8), customdata=custom,
+                hovertemplate=(f"{jumbo} · Ciclo %{{customdata[0]}}<br>Tipo: %{{customdata[6]}}"
+                               "<br>Inicio: %{customdata[2]}<br>Fin: %{customdata[3]}<br>Tiempo: %{customdata[4]}"
+                               "<br>Barrenos: %{customdata[1]} B<br>Labor: %{customdata[5]}<extra></extra>"),
+            ))
+            legend_done.add(jumbo)
+            if mostrar_etiquetas:
+                annotations.append(dict(
+                    x=x, y=(y1+y2)/2, xref="x", yref="y", showarrow=False, xshift=18,
+                    text=f"C{r.get('Ciclo')} · {r.get('Tiempo_Perforacion_hms') or '-'} | {int(n_b) if pd.notna(n_b) else '-'}B",
+                    font=dict(size=10,color="#334155"), bgcolor="rgba(255,255,255,.9)",
+                    bordercolor="#dbe3ea", borderpad=3, xanchor="left",
+                ))
+
+    tickvals = [7,9,11,13,15,17,19,21,23,25,27,29,31]
+    ticktext = [f"{v%24:02d}:00" for v in tickvals]
+    op_dates = sorted(rows["_opDate"].unique())
+    fig.update_layout(**base_layout(
+        520, annotations=annotations, margin=dict(l=80,r=150,t=55,b=72),
+        xaxis=dict(title="Fecha operativa", tickvals=op_dates,
+                   ticktext=[pd.Timestamp(x).strftime("%d/%m") for x in op_dates], gridcolor="#eef2f7"),
+        yaxis=dict(title="Hora", range=[31.2,6.8], tickmode="array", tickvals=tickvals, ticktext=ticktext, gridcolor="#eef2f7"),
+        shapes=[
+            dict(type="rect",xref="paper",x0=0,x1=1,yref="y",y0=7,y1=19,fillcolor="rgba(37,99,235,.035)",line=dict(width=0),layer="below"),
+            dict(type="rect",xref="paper",x0=0,x1=1,yref="y",y0=19,y1=31,fillcolor="rgba(15,23,42,.035)",line=dict(width=0),layer="below"),
+            dict(type="line",xref="paper",x0=0,x1=1,yref="y",y0=19,y1=19,line=dict(color="#94a3b8",width=1,dash="dot")),
+        ],
+    ))
     return fig
 
 
 # ==========================================================
-# GUARDAR RESULTADO DE PDF EN CACHÉ
+# PROCESAMIENTO / CACHE
 # ==========================================================
 
-def guardar_resultado_en_cache(
-    archivo,
-    clave_archivo: str,
-):
+
+def guardar_resultado_en_cache(archivo, clave):
+    suffix = Path(archivo.name).suffix.lower()
     temp_path = None
-
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".pdf",
-        ) as temp:
-            temp.write(
-                archivo.getbuffer()
-            )
-            temp_path = Path(
-                temp.name
-            )
-
-        resultado = procesar_pdf(
-            temp_path,
-            nombre_archivo=archivo.name,
-        )
-
-        fig = resultado["fig"]
-        png_bytes = figura_a_png(
-            fig
-        )
-        plt.close(
-            fig
-        )
-
-        metadata = resultado[
-            "metadata"
-        ]
-
-        fecha_segura = nombre_seguro(
-            metadata.get(
-                "Fecha_Inicio"
-            )
-            or "sin_fecha"
-        )
-
-        jumbo_seguro = nombre_seguro(
-            metadata.get(
-                "Jumbo"
-            )
-            or "JUMBO"
-        )
-
-        ciclo_seguro = nombre_seguro(
-            metadata.get(
-                "Ciclo"
-            )
-            or "sin_ciclo"
-        )
-
-        nombre_png = (
-            f"{jumbo_seguro}_"
-            f"Ciclo_{ciclo_seguro}_"
-            f"{fecha_segura}.png"
-        )
-
-        resultado_cache = {
-            "nombre_archivo":
-                archivo.name,
-            "metadata":
-                metadata,
-            "movimiento":
-                resultado[
-                    "movimiento"
-                ],
-            "detalle":
-                resultado[
-                    "detalle"
-                ],
-            "validacion":
-                resultado[
-                    "validacion"
-                ],
-            "resumen_ciclo":
-                resultado[
-                    "resumen_ciclo"
-                ],
-            "resumen_reporte":
-                resultado[
-                    "resumen_reporte"
-                ],
-            "extras":
-                resultado[
-                    "extras"
-                ],
-            "png_bytes":
-                png_bytes,
-            "plano_nav_png":
-                resultado.get(
-                    "plano_nav_png"
-                ),
-            "nombre_png":
-                nombre_png,
-            "error":
-                None,
-        }
-
-        st.session_state.procesados[
-            clave_archivo
-        ] = resultado_cache
-
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+            temp.write(archivo.getbuffer())
+            temp_path = Path(temp.name)
+        resultado = procesar_archivo(temp_path, nombre_archivo=archivo.name)
+        fig = resultado.get("fig")
+        png = None
+        if fig is not None:
+            png = figura_a_png(fig)
+            plt.close(fig)
+        resultado["png_bytes"] = png
+        resultado["nombre_archivo"] = archivo.name
+        resultado["error"] = None
+        st.session_state.procesados[clave] = resultado
     except Exception as exc:
-        st.session_state.procesados[
-            clave_archivo
-        ] = {
-            "nombre_archivo":
-                archivo.name,
-            "error":
-                str(exc),
+        st.session_state.procesados[clave] = {
+            "nombre_archivo": archivo.name,
+            "error": str(exc),
         }
-
     finally:
-        if (
-            temp_path
-            and temp_path.exists()
-        ):
-            temp_path.unlink(
-                missing_ok=True
-            )
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 # ==========================================================
-# CONTROLES DE CARGA / LIMPIEZA
+# CARGA
 # ==========================================================
 
-st.subheader(
-    "Reportes"
+st.subheader("Archivos")
+
+archivos = st.file_uploader(
+    "Seleccionar o agregar archivos PDF / ZDA",
+    type=["pdf", "zda"],
+    accept_multiple_files=True,
+    key=f"uploader_{st.session_state.uploader_version}",
 )
 
-col_uploader, col_limpiar = st.columns(
-    [5, 1]
+seleccion = archivos or []
+seleccion_claves = [(hash_archivo(a), a) for a in seleccion]
+
+pendientes = [
+    (k, a)
+    for k, a in seleccion_claves
+    if (
+        k not in st.session_state.procesados
+        or st.session_state.procesados[k].get("error")
+    )
+]
+
+n_pdf = sum(
+    Path(a.name).suffix.lower() == ".pdf"
+    for _, a in pendientes
+)
+n_zda = sum(
+    Path(a.name).suffix.lower() == ".zda"
+    for _, a in pendientes
 )
 
-with col_uploader:
-    archivos = st.file_uploader(
-        "Seleccionar o agregar reportes PDF",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key=(
-            "uploader_pdfs_"
-            f"{st.session_state.uploader_version}"
-        ),
+col_process, col_clear = st.columns(2)
+
+with col_process:
+    procesar = st.button(
+        "Procesar / recalcular",
+        type="primary",
+        use_container_width=True,
+        disabled=not seleccion,
     )
 
-with col_limpiar:
-    st.write("")
-    st.write("")
-
+with col_clear:
     st.button(
-        "Limpiar análisis",
+        "Limpiar",
         use_container_width=True,
         on_click=limpiar_analisis,
     )
 
+st.caption(
+    f"Archivos seleccionados: {len(seleccion)} · "
+    f"Pendientes: {len(pendientes)} · PDF pendientes: {n_pdf} · ZDA pendientes: {n_zda}"
+)
+
+if procesar and seleccion:
+    # Si hay archivos nuevos/pendientes, procesa solo esos.
+    # Si todos ya estaban procesados, el mismo botón recalcula la selección actual.
+    objetivos = pendientes if pendientes else seleccion_claves
+
+    barra = st.progress(0)
+    estado = st.empty()
+
+    for i, (clave, archivo) in enumerate(objetivos, start=1):
+        estado.write(
+            f"Procesando {i}/{len(objetivos)}: {archivo.name}"
+        )
+        guardar_resultado_en_cache(
+            archivo,
+            clave,
+        )
+        barra.progress(i / len(objetivos))
+
+    barra.empty()
+    estado.empty()
+
+    # Reconstruye inmediatamente el sidebar con los jumbos y tipos
+    # que acaban de ser detectados.
+    st.rerun()
+
+resultados_validos = [
+    r
+    for r in st.session_state.procesados.values()
+    if not r.get("error")
+]
+errores = [
+    r
+    for r in st.session_state.procesados.values()
+    if r.get("error")
+]
+
+if not resultados_validos:
+    if errores:
+        st.error(
+            "No hay archivos procesados correctamente todavía."
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Archivo": r.get("nombre_archivo"),
+                    "Error": r.get("error"),
+                }
+                for r in errores
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.write(
+            "Selecciona uno o varios archivos PDF/ZDA y presiona "
+            "**Procesar / recalcular**."
+        )
+    st.stop()
+
 
 # ==========================================================
-# PROCESAMIENTO SOLO DE ARCHIVOS NUEVOS
+# CONSOLIDACIÓN
 # ==========================================================
 
-if archivos:
-    st.write(
-        f"**Archivos seleccionados:** "
-        f"{len(archivos)}"
+report_rows = [dict(r["resumen_reporte"]) for r in resultados_validos]
+df_reportes = pd.DataFrame(report_rows)
+
+# Fuerza la clasificación V33 para PDF y ZDA con el mismo criterio.
+df_reportes["Tipo_Disparo"] = df_reportes["Barrenos_Realizados"].apply(clasificar_tipo_disparo_v33)
+df_reportes["Considerado_KPI_Automatizacion"] = df_reportes["Tipo_Disparo"].eq("FRENTE")
+for r in resultados_validos:
+    rr = r["resumen_reporte"]
+    rr["Tipo_Disparo"] = clasificar_tipo_disparo_v33(rr.get("Barrenos_Realizados"))
+    rr["Considerado_KPI_Automatizacion"] = rr["Tipo_Disparo"] == "FRENTE"
+
+# HTML V33 solo agrega Resumen_Ciclos de reportes cuyo conteo está OK.
+df_resumen = concatenar_dataframes(resultados_validos, "resumen_ciclo", solo_ok=True)
+df_detalle = concatenar_dataframes(resultados_validos, "detalle")
+df_validacion = concatenar_dataframes(resultados_validos, "validacion")
+df_validacion_metros = concatenar_dataframes(resultados_validos, "validacion_metros")
+df_atipicos = concatenar_dataframes(resultados_validos, "atipicos")
+df_extras = concatenar_dataframes([r for r in resultados_validos if r.get("fuente")=="PDF"], "extras")
+df_mwd = concatenar_dataframes(resultados_validos, "mwd_barrenos")
+df_automatico = df_reportes.copy()
+df_zda = df_reportes[df_reportes["Fuente"].eq("ZDA")].copy() if "Fuente" in df_reportes.columns else pd.DataFrame()
+
+
+# ==========================================================
+# EXPORTACIÓN EXCEL - BD-PERFO + Resumen_Reportes + Resumen_Ciclos
+# ==========================================================
+
+df_bd_perfo = construir_bd_perfo(df_reportes, df_detalle)
+excel_bytes = crear_excel_publicacion(df_bd_perfo, df_reportes, df_resumen)
+nombre_excel = f"EBR Drill Analytics {datetime.now().strftime('%d-%m-%Y')}.xlsx"
+
+st.download_button(
+    "Descargar Excel consolidado",
+    data=excel_bytes,
+    file_name=nombre_excel,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    type="primary",
+)
+
+
+# ==========================================================
+# BLOQUE 1 - AUTOMATIZACIÓN
+# ==========================================================
+
+@fragment
+def render_automation_section(
+    df_automatico: pd.DataFrame,
+    sel_jumbos,
+    sel_tipos,
+    mostrar_auto: bool,
+    mostrar_arm: bool,
+):
+    if df_automatico.empty:
+        st.info("Sin datos suficientes de automatización.")
+        return
+
+    df_visible = df_automatico[
+        df_automatico["Jumbo"].astype(str).isin(
+            [str(x) for x in sel_jumbos]
+        )
+        & df_automatico["Tipo_Disparo"].isin(sel_tipos)
+    ].copy()
+
+    st.subheader("Evolución del movimiento automático")
+
+    fig_auto = grafico_auto(
+        df_visible,
+        mostrar_auto,
     )
 
-    archivos_actuales = []
-
-    for archivo in archivos:
-        clave = hash_archivo(
-            archivo
+    if fig_auto is not None:
+        st.plotly_chart(
+            fig_auto,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+    else:
+        st.info(
+            "No hay ciclos visibles con datos de movimiento automático "
+            "para los filtros globales seleccionados."
         )
 
-        archivos_actuales.append(
-            (
-                clave,
-                archivo,
+    st.subheader("Uso automático por brazo")
+
+    jumbos_visibles = sorted(
+        df_visible.get(
+            "Jumbo",
+            pd.Series(dtype=object),
+        ).dropna().astype(str).unique()
+    )
+
+    if not jumbos_visibles:
+        st.info(
+            "No hay jumbos visibles con los filtros globales seleccionados."
+        )
+        return
+
+    hubo_grafico = False
+
+    for jumbo in jumbos_visibles:
+        fig_arm = grafico_brazos(
+            df_visible,
+            jumbo,
+            mostrar_arm,
+        )
+        if fig_arm is not None:
+            hubo_grafico = True
+            st.plotly_chart(
+                fig_arm,
+                use_container_width=True,
+                config={"displaylogo": False},
             )
+
+    if not hubo_grafico:
+        st.info(
+            "No hay datos por brazo para los filtros globales seleccionados."
         )
 
-    nuevos = [
-        (
-            clave,
-            archivo,
+
+# ==========================================================
+# BLOQUE 2 - BARRENOS CUT
+# ==========================================================
+
+@fragment
+def render_cut_section(
+    df_resumen: pd.DataFrame,
+    df_reportes: pd.DataFrame,
+    sel_jumbos,
+    sel_tipos,
+    mostrar_cut: bool,
+):
+    st.subheader("Evolución de la longitud perforada en barrenos Cut")
+
+    df_cut = preparar_cut(
+        df_resumen,
+        df_reportes,
+    )
+
+    if df_cut.empty:
+        st.info("Sin datos suficientes de barrenos Cut.")
+        return
+
+    st.caption(
+        "Cada punto representa la mediana de la longitud perforada "
+        "de los barrenos Cut de cada ciclo. Se aplican los filtros "
+        "globales del panel lateral."
+    )
+
+    fig_cut = grafico_cut(
+        df_cut,
+        sel_jumbos,
+        sel_tipos,
+        mostrar_cut,
+    )
+
+    if fig_cut is not None:
+        st.plotly_chart(
+            fig_cut,
+            use_container_width=True,
+            config={"displaylogo": False},
         )
-        for clave, archivo
-        in archivos_actuales
-        if clave
-        not in st.session_state.procesados
+    else:
+        st.info(
+            "No hay ciclos visibles con los filtros globales seleccionados."
+        )
+
+
+# ==========================================================
+# BLOQUE 3 - TIEMPOS DE CICLO DE PERFORACIÓN
+# ==========================================================
+
+@fragment
+def render_zda_section(
+    df_zda: pd.DataFrame,
+    sel_jumbos,
+    sel_tipos,
+    mostrar_zda: bool,
+):
+    st.subheader("Tiempos de ciclo de perforación")
+
+    if (
+        df_zda.empty
+        or not {
+            "Inicio_Perforacion_TS",
+            "Fin_Perforacion_TS",
+        }.issubset(df_zda.columns)
+    ):
+        st.info(
+            "Sin datos ZDA suficientes para mostrar tiempos de ciclo."
+        )
+        return
+
+    zda_all = df_zda[
+        df_zda["Inicio_Perforacion_TS"].notna()
+        & df_zda["Fin_Perforacion_TS"].notna()
+    ].copy()
+
+    if zda_all.empty:
+        st.info("Sin ventanas de perforación ZDA válidas.")
+        return
+
+    st.caption(
+        "Eje X: fecha operativa (07:00–07:00). Eje Y: hora. "
+        "Cada barra va desde el primer registro MWD hasta el último. "
+        "Turno día: 07:00–19:00 · Turno noche: 19:00–07:00."
+    )
+
+    # Clasificación unificada: Bottom + Easer + Cut + Contour.
+    zda_all["Tipo_Disparo"] = (
+        zda_all["Barrenos_Realizados"]
+        .apply(clasificar_tipo_disparo_v33)
+    )
+
+    zda_rows = zda_all[
+        zda_all["Jumbo"].astype(str).isin(
+            [str(x) for x in sel_jumbos]
+        )
+        & zda_all["Tipo_Disparo"].isin(sel_tipos)
+    ].copy()
+
+    st.caption(
+        "Los filtros globales del panel lateral actualizan la gráfica "
+        "y los resúmenes de esta sección."
+    )
+
+    st.markdown("#### Hora promedio de inicio por jumbo y turno")
+
+    shift = resumen_turnos_zda(
+        zda_rows
+    )
+
+    if not shift.empty:
+        st.dataframe(
+            shift,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "“Ciclos día/noche” cuenta todos los rounds del turno. "
+            "Para promedio, inicio más temprano e inicio más tarde "
+            "se considera solo el primer round de cada jumbo por "
+            "fecha operativa y turno."
+        )
+    else:
+        st.info(
+            "No hay ciclos visibles para calcular los indicadores de inicio."
+        )
+
+    with st.expander(
+        "Tipo de disparo",
+        expanded=False,
+    ):
+        type_summary = resumen_tipos_zda(
+            zda_rows
+        )
+
+        if not type_summary.empty:
+            st.dataframe(
+                type_summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "No hay ciclos visibles para resumir el tipo de disparo."
+            )
+
+        st.caption(
+            "Criterio sobre barrenos de frente "
+            "(Bottom + Easer + Cut + Contour). "
+            "Reaming y Casing no se consideran para la clasificación."
+        )
+
+    st.markdown(
+        "#### Gráfica de tiempos x fecha operativa"
+    )
+
+    fig_zda = grafico_zda_timeline(
+        zda_rows,
+        mostrar_zda,
+    )
+
+    if fig_zda is not None:
+        st.plotly_chart(
+            fig_zda,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+    else:
+        st.info(
+            "No hay ciclos visibles con los filtros globales seleccionados."
+        )
+
+
+# ==========================================================
+# BLOQUE 4 - CLASIFICACIÓN DE DISPAROS
+# ==========================================================
+
+@fragment
+def render_classification_section(
+    df_reportes: pd.DataFrame,
+    df_automatico: pd.DataFrame,
+    df_atipicos: pd.DataFrame,
+    sel_jumbos,
+    sel_tipos,
+):
+    filtrados = df_reportes[
+        df_reportes["Jumbo"].astype(str).isin(
+            [str(x) for x in sel_jumbos]
+        )
+        & df_reportes["Tipo_Disparo"].isin(sel_tipos)
+    ].copy()
+
+    st.caption(
+        "Esta sección utiliza los mismos filtros globales del panel lateral."
+    )
+
+    col_class, col_read = st.columns(
+        [1, 1.25]
+    )
+
+    with col_class:
+        if filtrados.empty:
+            st.info(
+                "No hay reportes visibles con los filtros globales seleccionados."
+            )
+        else:
+            resumen_clase = (
+                filtrados["Tipo_Disparo"]
+                .value_counts()
+                .reindex(
+                    TIPOS_DISPARO,
+                    fill_value=0,
+                )
+                .rename_axis(
+                    "Tipo de disparo"
+                )
+                .reset_index(
+                    name="N reportes"
+                )
+            )
+
+            resumen_clase = resumen_clase[
+                resumen_clase["N reportes"] > 0
+            ]
+
+            st.dataframe(
+                resumen_clase,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with col_read:
+        st.markdown("#### Resumen de lectura")
+
+        pdf_rows = (
+            filtrados[
+                filtrados["Fuente"].eq("PDF")
+            ]
+            if "Fuente" in filtrados.columns
+            else pd.DataFrame()
+        )
+
+        zda_rows_all = (
+            filtrados[
+                filtrados["Fuente"].eq("ZDA")
+            ]
+            if "Fuente" in filtrados.columns
+            else pd.DataFrame()
+        )
+
+        lectura_ok = int(
+            filtrados.get(
+                "Lectura_Confiable",
+                pd.Series(dtype=object),
+            ).eq("OK").sum()
+        )
+
+        pdf_ok = (
+            int(
+                pdf_rows.get(
+                    "Lectura_Confiable",
+                    pd.Series(dtype=object),
+                ).eq("OK").sum()
+            )
+            if not pdf_rows.empty
+            else 0
+        )
+
+        zda_ok = (
+            int(
+                zda_rows_all.get(
+                    "Lectura_Confiable",
+                    pd.Series(dtype=object),
+                ).eq("OK").sum()
+            )
+            if not zda_rows_all.empty
+            else 0
+        )
+
+        conteo_ok = int(
+            filtrados.get(
+                "Estado_Conteo",
+                pd.Series(dtype=object),
+            ).eq("OK").sum()
+        )
+
+        metros_ok = int(
+            filtrados.get(
+                "Estado_Metros_Tipos",
+                pd.Series(dtype=object),
+            ).eq("OK").sum()
+        )
+
+        # Atípicos pertenecientes a ciclos actualmente visibles.
+        n_atipicos_visible = 0
+        if (
+            not df_atipicos.empty
+            and {"Jumbo", "Ciclo"}.issubset(df_atipicos.columns)
+            and {"Jumbo", "Ciclo"}.issubset(filtrados.columns)
+        ):
+            claves_visibles = {
+                (str(j), str(c))
+                for j, c in zip(
+                    filtrados["Jumbo"],
+                    filtrados["Ciclo"],
+                )
+            }
+
+            n_atipicos_visible = sum(
+                (str(j), str(c)) in claves_visibles
+                for j, c in zip(
+                    df_atipicos["Jumbo"],
+                    df_atipicos["Ciclo"],
+                )
+            )
+
+        r1, r2, r3, r4, r5 = st.columns(5)
+
+        r1.metric(
+            "Archivos",
+            len(filtrados),
+        )
+        r2.metric(
+            "PDF",
+            len(pdf_rows),
+        )
+        r3.metric(
+            "ZDA",
+            len(zda_rows_all),
+        )
+        r4.metric(
+            "Lectura PDF OK",
+            f"{pdf_ok}/{len(pdf_rows)}",
+        )
+        r5.metric(
+            "Lectura ZDA OK",
+            f"{zda_ok}/{len(zda_rows_all)}",
+        )
+
+        s1, s2, s3, s4 = st.columns(4)
+
+        s1.metric(
+            "Conteo OK",
+            f"{conteo_ok}/{len(filtrados)}",
+        )
+        s2.metric(
+            "Metros por tipo OK",
+            f"{metros_ok}/{len(filtrados)}",
+        )
+        s3.metric(
+            "Revisar lectura",
+            len(filtrados) - lectura_ok,
+        )
+        s4.metric(
+            "Atípicos",
+            n_atipicos_visible,
+        )
+
+    st.markdown(
+        "#### Uso automático por ciclo"
+    )
+
+    auto_filtrado = df_automatico[
+        df_automatico["Jumbo"].astype(str).isin(
+            [str(x) for x in sel_jumbos]
+        )
+        & df_automatico["Tipo_Disparo"].isin(sel_tipos)
+    ].copy()
+
+    cols_auto = [
+        c
+        for c in [
+            "Fecha_Inicio",
+            "Jumbo",
+            "Ciclo",
+            "Barrenos_Realizados",
+            "Tipo_Disparo",
+            "Considerado_KPI_Automatizacion",
+            "Auto_Total_Brazos_min",
+            "Manual_Total_Brazos_min",
+            "Pct_Movimiento_Automatico_Brazos",
+            "Pct_Automatico_Brazo1",
+            "Pct_Automatico_Brazo2",
+            "Gap_Automatico_Brazos_pp",
+        ]
+        if c in auto_filtrado.columns
     ]
 
-    if nuevos:
-        progreso = st.progress(
-            0
-        )
+    tabla_auto = auto_filtrado[
+        cols_auto
+    ].copy()
 
-        for i, (
-            clave,
-            archivo,
-        ) in enumerate(
-            nuevos,
-            start=1,
-        ):
-            with st.spinner(
-                "Procesando archivo nuevo: "
-                f"{archivo.name}"
-            ):
-                guardar_resultado_en_cache(
-                    archivo,
-                    clave,
-                )
+    tabla_auto = tabla_auto.rename(
+        columns={
+            "Considerado_KPI_Automatizacion": "KPI Auto",
+            "Auto_Total_Brazos_min": "Auto total min",
+            "Manual_Total_Brazos_min": "Manual total min",
+            "Pct_Movimiento_Automatico_Brazos": "Auto Jumbo %",
+            "Pct_Automatico_Brazo1": "Brazo 1 %",
+            "Pct_Automatico_Brazo2": "Brazo 2 %",
+            "Gap_Automatico_Brazos_pp": "Gap brazos pp",
+        }
+    )
 
-            progreso.progress(
-                i / len(nuevos)
-            )
-
-        progreso.empty()
-
-    resultados_validos = []
-    errores_actuales = []
-
-    for clave, archivo in archivos_actuales:
-        resultado = (
-            st.session_state.procesados.get(
-                clave
-            )
-        )
-
-        if not resultado:
-            continue
-
-        if resultado.get(
-            "error"
-        ):
-            errores_actuales.append(
+    if "KPI Auto" in tabla_auto.columns:
+        tabla_auto["KPI Auto"] = (
+            tabla_auto["KPI Auto"]
+            .map(
                 {
-                    "Archivo_PDF":
-                        archivo.name,
-                    "Error":
-                        resultado[
-                            "error"
-                        ],
+                    True: "Sí",
+                    False: "No",
                 }
             )
-            continue
-
-        resultados_validos.append(
-            resultado
         )
 
-        metadata = resultado[
-            "metadata"
-        ]
+    st.dataframe(
+        tabla_auto,
+        use_container_width=True,
+        hide_index=True,
+        height=360,
+    )
 
-        movimiento = resultado[
-            "movimiento"
-        ]
 
-        validacion = resultado[
-            "validacion"
-        ]
+# ==========================================================
+# BLOQUE 5 - RESULTADOS POR ARCHIVO
+# ==========================================================
 
-        extras = resultado[
-            "extras"
-        ]
+@fragment
+def render_resultados_section(resultados_validos):
+    st.caption(
+        f"{len(resultados_validos)} archivo(s) procesado(s) acumulado(s)"
+    )
 
-        png_bytes = resultado[
-            "png_bytes"
-        ]
+    desglosar = st.checkbox(
+        "Desglosar todos",
+        value=False,
+        key="desglosar_todos",
+    )
 
-        # Imagen del plano de navegación extraída de la
-        # primera página del reporte iSURE.
-        plano_nav_png = resultado.get(
-            "plano_nav_png"
+    for idx, r in enumerate(resultados_validos):
+        rep = r["resumen_reporte"]
+        fuente = (
+            rep.get("Fuente")
+            or r.get("fuente")
+            or "PDF"
         )
-
-        nombre_png = resultado[
-            "nombre_png"
-        ]
-
-        # Asignación defensiva del plano de navegación.
-        # Se repite aquí para evitar cualquier variable sin definir
-        # incluso si cambia la estructura previa del resultado/cache.
-        plano_nav_png = resultado.get(
-            "plano_nav_png",
-            None,
-        )
-
-        titulo_expander = (
-            f"{metadata['Jumbo']} | "
-            f"Ciclo {metadata['Ciclo']} | "
-            f"{metadata['Fecha_Inicio']} | "
-            f"{archivo.name}"
+        titulo = (
+            f"{rep.get('Jumbo','-')} · "
+            f"Ciclo {rep.get('Ciclo','-')} · "
+            f"{rep.get('Fecha_Inicio','-')} · "
+            f"{fuente}"
         )
 
         with st.expander(
-            titulo_expander,
-            expanded=False,
+            titulo,
+            expanded=desglosar,
         ):
-            # ==================================================
-            # CABECERA COMPACTA
-            # La información continúa en la columna izquierda
-            # mientras el plano de navegación ocupa la derecha.
-            # Esto evita que la altura de la miniatura genere
-            # un gran espacio vacío antes de la clasificación.
-            # ==================================================
-
-            col_info, col_plano = st.columns(
-                [4.6, 1.25],
-                gap="medium",
-            )
+            col_info, col_nav = st.columns([4.7, 1.3])
 
             with col_info:
-                c1, c2, c3, c4 = st.columns(
-                    [1.0, 1.0, 0.85, 1.0]
-                )
-
-                c1.metric(
-                    "Jumbo",
-                    metadata[
-                        "Jumbo"
-                    ]
-                    or "-",
-                )
-
-                c2.metric(
-                    "Nº de serie",
-                    metadata[
-                        "Numero_Serie"
-                    ]
-                    or "-",
-                )
-
-                c3.metric(
-                    "Ciclo",
-                    metadata[
-                        "Ciclo"
-                    ]
-                    or "-",
-                )
-
-                c4.metric(
-                    "Metros perforados",
-                    (
-                        f"{metadata['Metros_Perforados']:.2f} m"
-                        if metadata[
-                            "Metros_Perforados"
-                        ]
-                        is not None
-                        else "-"
-                    ),
-                )
-
-                barrenos_realizados = metadata.get(
-                    "Barrenos_Realizados"
-                )
-
-                tipo_disparo = clasificar_tipo_disparo(
-                    barrenos_realizados
-                )
-
-                considerado_kpi = (
-                    tipo_disparo == "FRENTE"
-                )
-
-                st.markdown("### Clasificación del disparo")
-
-                d1, d2, d3 = st.columns(
-                    [1.15, 1.0, 1.0]
-                )
-
-                d1.metric(
-                    "Tipo de disparo",
-                    tipo_disparo,
-                )
-
-                d2.metric(
-                    "Barrenos realizados",
-                    (
-                        int(barrenos_realizados)
-                        if barrenos_realizados is not None
-                        else "-"
-                    ),
-                )
-
-                d3.metric(
-                    "Considerado en KPI Auto",
-                    "Sí" if considerado_kpi else "No",
-                )
-
-                fuente_barrenos = metadata.get(
-                    "Fuente_Barrenos_Realizados"
-                )
-
-                if fuente_barrenos:
-                    st.caption(
-                        f"Fuente del número de barrenos: {fuente_barrenos}. "
-                        "Para la clasificación se excluyen los barrenos Reaming."
-                    )
-
-                st.markdown("### Uso automático del movimiento de brazos")
-
-                m1, m2, m3, m4 = st.columns(
-                    [1.0, 1.0, 1.0, 1.0]
-                )
-
-                (
-                    auto_brazos_min,
-                    manual_brazos_min,
-                    pct_auto_brazos,
-                    pct_manual_brazos,
-                ) = calcular_kpi_movimiento_desde_brazos(
-                    movimiento[
-                        "Auto_Brazo1_min"
-                    ],
-                    movimiento[
-                        "Auto_Brazo2_min"
-                    ],
-                    movimiento[
-                        "Manual_Brazo1_min"
-                    ],
-                    movimiento[
-                        "Manual_Brazo2_min"
-                    ],
-                )
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
 
                 m1.metric(
-                    "Movimiento automático",
-                    fmt_pct(
-                        pct_auto_brazos
-                    ),
+                    "Serie",
+                    rep.get("Numero_Serie") or "-",
                 )
-
                 m2.metric(
-                    "Movimiento manual",
-                    fmt_pct(
-                        pct_manual_brazos
+                    "Sección",
+                    seccion_desde_plan_texto(
+                        rep.get("Plan_Perforacion")
                     ),
                 )
-
                 m3.metric(
-                    "Brazo 1 automático",
-                    fmt_pct(
-                        movimiento[
-                            "Pct_Automatico_Brazo1"
-                        ]
-                    ),
+                    "Tipo de disparo",
+                    rep.get("Tipo_Disparo") or "-",
                 )
-
                 m4.metric(
+                    "Barrenos",
+                    int(rep["Barrenos_Realizados"])
+                    if pd.notna(rep.get("Barrenos_Realizados"))
+                    else "-",
+                )
+                m5.metric(
+                    "Metros perforados",
+                    fmt(
+                        rep.get("Metros_Perforados"),
+                        2,
+                        " m",
+                    ),
+                )
+                m6.metric(
+                    "Lectura",
+                    rep.get("Lectura_Confiable")
+                    or rep.get("Estado")
+                    or "-",
+                )
+
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric(
+                    "Movimiento automático",
+                    fmt(
+                        rep.get(
+                            "Pct_Movimiento_Automatico_Brazos"
+                        ),
+                        1,
+                        "%",
+                    ),
+                )
+                a2.metric(
+                    "Movimiento manual",
+                    fmt(
+                        rep.get(
+                            "Pct_Movimiento_Manual_Brazos"
+                        ),
+                        1,
+                        "%",
+                    ),
+                )
+                a3.metric(
+                    "Brazo 1 automático",
+                    fmt(
+                        rep.get("Pct_Automatico_Brazo1"),
+                        1,
+                        "%",
+                    ),
+                )
+                a4.metric(
                     "Brazo 2 automático",
-                    fmt_pct(
-                        movimiento[
-                            "Pct_Automatico_Brazo2"
-                        ]
+                    fmt(
+                        rep.get("Pct_Automatico_Brazo2"),
+                        1,
+                        "%",
                     ),
                 )
 
-                st.caption(
-                    "Base de cálculo reconciliada: tiempos individuales de ambos brazos. "
-                    "% Auto = (Auto B1 + Auto B2) / "
-                    "(Auto B1 + Auto B2 + Manual B1 + Manual B2). "
-                    "Los gráficos y KPI consolidados consideran únicamente "
-                    "disparos FRENTE (>=45 barrenos)."
-                )
-
-                if not considerado_kpi:
-                    st.info(
-                        f"Este reporte está clasificado como {tipo_disparo} "
-                        f"({barrenos_realizados if barrenos_realizados is not None else '-'} barrenos) "
-                        "y no se considera en el KPI consolidado de automatización."
+                if fuente == "ZDA":
+                    z1, z2, z3 = st.columns(3)
+                    z1.metric(
+                        "Inicio perforación real",
+                        rep.get("Inicio_Perforacion") or "-",
+                    )
+                    z2.metric(
+                        "Fin perforación real",
+                        rep.get("Fin_Perforacion") or "-",
+                    )
+                    z3.metric(
+                        "Tiempo de perforación",
+                        rep.get("Tiempo_Perforacion_hms") or "-",
                     )
 
-            with col_plano:
-                if plano_nav_png is not None:
+            with col_nav:
+                nav = r.get("plano_nav_png")
+                if nav:
+                    if fuente == "ZDA":
+                        st.caption(
+                            "Plano reconstruido desde ZDA · "
+                            f"sección {seccion_desde_plan_texto(rep.get('Plan_Perforacion'))}"
+                        )
+                    else:
+                        st.caption("Plano de navegación del PDF")
+
                     st.image(
-                        plano_nav_png,
+                        nav,
                         use_container_width=True,
                     )
-                else:
-                    st.empty()
 
-            col_graf_izq, col_graf, col_graf_der = st.columns(
-                [0.08, 0.84, 0.08]
-            )
-
-            with col_graf:
+            if r.get("png_bytes"):
                 st.image(
-                    png_bytes,
+                    r["png_bytes"],
                     use_container_width=True,
                 )
+                st.download_button(
+                    "Descargar gráfico PNG",
+                    r["png_bytes"],
+                    file_name=(
+                        f"{rep.get('Jumbo','JUMBO')}_"
+                        f"Ciclo_{rep.get('Ciclo','-')}.png"
+                    ),
+                    mime="image/png",
+                    key=f"png_{idx}",
+                )
 
-            st.download_button(
-                label="Descargar gráfico PNG",
-                data=png_bytes,
-                file_name=nombre_png,
-                mime="image/png",
-                key=f"grafico_{clave}",
-                on_click="ignore",
-            )
-
-            with st.expander(
-                "Validación",
-                expanded=False,
+            val = r.get("validacion")
+            if (
+                isinstance(val, pd.DataFrame)
+                and not val.empty
             ):
-                st.dataframe(
-                    validacion[
-                        [
+                with st.expander(
+                    "Validación",
+                    expanded=False,
+                ):
+                    cols = [
+                        c
+                        for c in [
                             "Tipo",
                             "Esperado",
                             "Encontrado",
                             "Diferencia",
                             "Estado",
                         ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=220,
-                )
-
-                if (validacion["Estado"] == "REVISAR").any():
-                    st.warning(
-                        "Este ciclo presenta diferencias entre el resumen "
-                        "'TIPOS DE BARRENO' y los barrenos extraídos."
-                    )
-                else:
-                    st.success(
-                        "La extracción reconcilia con el resumen 'TIPOS DE BARRENO'."
-                    )
-
-            with st.expander(
-                f"Barrenos extra ({len(extras)})",
-                expanded=False,
-            ):
-                if not extras.empty:
-                    columnas_extras = [
-                        col
-                        for col in [
-                            "ID",
-                            "Tipo",
-                            "Longitud_roca_m",
-                            "Beta_grados",
-                        ]
-                        if col in extras.columns
+                        if c in val.columns
                     ]
-
                     st.dataframe(
-                        extras[columnas_extras],
+                        val[cols],
                         use_container_width=True,
                         hide_index=True,
-                        height=165,
-                    )
-                else:
-                    st.caption(
-                        "No se identificaron barrenos extra en este ciclo."
+                        height=220,
                     )
 
-    # ======================================================
-    # CONSOLIDADO
-    # ======================================================
+            vm = r.get("validacion_metros")
+            if (
+                isinstance(vm, pd.DataFrame)
+                and not vm.empty
+            ):
+                with st.expander(
+                    "Metros por tipo",
+                    expanded=False,
+                ):
+                    cols = [
+                        c
+                        for c in [
+                            "Tipo",
+                            "N",
+                            "Metros_Reporte_m",
+                            "Metros_Extraidos_m",
+                            "Diferencia_m",
+                            "Estado",
+                        ]
+                        if c in vm.columns
+                    ]
+                    st.dataframe(
+                        vm[cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=220,
+                    )
 
-    if resultados_validos:
-        df_detalle = pd.concat(
-            [
-                r["detalle"]
-                for r
-                in resultados_validos
-            ],
-            ignore_index=True,
-        )
-
-        df_resumen = pd.concat(
-            [
-                r["resumen_ciclo"]
-                for r
-                in resultados_validos
-            ],
-            ignore_index=True,
-        )
-
-        df_reportes = pd.DataFrame(
-            [
-                r[
-                    "resumen_reporte"
-                ]
-                for r
-                in resultados_validos
-            ]
-        )
-
-        df_validacion = pd.concat(
-            [
-                r[
-                    "validacion"
-                ]
-                for r
-                in resultados_validos
-            ],
-            ignore_index=True,
-        )
-
-        extras_validos = [
-            r["extras"]
-            for r
-            in resultados_validos
-            if not r[
-                "extras"
-            ].empty
-        ]
-
-        df_extras = (
-            pd.concat(
-                extras_validos,
-                ignore_index=True,
-            )
-            if extras_validos
-            else pd.DataFrame(
-                columns=df_detalle.columns
-            )
-        )
-
-        columnas_auto = [
-            "Archivo_PDF",
-            "Fecha_Inicio",
-            "Hora_Inicio",
-            "Jumbo",
-            "Numero_Serie",
-            "Ciclo",
-            "Barrenos_Realizados",
-            "Fuente_Barrenos_Realizados",
-            "Auto_Brazo1_min",
-            "Auto_Brazo2_min",
-            "Auto_Total_min",
-            "Manual_Brazo1_min",
-            "Manual_Brazo2_min",
-            "Manual_Total_min",
-            "Pct_Movimiento_Automatico",
-            "Pct_Movimiento_Manual",
-            "Pct_Automatico_Brazo1",
-            "Pct_Automatico_Brazo2",
-            "Pagina_Movimiento_Brazos",
-        ]
-
-        df_automatico = (
-            df_reportes[
-                [
+            extras = r.get("extras")
+            if (
+                isinstance(extras, pd.DataFrame)
+                and not extras.empty
+            ):
+                st.markdown(
+                    f"#### Barrenos extra ({len(extras)})"
+                )
+                cols = [
                     c
-                    for c
-                    in columnas_auto
-                    if c
-                    in df_reportes.columns
-                ]
-            ].copy()
-        )
-
-        # --------------------------------------------------
-        # CLASIFICACIÓN DEL TIPO DE DISPARO
-        # --------------------------------------------------
-
-        if "Barrenos_Realizados" in df_automatico.columns:
-            df_automatico[
-                "Tipo_Disparo"
-            ] = df_automatico[
-                "Barrenos_Realizados"
-            ].apply(
-                clasificar_tipo_disparo
-            )
-
-            df_automatico[
-                "Considerado_KPI_Automatizacion"
-            ] = (
-                df_automatico[
-                    "Tipo_Disparo"
-                ] == "FRENTE"
-            )
-        else:
-            df_automatico[
-                "Tipo_Disparo"
-            ] = "SIN CLASIFICAR"
-
-            df_automatico[
-                "Considerado_KPI_Automatizacion"
-            ] = False
-
-        # --------------------------------------------------
-        # KPI RECONCILIADO DESDE LOS TIEMPOS DE LOS BRAZOS
-        # --------------------------------------------------
-
-        columnas_tiempo_brazos = [
-            "Auto_Brazo1_min",
-            "Auto_Brazo2_min",
-            "Manual_Brazo1_min",
-            "Manual_Brazo2_min",
-        ]
-
-        if all(
-            c in df_automatico.columns
-            for c in columnas_tiempo_brazos
-        ):
-            df_automatico[
-                "Auto_Total_Brazos_min"
-            ] = (
-                df_automatico[
-                    "Auto_Brazo1_min"
-                ]
-                +
-                df_automatico[
-                    "Auto_Brazo2_min"
-                ]
-            )
-
-            df_automatico[
-                "Manual_Total_Brazos_min"
-            ] = (
-                df_automatico[
-                    "Manual_Brazo1_min"
-                ]
-                +
-                df_automatico[
-                    "Manual_Brazo2_min"
-                ]
-            )
-
-            denominador_brazos = (
-                df_automatico[
-                    "Auto_Total_Brazos_min"
-                ]
-                +
-                df_automatico[
-                    "Manual_Total_Brazos_min"
-                ]
-            )
-
-            df_automatico[
-                "Pct_Movimiento_Automatico_Brazos"
-            ] = (
-                df_automatico[
-                    "Auto_Total_Brazos_min"
-                ]
-                /
-                denominador_brazos
-                * 100
-            ).where(
-                denominador_brazos > 0
-            )
-
-            df_automatico[
-                "Pct_Movimiento_Manual_Brazos"
-            ] = (
-                df_automatico[
-                    "Manual_Total_Brazos_min"
-                ]
-                /
-                denominador_brazos
-                * 100
-            ).where(
-                denominador_brazos > 0
-            )
-
-            # Diferencias vs la columna "Suma" reportada por iSURE.
-            if "Auto_Total_min" in df_automatico.columns:
-                df_automatico[
-                    "Dif_Auto_Reporte_vs_Brazos_min"
-                ] = (
-                    df_automatico[
-                        "Auto_Total_min"
+                    for c in [
+                        "ID",
+                        "Tipo",
+                        "Longitud_roca_m",
+                        "Beta_grados",
                     ]
-                    -
-                    df_automatico[
-                        "Auto_Total_Brazos_min"
-                    ]
-                )
-
-            if "Manual_Total_min" in df_automatico.columns:
-                df_automatico[
-                    "Dif_Manual_Reporte_vs_Brazos_min"
-                ] = (
-                    df_automatico[
-                        "Manual_Total_min"
-                    ]
-                    -
-                    df_automatico[
-                        "Manual_Total_Brazos_min"
-                    ]
-                )
-
-        # Gap absoluto por ciclo
-        if (
-            "Pct_Automatico_Brazo1"
-            in df_automatico.columns
-            and
-            "Pct_Automatico_Brazo2"
-            in df_automatico.columns
-        ):
-            df_automatico[
-                "Gap_Automatico_Brazos_pp"
-            ] = (
-                df_automatico[
-                    "Pct_Automatico_Brazo1"
+                    if c in extras.columns
                 ]
-                -
-                df_automatico[
-                    "Pct_Automatico_Brazo2"
-                ]
-            ).abs()
-
-        st.divider()
-        st.header(
-            "Consolidado"
-        )
-
-        # --------------------------------------------------
-        # GRÁFICO GENERAL
-        # --------------------------------------------------
-
-        st.subheader(
-            "Evolución del movimiento automático"
-        )
-
-        fig_auto = (
-            generar_grafico_tendencia_automatico(
-                df_automatico
-            )
-        )
-
-        tendencia_png = None
-
-        if fig_auto is not None:
-            st.pyplot(
-                fig_auto,
-                use_container_width=True,
-            )
-
-            tendencia_png = (
-                figura_a_png(
-                    fig_auto
+                st.dataframe(
+                    extras[cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=180,
                 )
-            )
 
-            plt.close(
-                fig_auto
-            )
-        else:
-            st.info(
-                "No se encontraron datos suficientes "
-                "de movimiento automático/manual para "
-                "generar la tendencia."
-            )
+            mwd = r.get("mwd_barrenos")
+            if (
+                isinstance(mwd, pd.DataFrame)
+                and not mwd.empty
+            ):
+                with st.expander(
+                    f"MWD por brazo y secuencia ({len(mwd)})",
+                    expanded=False,
+                ):
+                    cols = [
+                        c
+                        for c in [
+                            "Brazo",
+                            "Secuencia",
+                            "Estado_MWD",
+                            "Profundidad_Max_MWD_m",
+                            "Muestras_MWD",
+                            "Inicio_MWD",
+                            "Fin_MWD",
+                            "Duracion_MWD_s",
+                        ]
+                        if c in mwd.columns
+                    ]
+                    st.dataframe(
+                        mwd[cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=260,
+                    )
 
-        # --------------------------------------------------
-        # GRÁFICOS POR EQUIPO: BRAZO 1 VS BRAZO 2
-        # --------------------------------------------------
 
-        st.subheader(
-            "Uso automático por brazo"
-        )
+# ==========================================================
+# PRESENTACIÓN EN BLOQUES VISUALES
+# ==========================================================
 
-        graficos_brazos_png = []
+st.divider()
+st.header("Consolidado")
 
-        jumbos_disponibles = [
-            j
-            for j
-            in sorted(
-                df_automatico[
-                    "Jumbo"
-                ].dropna().unique()
-            )
-        ]
-
-        for jumbo in jumbos_disponibles:
-            fig_brazos = (
-                generar_grafico_brazos_por_jumbo(
-                    df_automatico,
-                    jumbo,
-                )
-            )
-
-            if fig_brazos is None:
-                continue
-
-            st.markdown(
-                f"#### {jumbo}"
-            )
-
-            st.pyplot(
-                fig_brazos,
-                use_container_width=True,
-            )
-
-            png_brazos = (
-                figura_a_png(
-                    fig_brazos
-                )
-            )
-
-            nombre_brazos = (
-                f"{jumbo}_"
-                "Uso_Automatico_Brazo1_vs_Brazo2.png"
-            )
-
-            graficos_brazos_png.append(
-                (
-                    nombre_brazos,
-                    png_brazos,
-                )
-            )
-
-            plt.close(
-                fig_brazos
-            )
-
-        # --------------------------------------------------
-        # TABLA USO AUTOMÁTICO
-        # --------------------------------------------------
-
-        st.markdown(
-            "#### Clasificación de disparos"
-        )
-
-        if "Tipo_Disparo" in df_automatico.columns:
-            resumen_disparos = (
-                df_automatico[
-                    "Tipo_Disparo"
-                ]
-                .value_counts(
-                    dropna=False
-                )
-                .rename_axis(
-                    "Tipo_Disparo"
-                )
-                .reset_index(
-                    name="N_Reportes"
-                )
-            )
-
-            st.dataframe(
-                resumen_disparos,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown(
-            "#### Uso automático por ciclo"
-        )
-
-        columnas_vista_auto = [
-            c
-            for c
-            in [
-                "Fecha_Inicio",
-                "Jumbo",
-                "Ciclo",
-                "Barrenos_Realizados",
-                "Fuente_Barrenos_Realizados",
-                "Tipo_Disparo",
-                "Considerado_KPI_Automatizacion",
-                "Auto_Total_Brazos_min",
-                "Manual_Total_Brazos_min",
-                "Pct_Movimiento_Automatico_Brazos",
-                "Pct_Movimiento_Manual_Brazos",
-                "Pct_Automatico_Brazo1",
-                "Pct_Automatico_Brazo2",
-                "Gap_Automatico_Brazos_pp",
-                "Auto_Total_min",
-                "Manual_Total_min",
-                "Dif_Auto_Reporte_vs_Brazos_min",
-                "Dif_Manual_Reporte_vs_Brazos_min",
-            ]
-            if c
-            in df_automatico.columns
-        ]
-
-        st.dataframe(
-            df_automatico[
-                columnas_vista_auto
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # --------------------------------------------------
-        # EVOLUCIÓN MEDIANA DE BARRENOS CUT
-        # --------------------------------------------------
-
-        st.markdown(
-            "#### Evolución de la mediana de barrenos Cut"
-        )
-
-        fig_cut = generar_grafico_mediana_cut(
-            df_resumen
-        )
-
-        mediana_cut_png = None
-
-        if fig_cut is not None:
-            st.pyplot(
-                fig_cut,
-                use_container_width=True,
-            )
-
-            mediana_cut_png = figura_a_png(
-                fig_cut
-            )
-
-            plt.close(
-                fig_cut
-            )
-        else:
-            st.info(
-                "No se encontraron datos suficientes de barrenos Cut "
-                "para generar la evolución de la mediana."
-            )
-
-        # --------------------------------------------------
-        # DESCARGAS
-        # --------------------------------------------------
-
-        excel_bytes = crear_excel(
-            df_reportes,
-            df_resumen,
-            df_detalle,
-            df_validacion,
-            df_extras,
-            df_automatico,
-        )
-
-        graficos_zip = [
-            (
-                r[
-                    "nombre_png"
-                ],
-                r[
-                    "png_bytes"
-                ],
-            )
-            for r
-            in resultados_validos
-        ]
-
-        if (
-            tendencia_png
-            is not None
-        ):
-            graficos_zip.append(
-                (
-                    "Evolucion_Movimiento_Automatico.png",
-                    tendencia_png,
-                )
-            )
-
-        if mediana_cut_png is not None:
-            graficos_zip.append(
-                (
-                    "Evolucion_Mediana_Barrenos_Cut.png",
-                    mediana_cut_png,
-                )
-            )
-
-        graficos_zip.extend(
-            graficos_brazos_png
-        )
-
-        col_excel, col_graficos = (
-            st.columns(
-                2
-            )
-        )
-
-        with col_excel:
-            st.download_button(
-                label="Descargar Excel consolidado",
-                data=excel_bytes,
-                file_name="EBR_Drill_Consolidado.xlsx",
-                mime=(
-                    "application/"
-                    "vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                type="primary",
-                use_container_width=True,
-                on_click="ignore",
-            )
-
-        with col_graficos:
-            zip_bytes = (
-                crear_zip_graficos(
-                    graficos_zip
-                )
-            )
-
-            st.download_button(
-                label="Descargar todos los gráficos",
-                data=zip_bytes,
-                file_name="EBR_Drill_Graficos.zip",
-                mime="application/zip",
-                use_container_width=True,
-                on_click="ignore",
-            )
-
-    # ======================================================
-    # ERRORES
-    # ======================================================
-
-    if errores_actuales:
-        st.divider()
-
-        st.subheader(
-            "Archivos con error"
-        )
-
-        st.dataframe(
-            pd.DataFrame(
-                errores_actuales
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-else:
-    st.write(
-        "Selecciona uno o varios PDF para iniciar el análisis."
+with st.container(border=True):
+    render_automation_section(
+        df_automatico,
+        global_jumbos,
+        global_tipos,
+        global_lbl_auto,
+        global_lbl_arm,
     )
+
+with st.container(border=True):
+    render_cut_section(
+        df_resumen,
+        df_reportes,
+        global_jumbos,
+        global_tipos,
+        global_lbl_cut,
+    )
+
+with st.container(border=True):
+    render_zda_section(
+        df_zda,
+        global_jumbos,
+        global_tipos,
+        global_lbl_zda,
+    )
+
+with st.expander(
+    "Clasificación de disparos",
+    expanded=False,
+):
+    render_classification_section(
+        df_reportes,
+        df_automatico,
+        df_atipicos,
+        global_jumbos,
+        global_tipos,
+    )
+
+with st.expander(
+    f"Resultados por archivo · {len(resultados_validos)} archivos procesados",
+    expanded=False,
+):
+    render_resultados_section(
+        resultados_validos,
+    )
+
+if errores:
+    with st.container(border=True):
+        st.subheader("Archivos con error")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Archivo": r.get("nombre_archivo"),
+                    "Error": r.get("error"),
+                }
+                for r in errores
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
