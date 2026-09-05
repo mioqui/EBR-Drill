@@ -33,7 +33,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.96-PYTHON-CUCHULA-NEGRO"
+APP_VERSION_INTERNAL = "V35.01-PYTHON-CLUSTER-RESUMEN-DIA-NOCHE"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -1121,6 +1121,111 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
 
 
 
+
+COLOR_OPERADOR_AZUL = "#4F67F2"
+COLOR_OPERADOR_VERDE = "#16C48A"
+COLOR_OPERADOR_NARANJA = "#F59E0B"
+COLOR_OPERADOR_ROJO = "#EF4444"
+COLOR_OPERADOR_SIN_REGISTRO = "#111111"
+
+
+def construir_colores_operador_por_ranking(df_auto: pd.DataFrame):
+    """
+    Colores dinámicos según horas automáticas acumuladas del conjunto visible.
+
+    Regla:
+    - Sin registrar -> negro
+    - Mayor horas   -> azul
+    - Segundo       -> verde
+    - Tercero       -> naranja
+    - Menor horas   -> rojo
+
+    Para 1, 2 o 3 operadores se conserva el sentido de los extremos:
+    1 -> azul
+    2 -> azul / rojo
+    3 -> azul / verde / rojo
+
+    Si en el futuro hubiera más de 4 operadores, los intermedios adicionales
+    se muestran en naranja y el de menor acumulado permanece rojo.
+    """
+    color_map = {
+        "Sin registrar": COLOR_OPERADOR_SIN_REGISTRO,
+    }
+
+    if (
+        df_auto is None
+        or df_auto.empty
+        or "Operador_Filtro" not in df_auto.columns
+        or "Auto_Total_Brazos_min" not in df_auto.columns
+    ):
+        return color_map
+
+    work = df_auto.copy()
+    work["_Operador_Color"] = (
+        work["Operador_Filtro"]
+        .fillna("SIN DATO")
+        .astype(str)
+        .str.strip()
+    )
+    work["_Auto_min_color"] = pd.to_numeric(
+        work["Auto_Total_Brazos_min"],
+        errors="coerce",
+    )
+
+    op_upper = work["_Operador_Color"].str.upper()
+    work = work[
+        ~op_upper.isin(["", "SIN DATO", "NONE", "NAN"])
+        & work["_Auto_min_color"].notna()
+    ].copy()
+
+    if work.empty:
+        return color_map
+
+    ranking = (
+        work.groupby("_Operador_Color", as_index=False)
+        .agg(Horas_auto=("_Auto_min_color", "sum"))
+        .sort_values(
+            ["Horas_auto", "_Operador_Color"],
+            ascending=[False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+    operadores = ranking["_Operador_Color"].astype(str).tolist()
+    n = len(operadores)
+
+    if n == 1:
+        colores = [COLOR_OPERADOR_AZUL]
+    elif n == 2:
+        colores = [
+            COLOR_OPERADOR_AZUL,
+            COLOR_OPERADOR_ROJO,
+        ]
+    elif n == 3:
+        colores = [
+            COLOR_OPERADOR_AZUL,
+            COLOR_OPERADOR_VERDE,
+            COLOR_OPERADOR_ROJO,
+        ]
+    elif n == 4:
+        colores = [
+            COLOR_OPERADOR_AZUL,
+            COLOR_OPERADOR_VERDE,
+            COLOR_OPERADOR_NARANJA,
+            COLOR_OPERADOR_ROJO,
+        ]
+    else:
+        colores = (
+            [COLOR_OPERADOR_AZUL, COLOR_OPERADOR_VERDE]
+            + [COLOR_OPERADOR_NARANJA] * max(0, n - 3)
+            + [COLOR_OPERADOR_ROJO]
+        )
+
+    color_map.update(dict(zip(operadores, colores)))
+    return color_map
+
+
+
 def grafico_auto_por_operador(
     df_auto: pd.DataFrame,
     mostrar_etiquetas: bool,
@@ -1186,19 +1291,14 @@ def grafico_auto_por_operador(
         "JUMB002": "square",
     }
 
-    # Paleta fija para facilitar el seguimiento visual de cada operador.
-    # Cuchula se muestra en negro para diferenciarlo claramente de Osorio.
-    color_map_operador = {
-        "John Osorio": "#4F67F2",
-        "Josue Rivera": "#F05A3A",
-        "Nilton Celis": "#16C48A",
-        "Rogelio Cuchula": "#111111",
-    }
+    # La paleta se asigna dinámicamente según las horas automáticas
+    # acumuladas del rango/filtros actualmente visibles.
+    color_map_operador = construir_colores_operador_por_ranking(df)
 
     for idx, operador in enumerate(operadores):
         color_operador = color_map_operador.get(
             str(operador),
-            COLORES[idx % len(COLORES)],
+            "#64748b",
         )
 
         g = df[
@@ -1437,6 +1537,213 @@ def grafico_auto_por_operador(
                 x=0,
             ),
             hovermode="closest",
+        )
+    )
+
+    return fig
+
+
+
+def grafico_horas_auto_acumuladas_operador(
+    df_auto: pd.DataFrame,
+    operadores_visibles=None,
+):
+    """
+    Total de horas de movimiento automático acumuladas por operador.
+
+    - Suma Auto_Total_Brazos_min y convierte a horas.
+    - Los ciclos sin operador se agrupan como "Sin registrar".
+    - Para operadores identificados se muestra solo el apellido.
+    - La paleta mantiene coherencia con el gráfico de evolución por operador.
+    """
+    if df_auto is None or df_auto.empty:
+        return None
+
+    if "Auto_Total_Brazos_min" not in df_auto.columns:
+        return None
+
+    df = df_auto.copy()
+
+    # Operador normalizado para agrupación.
+    if "Operador_Filtro" in df.columns:
+        operador_raw = (
+            df["Operador_Filtro"]
+            .fillna("SIN DATO")
+            .astype(str)
+            .str.strip()
+        )
+    else:
+        operador_raw = pd.Series(
+            ["SIN DATO"] * len(df),
+            index=df.index,
+            dtype=object,
+        )
+
+    operador_upper = operador_raw.str.upper()
+    es_sin_registro = operador_upper.isin(
+        ["", "SIN DATO", "NONE", "NAN"]
+    )
+
+    df["_Operador_Agrupado"] = operador_raw
+    df.loc[es_sin_registro, "_Operador_Agrupado"] = "Sin registrar"
+
+    # Respetar el filtro lateral de operadores para los operadores conocidos.
+    # "Sin registrar" permanece visible como indicador de control.
+    if operadores_visibles is not None:
+        operadores_sel = {str(x).strip() for x in operadores_visibles}
+        mask = (
+            df["_Operador_Agrupado"].eq("Sin registrar")
+            | df["_Operador_Agrupado"].isin(operadores_sel)
+        )
+        df = df[mask].copy()
+
+    df["_Auto_min"] = pd.to_numeric(
+        df["Auto_Total_Brazos_min"],
+        errors="coerce",
+    )
+    df = df[df["_Auto_min"].notna()].copy()
+
+    if df.empty:
+        return None
+
+    resumen = (
+        df.groupby("_Operador_Agrupado", as_index=False)
+        .agg(
+            Auto_min=("_Auto_min", "sum"),
+            Ciclos=("_Auto_min", "size"),
+        )
+    )
+    resumen["Horas_auto"] = resumen["Auto_min"] / 60.0
+
+    resumen = resumen[
+        resumen["Horas_auto"].notna()
+    ].copy()
+
+    if resumen.empty:
+        return None
+
+    # Misma regla cromática que el gráfico de curvas:
+    # negro = sin registrar; operadores identificados = ranking por horas.
+    color_map = construir_colores_operador_por_ranking(df)
+
+    def _apellido(nombre):
+        nombre = str(nombre)
+        if nombre == "Sin registrar":
+            return nombre
+        partes = nombre.split()
+        return partes[-1] if partes else nombre
+
+    resumen["Etiqueta"] = resumen["_Operador_Agrupado"].apply(_apellido)
+    resumen["Color"] = (
+        resumen["_Operador_Agrupado"]
+        .map(color_map)
+        .fillna("#64748b")
+    )
+
+    # Orden visual:
+    # 1) Sin registrar arriba como categoría de control.
+    # 2) Operadores identificados ordenados de mayor a menor horas.
+    resumen["_Orden_Sin_Registro"] = (
+        ~resumen["_Operador_Agrupado"].eq("Sin registrar")
+    ).astype(int)
+
+    resumen = resumen.sort_values(
+        ["_Orden_Sin_Registro", "Horas_auto", "Etiqueta"],
+        ascending=[True, False, True],
+    ).reset_index(drop=True)
+
+    max_horas = float(resumen["Horas_auto"].max())
+    if max_horas <= 0:
+        max_horas = 1.0
+
+    # Fondo tipo "track" para aproximar el estilo de la referencia.
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            y=resumen["Etiqueta"],
+            x=[max_horas] * len(resumen),
+            orientation="h",
+            marker=dict(
+                color="#F2F1EC",
+                line=dict(width=0),
+            ),
+            width=0.22,
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            y=resumen["Etiqueta"],
+            x=resumen["Horas_auto"],
+            orientation="h",
+            marker=dict(
+                color=resumen["Color"].tolist(),
+                line=dict(width=0),
+            ),
+            width=0.22,
+            text=[
+                f"{v:.2f} h"
+                for v in resumen["Horas_auto"]
+            ],
+            textposition="outside",
+            textfont=dict(
+                size=13,
+                color="#6b6b66",
+            ),
+            cliponaxis=False,
+            customdata=np.column_stack([
+                resumen["_Operador_Agrupado"].astype(object),
+                resumen["Ciclos"].astype(object),
+            ]),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b>"
+                "<br>Horas automático: %{x:.2f} h"
+                "<br>Ciclos con dato: %{customdata[1]}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+
+    fig.update_layout(
+        **base_layout(
+            max(330, 110 + len(resumen) * 58),
+            margin=dict(
+                l=125,
+                r=95,
+                t=20,
+                b=35,
+            ),
+            barmode="overlay",
+            bargap=0.46,
+            xaxis=dict(
+                range=[0, max_horas * 1.20],
+                showgrid=False,
+                showticklabels=False,
+                zeroline=False,
+                title=None,
+                fixedrange=True,
+            ),
+            yaxis=dict(
+                title=None,
+                categoryorder="array",
+                categoryarray=resumen["Etiqueta"].tolist(),
+                autorange="reversed",
+                showgrid=False,
+                zeroline=False,
+                tickfont=dict(
+                    size=14,
+                    color="#73726d",
+                ),
+                fixedrange=True,
+            ),
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            hovermode="closest",
+            showlegend=False,
         )
     )
 
@@ -2119,11 +2426,393 @@ def preparar_timeline_ciclos_turno(rows: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+
+def _kmeans_1d(valores, k, max_iter=100):
+    """
+    K-Means determinístico para una sola variable.
+    Devuelve etiquetas y centros ordenados de menor a mayor.
+    """
+    x = np.asarray(valores, dtype=float)
+    x = x[np.isfinite(x)]
+
+    if x.size < k or k < 1:
+        return None, None
+
+    # Inicialización determinística por cuantiles.
+    qs = np.linspace(0, 1, k + 2)[1:-1]
+    centros = np.quantile(x, qs).astype(float)
+
+    for _ in range(max_iter):
+        dist = np.abs(x[:, None] - centros[None, :])
+        etiquetas = np.argmin(dist, axis=1)
+
+        nuevos = centros.copy()
+        for j in range(k):
+            vals_j = x[etiquetas == j]
+            if vals_j.size:
+                nuevos[j] = float(vals_j.mean())
+            else:
+                # Reubicar un centro vacío en el punto más alejado
+                # de su centro actualmente asignado.
+                dist_min = np.min(dist, axis=1)
+                nuevos[j] = float(x[int(np.argmax(dist_min))])
+
+        if np.allclose(nuevos, centros, atol=1e-6):
+            centros = nuevos
+            break
+        centros = nuevos
+
+    # Reordenar centros y etiquetas de temprano -> tardío.
+    orden = np.argsort(centros)
+    mapa = {old: new for new, old in enumerate(orden)}
+    centros_ordenados = centros[orden]
+    etiquetas_ordenadas = np.array([mapa[int(e)] for e in etiquetas], dtype=int)
+
+    return etiquetas_ordenadas, centros_ordenados
+
+
+def _silhouette_1d(valores, etiquetas):
+    """
+    Silhouette promedio para clustering 1D usando distancia absoluta.
+    No requiere scikit-learn.
+    """
+    x = np.asarray(valores, dtype=float)
+    labels = np.asarray(etiquetas, dtype=int)
+
+    if x.size < 3 or len(np.unique(labels)) < 2:
+        return None
+
+    scores = []
+
+    for i in range(len(x)):
+        same = labels == labels[i]
+        same[i] = False
+
+        # Para clusters singleton se usa 0, equivalente a una
+        # observación sin soporte interno suficiente.
+        if same.sum() == 0:
+            scores.append(0.0)
+            continue
+
+        a = float(np.mean(np.abs(x[i] - x[same])))
+
+        b_candidates = []
+        for lab in np.unique(labels):
+            if lab == labels[i]:
+                continue
+            other = labels == lab
+            if other.sum():
+                b_candidates.append(
+                    float(np.mean(np.abs(x[i] - x[other])))
+                )
+
+        if not b_candidates:
+            scores.append(0.0)
+            continue
+
+        b = min(b_candidates)
+        denom = max(a, b)
+        scores.append((b - a) / denom if denom > 0 else 0.0)
+
+    return float(np.mean(scores)) if scores else None
+
+
+def analizar_clusters_primer_inicio(
+    ciclos: pd.DataFrame,
+    turno: str,
+    k_min: int = 2,
+    k_max: int = 4,
+):
+    """
+    Detecta clusters naturales de hora de primer inicio.
+
+    Población:
+      primer inicio por Fecha operativa + Turno + Jumbo.
+
+    Selección de K:
+      prueba K=2..4 y elige el mayor Silhouette Score.
+    """
+    if ciclos is None or ciclos.empty:
+        return None
+
+    requeridas = {
+        "Fecha_Operativa_DT",
+        "Turno",
+        "Jumbo",
+        "X_Inicio",
+    }
+    if not requeridas.issubset(ciclos.columns):
+        return None
+
+    work = ciclos[ciclos["Turno"].eq(turno)].copy()
+    if work.empty:
+        return None
+
+    work["X_Inicio"] = pd.to_numeric(
+        work["X_Inicio"],
+        errors="coerce",
+    )
+    work = work[
+        work["X_Inicio"].notna()
+        & work["X_Inicio"].between(0, 12, inclusive="both")
+    ].copy()
+
+    if work.empty:
+        return None
+
+    # Primer arranque real de cada equipo por fecha-turno.
+    primeros = (
+        work.sort_values(
+            [
+                "Fecha_Operativa_DT",
+                "Jumbo",
+                "X_Inicio",
+                "Ciclo",
+            ]
+        )
+        .drop_duplicates(
+            subset=[
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    valores = primeros["X_Inicio"].to_numpy(dtype=float)
+    n = len(valores)
+
+    # Con muy pocos puntos la segmentación no es estable.
+    if n < 4 or np.unique(np.round(valores, 4)).size < 2:
+        return {
+            "ok": False,
+            "motivo": "Se requieren al menos 4 primeros inicios con variación.",
+            "n": n,
+            "primeros": primeros,
+        }
+
+    mejor = None
+    k_sup = min(k_max, n - 1, np.unique(np.round(valores, 4)).size)
+
+    for k in range(k_min, k_sup + 1):
+        labels, centros = _kmeans_1d(valores, k)
+        if labels is None:
+            continue
+
+        # Evitar soluciones con clusters vacíos.
+        counts = np.bincount(labels, minlength=k)
+        if np.any(counts == 0):
+            continue
+
+        sil = _silhouette_1d(valores, labels)
+        if sil is None:
+            continue
+
+        candidato = {
+            "k": k,
+            "labels": labels,
+            "centros": centros,
+            "silhouette": sil,
+            "counts": counts,
+        }
+
+        if mejor is None or sil > mejor["silhouette"]:
+            mejor = candidato
+
+    if mejor is None:
+        return {
+            "ok": False,
+            "motivo": "No fue posible obtener una segmentación estable.",
+            "n": n,
+            "primeros": primeros,
+        }
+
+    k = mejor["k"]
+    centros = np.asarray(mejor["centros"], dtype=float)
+
+    # Límites de zona = punto medio entre centroides consecutivos.
+    limites = [0.0]
+    for a, b in zip(centros[:-1], centros[1:]):
+        limites.append(float((a + b) / 2.0))
+    limites.append(12.0)
+
+    if k == 2:
+        nombres = ["Temprano", "Tardío"]
+    elif k == 3:
+        nombres = ["Temprano", "Intermedio", "Tardío"]
+    elif k == 4:
+        nombres = [
+            "Muy temprano",
+            "Temprano",
+            "Tardío",
+            "Muy tardío",
+        ]
+    else:
+        nombres = [f"Cluster {i+1}" for i in range(k)]
+
+    resumen = []
+    for i in range(k):
+        n_i = int(mejor["counts"][i])
+        resumen.append({
+            "Cluster": nombres[i],
+            "Centro_h": float(centros[i]),
+            "Desde_h": float(limites[i]),
+            "Hasta_h": float(limites[i + 1]),
+            "N": n_i,
+            "Pct": n_i / n * 100.0 if n else 0.0,
+        })
+
+    primeros = primeros.copy()
+    primeros["Cluster_ID"] = mejor["labels"]
+    primeros["Cluster"] = [
+        nombres[int(i)]
+        for i in mejor["labels"]
+    ]
+
+    return {
+        "ok": True,
+        "k": k,
+        "silhouette": float(mejor["silhouette"]),
+        "centros": centros,
+        "limites": limites,
+        "resumen": pd.DataFrame(resumen),
+        "primeros": primeros,
+        "n": n,
+    }
+
+
+
+
+def render_resumen_clusters_primer_inicio(
+    cluster_info,
+    turno: str,
+):
+    """
+    Muestra una tabla compacta y una lectura automática del clustering
+    del primer inicio para un turno.
+    """
+    if not cluster_info:
+        return
+
+    if not cluster_info.get("ok"):
+        st.info(
+            cluster_info.get(
+                "motivo",
+                f"No hay datos suficientes para resumir clusters del Turno {turno}.",
+            )
+        )
+        return
+
+    resumen = cluster_info.get("resumen")
+    if resumen is None or resumen.empty:
+        return
+
+    st.markdown(
+        f"##### Resumen de clusters · Turno {turno}"
+    )
+    st.caption(
+        f"K={cluster_info.get('k', '-')} · "
+        f"Silhouette={cluster_info.get('silhouette', 0):.2f}"
+    )
+
+    tabla = resumen.copy()
+    tabla["Centro"] = tabla["Centro_h"].apply(
+        lambda v: _hora_relativa_turno_a_texto(v, turno)
+    )
+    tabla["Ciclos"] = pd.to_numeric(
+        tabla["N"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    tabla["Participación"] = tabla["Pct"].apply(
+        lambda v: f"{float(v):.0f}%"
+    )
+
+    tabla = tabla[
+        [
+            "Cluster",
+            "Centro",
+            "Ciclos",
+            "Participación",
+        ]
+    ].rename(
+        columns={
+            "Cluster": "Grupo",
+        }
+    )
+
+    st.dataframe(
+        tabla,
+        width="stretch",
+        hide_index=True,
+        height=min(
+            60 + 36 * len(tabla),
+            235,
+        ),
+    )
+
+    # Lectura compacta del patrón dominante y del patrón más tardío.
+    dominante = resumen.sort_values(
+        ["Pct", "Centro_h"],
+        ascending=[False, True],
+    ).iloc[0]
+
+    tardio = resumen.sort_values(
+        "Centro_h",
+        ascending=False,
+    ).iloc[0]
+
+    centro_dom = _hora_relativa_turno_a_texto(
+        dominante["Centro_h"],
+        turno,
+    )
+    centro_tardio = _hora_relativa_turno_a_texto(
+        tardio["Centro_h"],
+        turno,
+    )
+
+    pct_dom = float(dominante["Pct"])
+    pct_tardio = float(tardio["Pct"])
+
+    if str(dominante["Cluster"]) != str(tardio["Cluster"]):
+        lectura = (
+            f"**El {pct_dom:.0f}% de los primeros martillos del Turno {turno} "
+            f"se concentra alrededor de las {centro_dom} "
+            f"({dominante['Cluster']}), mientras que el patrón más tardío "
+            f"se concentra alrededor de las {centro_tardio} y representa "
+            f"el {pct_tardio:.0f}% de los inicios.**"
+        )
+    else:
+        lectura = (
+            f"**El patrón con mayor participación del Turno {turno} es "
+            f"{dominante['Cluster']}: concentra el {pct_dom:.0f}% de los primeros "
+            f"martillos alrededor de las {centro_dom}.**"
+        )
+
+    st.markdown(
+        f"""
+        <div style="
+            border-left: 4px solid #d1d5db;
+            padding: 0.55rem 0.85rem;
+            margin: 0.35rem 0 1.10rem 0;
+            color: #1f2937;
+            line-height: 1.45;
+        ">
+            {lectura}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
 def grafico_timeline_ciclos_turno(
     ciclos: pd.DataFrame,
     turno: str,
     solo_puntos_inicio: bool = False,
     solo_primer_inicio: bool = False,
+    mostrar_clusters: bool = False,
 ):
     """
     Timeline horizontal por fecha operativa.
@@ -2158,10 +2847,18 @@ def grafico_timeline_ciclos_turno(
     if g.empty:
         return None
 
+    cluster_info = None
+    if mostrar_clusters and solo_puntos_inicio:
+        cluster_info = analizar_clusters_primer_inicio(
+            ciclos,
+            turno,
+        )
+
     # Vista de patrones de arranque:
-    # cuando se pide solo el primer inicio, conservar únicamente
-    # el round que empezó más temprano para cada Jumbo + fecha operativa + turno.
-    if solo_puntos_inicio and solo_primer_inicio:
+    # al mostrar clusters se usa automáticamente el primer inicio
+    # de cada Jumbo + fecha operativa + turno, porque esa es la
+    # población sobre la que se calculan los centroides.
+    if solo_puntos_inicio and (solo_primer_inicio or mostrar_clusters):
         g = (
             g.sort_values(
                 [
@@ -2390,7 +3087,7 @@ def grafico_timeline_ciclos_turno(
         **base_layout(
             height,
             title=dict(text=f"<b>{titulo}</b>", x=0.01, xanchor="left"),
-            margin=dict(l=125, r=30, t=58, b=75),
+            margin=dict(l=125, r=30, t=105 if (mostrar_clusters and solo_puntos_inicio) else 58, b=75),
             xaxis=dict(
                 title="Hora del turno",
                 range=[0, 12],
@@ -2416,6 +3113,103 @@ def grafico_timeline_ciclos_turno(
             hovermode="closest",
         )
     )
+
+    # ------------------------------------------------------
+    # Capa analítica de clusters de hora de primer inicio
+    # ------------------------------------------------------
+    if cluster_info and cluster_info.get("ok"):
+        resumen_cluster = cluster_info["resumen"]
+
+        # Colores muy suaves para no competir con la codificación
+        # JUMB001/JUMB002 de los puntos.
+        zonas_rgba = [
+            "rgba(59,130,246,0.055)",   # azul suave
+            "rgba(16,185,129,0.050)",   # verde suave
+            "rgba(245,158,11,0.050)",   # naranja suave
+            "rgba(239,68,68,0.045)",    # rojo suave
+        ]
+        lineas_cluster = [
+            "#3B82F6",
+            "#10B981",
+            "#F59E0B",
+            "#EF4444",
+        ]
+
+        for i, row in resumen_cluster.iterrows():
+            color_fill = zonas_rgba[i % len(zonas_rgba)]
+            color_line = lineas_cluster[i % len(lineas_cluster)]
+
+            fig.add_vrect(
+                x0=float(row["Desde_h"]),
+                x1=float(row["Hasta_h"]),
+                fillcolor=color_fill,
+                line_width=0,
+                layer="below",
+            )
+
+            centro = float(row["Centro_h"])
+            fig.add_vline(
+                x=centro,
+                line_width=1.6,
+                line_dash="dash",
+                line_color=color_line,
+                opacity=0.82,
+            )
+
+            fig.add_annotation(
+                x=centro,
+                y=1.035,
+                xref="x",
+                yref="paper",
+                text=(
+                    f"<b>{row['Cluster']}</b><br>"
+                    f"Centro {_hora_relativa_turno_a_texto(centro, turno)}"
+                    f"<br>{int(row['N'])} inicios · {row['Pct']:.0f}%"
+                ),
+                showarrow=False,
+                xanchor="center",
+                yanchor="bottom",
+                align="center",
+                font=dict(
+                    size=10,
+                    color=color_line,
+                ),
+                bgcolor="rgba(255,255,255,0.82)",
+                bordercolor="rgba(0,0,0,0)",
+                borderpad=2,
+            )
+
+        fig.add_annotation(
+            x=0.995,
+            y=1.105,
+            xref="paper",
+            yref="paper",
+            text=(
+                f"K={cluster_info['k']} · "
+                f"Silhouette={cluster_info['silhouette']:.2f}"
+            ),
+            showarrow=False,
+            xanchor="right",
+            yanchor="top",
+            font=dict(size=10, color="#64748b"),
+            bgcolor="rgba(255,255,255,0.80)",
+        )
+
+    elif mostrar_clusters and solo_puntos_inicio and cluster_info:
+        fig.add_annotation(
+            x=0.995,
+            y=1.075,
+            xref="paper",
+            yref="paper",
+            text=cluster_info.get(
+                "motivo",
+                "No hay datos suficientes para clustering.",
+            ),
+            showarrow=False,
+            xanchor="right",
+            yanchor="top",
+            font=dict(size=10, color="#64748b"),
+        )
 
     fig.add_vline(
         x=12,
@@ -4317,18 +5111,24 @@ def render_automation_section(
     render_kpis_uso_automatico(df_automatico)
     st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
 
-    df_visible = df_automatico[
+    # Base visible por Jumbo / Tipo / Roca / Fecha.
+    # Se conserva aparte para el gráfico de horas acumuladas, que además
+    # debe poder mostrar los ciclos "Sin registrar".
+    df_visible_base = df_automatico[
         df_automatico["Jumbo"].astype(str).isin(
             [str(x) for x in sel_jumbos]
         )
         & df_automatico["Tipo_Disparo"].isin(sel_tipos)
         & df_automatico["Tipo_Roca"].isin(sel_rocas)
-        & df_automatico["Operador_Filtro"].isin(sel_operadores)
     ].copy()
 
-    # El rango de fechas del sidebar también filtra los gráficos de
-    # Uso Automático para que sean consistentes con las tarjetas superiores.
-    df_visible = aplicar_filtro_fechas_global(df_visible)
+    df_visible_base = aplicar_filtro_fechas_global(df_visible_base)
+
+    # Los gráficos de evolución por operador siguen respetando
+    # el filtro explícito de operadores del panel lateral.
+    df_visible = df_visible_base[
+        df_visible_base["Operador_Filtro"].isin(sel_operadores)
+    ].copy()
 
     st.subheader("Evolución del movimiento automático")
 
@@ -4352,11 +5152,10 @@ def render_automation_section(
 
     st.subheader("Evolución del movimiento automático por operador")
     st.caption(
-        "Cada color representa un operador y cada punto un ciclo/round. "
-        "El porcentaje global de la leyenda se calcula con la suma de los "
-        "tiempos automáticos y manuales de los ciclos visibles. "
-        "El símbolo del punto identifica el jumbo: círculo = JUMB001, "
-        "cuadrado = JUMB002."
+        "Cada línea representa un operador y cada punto un ciclo/round. "
+        "El color se asigna por horas automáticas acumuladas del rango visible: "
+        "azul = más horas, verde = segundo, naranja = tercero y rojo = menos horas. "
+        "El símbolo identifica el jumbo: círculo = JUMB001, cuadrado = JUMB002."
     )
 
     fig_auto_operador = grafico_auto_por_operador(
@@ -4375,6 +5174,33 @@ def render_automation_section(
         st.info(
             "No hay ciclos visibles con operador identificado y datos de "
             "movimiento automático para los filtros seleccionados."
+        )
+
+    st.subheader("Total horas automático acumuladas por operador")
+    st.caption(
+        "Suma el tiempo de movimiento automático de los ciclos visibles. "
+        "Colores por ranking: azul = más horas, verde = segundo, "
+        "naranja = tercero, rojo = menos horas; negro = sin registrar."
+    )
+
+    fig_horas_operador = grafico_horas_auto_acumuladas_operador(
+        df_visible_base,
+        sel_operadores,
+    )
+
+    if fig_horas_operador is not None:
+        st.plotly_chart(
+            fig_horas_operador,
+            width="stretch",
+            config={
+                "displaylogo": False,
+                "scrollZoom": False,
+            },
+        )
+    else:
+        st.info(
+            "No hay datos suficientes de horas automáticas para los filtros "
+            "seleccionados."
         )
 
     st.subheader("Uso automático por brazo")
@@ -4677,12 +5503,36 @@ def render_zda_section(
             ),
         )
 
+        mostrar_clusters_inicio_timeline = st.checkbox(
+            "Mostrar clusters de hora de inicio",
+            value=False,
+            key="mostrar_clusters_inicio_timeline",
+            disabled=not solo_puntos_inicio_timeline,
+            help=(
+                "Identifica automáticamente entre 2 y 4 grupos de hora de "
+                "primer inicio mediante K-Means 1D. Al activarlo se usa "
+                "automáticamente solo el primer inicio de cada jumbo por turno. "
+                "Las zonas muestran los clusters y la línea punteada su centro."
+            ),
+        )
+
+        if solo_puntos_inicio_timeline and mostrar_clusters_inicio_timeline:
+            st.caption(
+                "Clusters calculados por separado para Día y Noche sobre el "
+                "primer inicio de cada jumbo por fecha operativa. K se selecciona "
+                "automáticamente entre 2 y 4 usando Silhouette Score."
+            )
+
         # Orden de lectura fijo: primero Turno Día y luego Turno Noche.
         fig_turno_dia = grafico_timeline_ciclos_turno(
             ciclos_turno_filtrado,
             "Día",
             solo_puntos_inicio=solo_puntos_inicio_timeline,
             solo_primer_inicio=solo_primer_inicio_timeline,
+            mostrar_clusters=(
+                solo_puntos_inicio_timeline
+                and mostrar_clusters_inicio_timeline
+            ),
         )
 
         if fig_turno_dia is not None:
@@ -4699,11 +5549,28 @@ def render_zda_section(
                 "No hay ciclos visibles en el Turno Día."
             )
 
+        if (
+            solo_puntos_inicio_timeline
+            and mostrar_clusters_inicio_timeline
+        ):
+            cluster_dia = analizar_clusters_primer_inicio(
+                ciclos_turno_filtrado,
+                "Día",
+            )
+            render_resumen_clusters_primer_inicio(
+                cluster_dia,
+                "Día",
+            )
+
         fig_turno_noche = grafico_timeline_ciclos_turno(
             ciclos_turno_filtrado,
             "Noche",
             solo_puntos_inicio=solo_puntos_inicio_timeline,
             solo_primer_inicio=solo_primer_inicio_timeline,
+            mostrar_clusters=(
+                solo_puntos_inicio_timeline
+                and mostrar_clusters_inicio_timeline
+            ),
         )
 
         if fig_turno_noche is not None:
@@ -4718,6 +5585,19 @@ def render_zda_section(
         else:
             st.info(
                 "No hay ciclos visibles en el Turno Noche."
+            )
+
+        if (
+            solo_puntos_inicio_timeline
+            and mostrar_clusters_inicio_timeline
+        ):
+            cluster_noche = analizar_clusters_primer_inicio(
+                ciclos_turno_filtrado,
+                "Noche",
+            )
+            render_resumen_clusters_primer_inicio(
+                cluster_noche,
+                "Noche",
             )
 
         # ------------------------------------------------------
@@ -4787,7 +5667,7 @@ def render_zda_section(
         with ctrl_prom:
             mostrar_promedio_inicio = st.checkbox(
                 "Mostrar promedio",
-                value=True,
+                value=False,
                 key="mostrar_promedio_inicio_diario",
             )
         with ctrl_med:
@@ -4859,7 +5739,7 @@ def render_zda_section(
         with ctrl_prom_fin:
             mostrar_promedio_fin = st.checkbox(
                 "Mostrar promedio",
-                value=True,
+                value=False,
                 key="mostrar_promedio_ultimo_fin_diario",
             )
         with ctrl_med_fin:
