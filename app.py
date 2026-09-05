@@ -33,7 +33,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.91-PYTHON-NAVEGACION-UN-CLIC"
+APP_VERSION_INTERNAL = "V34.95-PYTHON-AUTO-OPERADOR-ETIQUETAS-SIN-SOLAPE-FIX"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -1177,6 +1177,7 @@ def grafico_auto_por_operador(
     fig = go.Figure()
     annotations = []
     points = []
+    etiquetas_finales = []
 
     # Símbolo permite reconocer el jumbo sin competir con el color,
     # que queda reservado para distinguir operadores.
@@ -1308,6 +1309,84 @@ def grafico_auto_por_operador(
                     "rank": i + idx * 100,
                 })
 
+        # Guardar la etiqueta final para posicionarla después.
+        # El ajuste conjunto permite evitar superposición entre apellidos.
+        ultimo = g.iloc[-1]
+        etiquetas_finales.append({
+            "x": ultimo["FechaHora"],
+            "y": float(ultimo["Pct_Movimiento_Automatico_Brazos"]),
+            "texto": operador.split()[-1],
+            "color": COLORES[idx % len(COLORES)],
+        })
+
+    # ------------------------------------------------------
+    # Etiquetas finales sin superposición
+    # ------------------------------------------------------
+    # Si dos o más operadores terminan con valores muy próximos,
+    # sus apellidos se desplazan verticalmente en píxeles.
+    # Los puntos y las curvas permanecen exactamente en su valor real.
+    if etiquetas_finales:
+        etiquetas_ordenadas = sorted(
+            etiquetas_finales,
+            key=lambda e: e["y"],
+            reverse=True,
+        )
+
+        # Umbral en puntos porcentuales para considerar que dos etiquetas
+        # podrían superponerse visualmente.
+        umbral_pp = 6.0
+        clusters = []
+        cluster_actual = []
+
+        for etiqueta in etiquetas_ordenadas:
+            if not cluster_actual:
+                cluster_actual = [etiqueta]
+                continue
+
+            if abs(cluster_actual[-1]["y"] - etiqueta["y"]) <= umbral_pp:
+                cluster_actual.append(etiqueta)
+            else:
+                clusters.append(cluster_actual)
+                cluster_actual = [etiqueta]
+
+        if cluster_actual:
+            clusters.append(cluster_actual)
+
+        # Desplazamientos simétricos alrededor de la posición real.
+        # Ejemplos:
+        # 2 etiquetas -> +11 / -11 px
+        # 3 etiquetas -> +22 / 0 / -22 px
+        # 4 etiquetas -> +33 / +11 / -11 / -33 px
+        for cluster in clusters:
+            n = len(cluster)
+            paso_px = 22
+            centro = (n - 1) / 2.0
+
+            for pos, etiqueta in enumerate(cluster):
+                yshift = int(round((centro - pos) * paso_px))
+
+                annotations.append(
+                    dict(
+                        x=etiqueta["x"],
+                        y=etiqueta["y"],
+                        xref="x",
+                        yref="y",
+                        text=f'<b>{etiqueta["texto"]}</b>',
+                        showarrow=False,
+                        xanchor="left",
+                        yanchor="middle",
+                        xshift=14,
+                        yshift=yshift,
+                        font=dict(
+                            size=11,
+                            color=etiqueta["color"],
+                        ),
+                        bgcolor="rgba(255,255,255,0.90)",
+                        bordercolor="rgba(0,0,0,0)",
+                        borderpad=2,
+                    )
+                )
+
     if mostrar_etiquetas and points:
         annotations.extend(
             smart_annotations(
@@ -1324,7 +1403,7 @@ def grafico_auto_por_operador(
             annotations=annotations,
             margin=dict(
                 l=78,
-                r=35,
+                r=145,
                 t=55,
                 b=82,
             ),
