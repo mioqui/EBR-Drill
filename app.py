@@ -33,7 +33,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.81-PYTHON-OPERADORES-ZDA-NORMALIZADOS"
+APP_VERSION_INTERNAL = "V34.91-PYTHON-NAVEGACION-UN-CLIC"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -188,6 +188,7 @@ def _valores_detectados_desde_cache():
     jumbos = []
     tipos = []
     rocas = []
+    operadores = []
 
     for r in st.session_state.procesados.values():
         if r.get("error"):
@@ -199,6 +200,11 @@ def _valores_detectados_desde_cache():
         roca = tipo_roca_desde_plan_texto(
             rep.get("Plan_Perforacion")
         )
+        operador = (
+            rep.get("Operador_ZDA")
+            or rep.get("Operador")
+            or None
+        )
 
         if jumbo and str(jumbo).strip():
             jumbos.append(str(jumbo).strip())
@@ -206,6 +212,8 @@ def _valores_detectados_desde_cache():
             tipos.append(str(tipo).strip())
         if roca and str(roca).strip():
             rocas.append(str(roca).strip())
+        if operador and str(operador).strip():
+            operadores.append(str(operador).strip())
 
     # Orden natural para JUMB001, JUMB002... y luego series/otros.
     def jumbo_sort_key(valor):
@@ -228,7 +236,9 @@ def _valores_detectados_desde_cache():
     if "SIN DATO" in rocas_presentes:
         rocas.append("SIN DATO")
 
-    return jumbos, tipos, rocas
+    operadores = sorted(set(operadores))
+
+    return jumbos, tipos, rocas, operadores
 
 
 def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
@@ -258,12 +268,13 @@ def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
     st.session_state[previous_options_key] = options.copy()
 
 
-jumbos_detectados, tipos_detectados, rocas_detectadas = _valores_detectados_desde_cache()
+jumbos_detectados, tipos_detectados, rocas_detectadas, operadores_detectados = _valores_detectados_desde_cache()
 
 # Variables siempre definidas aunque aún no existan datos.
 global_jumbos = []
 global_tipos = []
 global_rocas = []
+global_operadores = []
 global_lbl_auto = False
 global_line_auto = False
 global_lbl_arm = False
@@ -296,6 +307,11 @@ with st.sidebar:
             rocas_detectadas,
             "_global_rocas_options_prev",
         )
+        _sincronizar_multiselect_dinamico(
+            "global_operadores",
+            operadores_detectados,
+            "_global_operadores_options_prev",
+        )
 
         global_jumbos = st.multiselect(
             "Jumbos",
@@ -313,6 +329,16 @@ with st.sidebar:
             "Tipo de roca",
             rocas_detectadas,
             key="global_rocas",
+        )
+
+        global_operadores = st.multiselect(
+            "Operadores",
+            operadores_detectados,
+            key="global_operadores",
+            help=(
+                "Se muestran únicamente los operadores detectados "
+                "en los archivos ZDA procesados."
+            ),
         )
 
         st.caption(
@@ -341,7 +367,7 @@ with st.sidebar:
             key="opt_line_auto",
             help=(
                 "Desmarcado: muestra solo los puntos. "
-                "Marcado: agrega una línea suavizada que conecta los ciclos."
+                "Marcado: agrega una curva suavizada que conecta los ciclos sin modificar los valores reales de los puntos."
             ),
         )
         global_lbl_arm = st.checkbox(
@@ -1057,7 +1083,7 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
                 width=3,
                 color=COLORES[idx % len(COLORES)],
                 shape="spline",
-                smoothing=0.35,
+                smoothing=1.0,
             ) if mostrar_linea else None,
             marker=dict(
                 size=9,
@@ -1091,6 +1117,236 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
         yaxis=dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7"),
         xaxis=dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7"),
     ))
+    return fig
+
+
+
+def grafico_auto_por_operador(
+    df_auto: pd.DataFrame,
+    mostrar_etiquetas: bool,
+    mostrar_linea: bool,
+):
+    """
+    Evolución del movimiento automático por operador.
+
+    - Cada línea/color representa un operador.
+    - Cada punto representa un ciclo/round.
+    - El % global mostrado en la leyenda se calcula a partir de la suma
+      de tiempos automáticos y manuales del operador:
+          Auto / (Auto + Manual)
+      y no como promedio simple de porcentajes por ciclo.
+    """
+    if df_auto.empty:
+        return None
+
+    requeridas = {
+        "Operador_Filtro",
+        "Pct_Movimiento_Automatico_Brazos",
+    }
+    if not requeridas.issubset(df_auto.columns):
+        return None
+
+    df = df_auto.copy()
+
+    df["Operador_Filtro"] = (
+        df["Operador_Filtro"]
+        .fillna("SIN DATO")
+        .astype(str)
+        .str.strip()
+    )
+
+    # Para una comparación realmente "por operador", no dibujar
+    # registros donde no se logró identificar a la persona.
+    df = df[
+        df["Operador_Filtro"].ne("")
+        & df["Operador_Filtro"].str.upper().ne("SIN DATO")
+        & df["Pct_Movimiento_Automatico_Brazos"].notna()
+    ].copy()
+
+    df = asegurar_fechahora(df)
+    if df.empty:
+        return None
+
+    operadores = sorted(
+        df["Operador_Filtro"]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+
+    fig = go.Figure()
+    annotations = []
+    points = []
+
+    # Símbolo permite reconocer el jumbo sin competir con el color,
+    # que queda reservado para distinguir operadores.
+    jumbo_symbols = {
+        "JUMB001": "circle",
+        "JUMB002": "square",
+    }
+
+    for idx, operador in enumerate(operadores):
+        g = df[
+            df["Operador_Filtro"].astype(str).eq(str(operador))
+        ].sort_values("FechaHora").copy()
+
+        if g.empty:
+            continue
+
+        auto = pd.to_numeric(
+            g.get("Auto_Total_Brazos_min"),
+            errors="coerce",
+        ).sum(min_count=1)
+
+        manual = pd.to_numeric(
+            g.get("Manual_Total_Brazos_min"),
+            errors="coerce",
+        ).sum(min_count=1)
+
+        global_pct = (
+            auto / (auto + manual) * 100
+            if pd.notna(auto)
+            and pd.notna(manual)
+            and (auto + manual) > 0
+            else None
+        )
+
+        ciclos = (
+            g["Ciclo"]
+            if "Ciclo" in g.columns
+            else pd.Series(["-"] * len(g), index=g.index)
+        )
+        jumbos = (
+            g["Jumbo"].fillna("-").astype(str)
+            if "Jumbo" in g.columns
+            else pd.Series(["-"] * len(g), index=g.index)
+        )
+        tipos = (
+            g["Tipo_Disparo"].fillna("-").astype(str)
+            if "Tipo_Disparo" in g.columns
+            else pd.Series(["-"] * len(g), index=g.index)
+        )
+        rocas = (
+            g["Tipo_Roca"].fillna("SIN DATO").astype(str)
+            if "Tipo_Roca" in g.columns
+            else pd.Series(["SIN DATO"] * len(g), index=g.index)
+        )
+        barrenos = (
+            g["Barrenos_Realizados"]
+            if "Barrenos_Realizados" in g.columns
+            else pd.Series([None] * len(g), index=g.index)
+        )
+
+        custom = np.column_stack([
+            ciclos.astype(object),
+            jumbos.astype(object),
+            tipos.astype(object),
+            rocas.astype(object),
+            barrenos.astype(object),
+        ])
+
+        symbols = [
+            jumbo_symbols.get(str(j), "diamond")
+            for j in jumbos
+        ]
+
+        nombre_leyenda = (
+            f"{operador} · Global {global_pct:.1f}%"
+            if global_pct is not None and pd.notna(global_pct)
+            else operador
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=g["FechaHora"],
+                y=g["Pct_Movimiento_Automatico_Brazos"],
+                mode="lines+markers" if mostrar_linea else "markers",
+                name=nombre_leyenda,
+                line=(
+                    dict(
+                        width=2.8,
+                        color=COLORES[idx % len(COLORES)],
+                        shape="spline",
+                        smoothing=1.0,
+                    )
+                    if mostrar_linea
+                    else None
+                ),
+                marker=dict(
+                    size=9,
+                    symbol=symbols,
+                    color=COLORES[idx % len(COLORES)],
+                    line=dict(
+                        color="#ffffff",
+                        width=1.1,
+                    ),
+                ),
+                customdata=custom,
+                hovertemplate=(
+                    f"<b>{operador}</b>"
+                    "<br>Fecha: %{x|%d/%m/%Y %H:%M}"
+                    "<br>Jumbo: %{customdata[1]}"
+                    "<br>Ciclo: %{customdata[0]}"
+                    "<br>Automático: %{y:.1f}%"
+                    "<br>Barrenos: %{customdata[4]}"
+                    "<br>Tipo de disparo: %{customdata[2]}"
+                    "<br>Tipo de roca: %{customdata[3]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+        if mostrar_etiquetas:
+            for i, (_, r) in enumerate(g.iterrows()):
+                points.append({
+                    "x": r["FechaHora"],
+                    "y": r["Pct_Movimiento_Automatico_Brazos"],
+                    "text": (
+                        f"{operador.split()[-1]}<br>"
+                        f"{r['Pct_Movimiento_Automatico_Brazos']:.1f}%"
+                    ),
+                    "rank": i + idx * 100,
+                })
+
+    if mostrar_etiquetas and points:
+        annotations.extend(
+            smart_annotations(
+                points,
+                x_window_hours=18,
+                y_window=4,
+                font_size=10,
+            )
+        )
+
+    fig.update_layout(
+        **base_layout(
+            500,
+            annotations=annotations,
+            margin=dict(
+                l=78,
+                r=35,
+                t=55,
+                b=82,
+            ),
+            yaxis=dict(
+                title="Movimiento automático (%)",
+                rangemode="tozero",
+                gridcolor="#eef2f7",
+            ),
+            xaxis=dict(
+                title="Fecha",
+                tickformat="%d/%m",
+                gridcolor="#eef2f7",
+            ),
+            legend=dict(
+                orientation="h",
+                y=-0.20,
+                x=0,
+            ),
+            hovermode="closest",
+        )
+    )
+
     return fig
 
 
@@ -1148,7 +1404,7 @@ def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.Data
     cut = cut[cut["Mediana"].notna()].copy()
     if cut.empty:
         return cut
-    cols = [c for c in ["Jumbo","Ciclo","Fecha_Inicio","Tipo_Disparo","Tipo_Roca"] if c in df_reportes.columns]
+    cols = [c for c in ["Jumbo","Ciclo","Fecha_Inicio","Tipo_Disparo","Tipo_Roca","Operador_Filtro"] if c in df_reportes.columns]
     tipos = df_reportes[cols].drop_duplicates(subset=[c for c in ["Jumbo","Ciclo","Fecha_Inicio"] if c in cols])
     cut = cut.merge(tipos, on=["Jumbo","Ciclo","Fecha_Inicio"], how="left")
     cut["Tipo_Disparo"] = cut["Tipo_Disparo"].fillna("SIN CLASIFICAR")
@@ -1156,7 +1412,14 @@ def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.Data
 
 
 
-def grafico_cut(df_cut: pd.DataFrame, jumbos_visibles, tipos_visibles, rocas_visibles, mostrar_etiquetas: bool):
+def grafico_cut(
+    df_cut: pd.DataFrame,
+    jumbos_visibles,
+    tipos_visibles,
+    rocas_visibles,
+    operadores_visibles,
+    mostrar_etiquetas: bool,
+):
     if df_cut.empty:
         return None
 
@@ -1164,6 +1427,7 @@ def grafico_cut(df_cut: pd.DataFrame, jumbos_visibles, tipos_visibles, rocas_vis
         df_cut["Jumbo"].astype(str).isin([str(x) for x in jumbos_visibles])
         & df_cut["Tipo_Disparo"].isin(tipos_visibles)
         & df_cut["Tipo_Roca"].isin(rocas_visibles)
+        & df_cut["Operador_Filtro"].isin(operadores_visibles)
     ].copy()
 
     if df.empty:
@@ -3010,51 +3274,131 @@ def asegurar_visuales_resultado(r):
 # CARGA MASIVA EN DOS FASES
 # ==========================================================
 
-st.subheader("Archivos")
 
-archivos = st.file_uploader(
-    "Seleccionar archivos PDF / ZDA",
-    type=["pdf", "zda"],
-    accept_multiple_files=True,
-    key=f"uploader_{st.session_state.uploader_version}",
-    help=(
-        "Modo masivo: al presionar Procesar, primero se copian los archivos a "
-        "disco temporal y se libera el uploader. Luego se procesan uno por uno."
-    ),
-)
+def _streamlit_version_tuple():
+    """Versión numérica simple para habilitar carga de carpetas."""
+    nums = re.findall(r"\d+", str(getattr(st, "__version__", "0.0.0")))
+    vals = [int(x) for x in nums[:3]]
+    while len(vals) < 3:
+        vals.append(0)
+    return tuple(vals)
 
-seleccion = archivos or []
-total_upload_mb = sum(int(getattr(a, "size", 0) or 0) for a in seleccion) / (1024 * 1024)
 
-col_process, col_clear = st.columns(2)
-with col_process:
-    procesar = st.button(
-        "Procesar lote",
-        type="primary",
-        width="stretch",
-        disabled=not seleccion,
-    )
-with col_clear:
-    st.button(
-        "Limpiar",
-        width="stretch",
-        on_click=limpiar_analisis,
+with st.container(border=True):
+    st.subheader("Cargar ciclos (.ZDA / PDF)")
+    st.caption(
+        "Puedes agregar archivos individuales o seleccionar una carpeta completa. "
+        "Los ciclos ya procesados permanecen cargados y puedes seguir incorporando "
+        "nuevos archivos a medida que avanza el mes."
     )
 
-st.caption(
-    f"Seleccionados: {len(seleccion)} · Tamaño del lote: {total_upload_mb:,.1f} MB · "
-    f"Procesados acumulados: {len(st.session_state.procesados)}"
-)
+    col_files, col_folder, col_clear = st.columns([1.15, 1.15, 1.45])
+
+    with col_files:
+        with st.popover(
+            "📄 Elegir archivos",
+            use_container_width=True,
+            help="Selecciona uno o varios archivos PDF/ZDA.",
+        ):
+            archivos_individuales = st.file_uploader(
+                "Archivos PDF / ZDA",
+                type=["pdf", "zda"],
+                accept_multiple_files=True,
+                key=f"uploader_archivos_{st.session_state.uploader_version}",
+                label_visibility="collapsed",
+                help=(
+                    "Puedes seleccionar uno o varios archivos. "
+                    "La carga se procesa automáticamente."
+                ),
+            )
+
+    with col_folder:
+        if _streamlit_version_tuple() >= (1, 49, 0):
+            with st.popover(
+                "📁 Elegir carpeta",
+                use_container_width=True,
+                help="Carga todos los PDF/ZDA contenidos en una carpeta y sus subcarpetas.",
+            ):
+                archivos_carpeta = st.file_uploader(
+                    "Carpeta con archivos PDF / ZDA",
+                    type=["pdf", "zda"],
+                    accept_multiple_files="directory",
+                    key=f"uploader_carpeta_{st.session_state.uploader_version}",
+                    label_visibility="collapsed",
+                    help=(
+                        "Selecciona una carpeta. Solo se cargarán archivos PDF/ZDA; "
+                        "también se consideran sus subcarpetas."
+                    ),
+                )
+        else:
+            archivos_carpeta = []
+            st.button(
+                "📁 Elegir carpeta",
+                width="stretch",
+                disabled=True,
+                help="Requiere Streamlit 1.49 o superior.",
+                key="folder_upload_disabled",
+            )
+
+    with col_clear:
+        st.button(
+            "🗑️ Borrar datos cargados",
+            width="stretch",
+            on_click=limpiar_analisis,
+            help=(
+                "Elimina de la sesión todos los ciclos procesados, "
+                "archivos temporales y filtros asociados."
+            ),
+        )
+
+    archivos_individuales = archivos_individuales or []
+    archivos_carpeta = archivos_carpeta or []
+    seleccion = list(archivos_individuales) + list(archivos_carpeta)
+
+    total_upload_mb = sum(
+        int(getattr(a, "size", 0) or 0)
+        for a in seleccion
+    ) / (1024 * 1024)
+
+    procesados_ok_actual = sum(
+        1
+        for r in st.session_state.procesados.values()
+        if not r.get("error")
+    )
+    procesados_error_actual = sum(
+        1
+        for r in st.session_state.procesados.values()
+        if r.get("error")
+    )
+
+    estado_carga = (
+        f"{procesados_ok_actual} ciclo(s) cargado(s) correctamente."
+    )
+    if procesados_error_actual:
+        estado_carga += f" · {procesados_error_actual} archivo(s) con error."
+    if seleccion:
+        estado_carga += (
+            f" · Nuevos seleccionados: {len(seleccion)} "
+            f"({total_upload_mb:,.1f} MB)."
+        )
+
+    st.markdown(
+        f"<div style='font-size:0.98rem; color:#475467; padding-top:0.25rem;'>"
+        f"{estado_carga}</div>",
+        unsafe_allow_html=True,
+    )
 
 if seleccion and total_upload_mb >= 700:
     st.warning(
-        "El lote cargado supera aproximadamente 700 MB. El modo masivo libera los "
-        "archivos antes del parsing, pero Streamlit Community Cloud debe recibir primero "
-        "todo el lote en el uploader. Si la carga por sí sola supera la memoria disponible, "
-        "será necesario dividir únicamente la etapa de carga."
+        "El lote seleccionado supera aproximadamente 700 MB. El modo masivo "
+        "libera los archivos antes del parsing, pero el navegador debe transferir "
+        "primero todo el lote. Si la carga supera la memoria disponible, conviene "
+        "dividir únicamente la selección en dos carpetas o lotes."
     )
 
-if procesar and seleccion:
+# Primera fase automática: al seleccionar archivos o una carpeta, se copian
+# a disco temporal y se libera inmediatamente el uploader antes del parsing.
+if seleccion:
     estado_stage = st.empty()
     estado_stage.write(
         f"Preparando {len(seleccion)} archivo(s) en disco temporal..."
@@ -3062,8 +3406,8 @@ if procesar and seleccion:
     nuevos = preparar_archivos_en_disco(seleccion)
     estado_stage.empty()
 
-    # CRÍTICO: borrar el widget ANTES de procesar. En el siguiente rerun los
-    # 150 UploadedFile ya no permanecen en memoria; sólo quedan paths en disco.
+    # Cambiar la versión de ambos uploaders hace que Streamlit libere sus bytes
+    # antes de comenzar el procesamiento intensivo del lote.
     st.session_state.uploader_version += 1
     st.session_state.auto_process_staged = bool(nuevos)
     st.rerun()
@@ -3118,8 +3462,8 @@ if not resultados_validos:
         )
     else:
         st.write(
-            "Selecciona uno o varios archivos PDF/ZDA y presiona "
-            "**Procesar / recalcular**."
+            "Selecciona uno o varios archivos o una carpeta completa para "
+            "comenzar el análisis."
         )
     st.stop()
 
@@ -3134,11 +3478,28 @@ df_reportes = pd.DataFrame(report_rows)
 # Fuerza la clasificación V33 para PDF y ZDA con el mismo criterio.
 df_reportes["Tipo_Disparo"] = df_reportes["Barrenos_Realizados"].apply(clasificar_tipo_disparo_v33)
 df_reportes["Tipo_Roca"] = df_reportes["Plan_Perforacion"].apply(tipo_roca_desde_plan_texto)
+
+def _operador_filtro_row(r):
+    for campo in ("Operador_ZDA", "Operador", "Operario"):
+        valor = r.get(campo)
+        if valor is not None and not pd.isna(valor):
+            texto = str(valor).strip()
+            if texto:
+                return texto
+    return "SIN DATO"
+
+df_reportes["Operador_Filtro"] = df_reportes.apply(_operador_filtro_row, axis=1)
 df_reportes["Considerado_KPI_Automatizacion"] = df_reportes["Tipo_Disparo"].eq("FRENTE")
 for r in resultados_validos:
     rr = r["resumen_reporte"]
     rr["Tipo_Disparo"] = clasificar_tipo_disparo_v33(rr.get("Barrenos_Realizados"))
     rr["Tipo_Roca"] = tipo_roca_desde_plan_texto(rr.get("Plan_Perforacion"))
+    rr["Operador_Filtro"] = (
+        rr.get("Operador_ZDA")
+        or rr.get("Operador")
+        or rr.get("Operario")
+        or "SIN DATO"
+    )
     rr["Considerado_KPI_Automatizacion"] = rr["Tipo_Disparo"] == "FRENTE"
 
 # HTML V33 solo agrega Resumen_Ciclos de reportes cuyo conteo está OK.
@@ -3146,7 +3507,106 @@ df_resumen = concatenar_dataframes(resultados_validos, "resumen_ciclo", solo_ok=
 df_detalle = concatenar_dataframes(resultados_validos, "detalle")
 df_atipicos = concatenar_dataframes(resultados_validos, "atipicos")
 df_automatico = df_reportes.copy()
+
 df_zda = df_reportes[df_reportes["Fuente"].eq("ZDA")].copy() if "Fuente" in df_reportes.columns else pd.DataFrame()
+
+# ==========================================================
+# FILTRO GLOBAL DE FECHAS EN SIDEBAR
+# ==========================================================
+# El contenedor fue creado al inicio dentro de st.sidebar para conservar
+# la ubicación del filtro junto con Jumbos / Tipo / Roca / Operadores.
+# Se llena aquí, cuando df_zda ya está consolidado, independientemente
+# de qué sección del dashboard esté seleccionada.
+
+global_fecha_inicio_zda = None
+global_fecha_fin_zda = None
+
+if sidebar_fecha_container is not None:
+    with sidebar_fecha_container:
+        st.markdown("##### Rango de fechas")
+        st.caption("Aplica a Uso Automático y Tiempos de Ciclo.")
+
+        if (
+            not df_zda.empty
+            and "Inicio_Perforacion_TS" in df_zda.columns
+            and df_zda["Inicio_Perforacion_TS"].notna().any()
+        ):
+            fechas_sidebar = (
+                df_zda.loc[
+                    df_zda["Inicio_Perforacion_TS"].notna(),
+                    "Inicio_Perforacion_TS",
+                ]
+                .apply(zda_operational_date)
+            )
+
+            fechas_sidebar = pd.to_datetime(
+                fechas_sidebar,
+                errors="coerce",
+                utc=True,
+            ).dropna()
+
+            if not fechas_sidebar.empty:
+                fecha_min_sidebar = fechas_sidebar.min().date()
+                fecha_max_sidebar = fechas_sidebar.max().date()
+
+                # Recuperar valores previos y ajustarlos al rango disponible.
+                fecha_inicio_previa = st.session_state.get(
+                    "fecha_inicio_zda_global",
+                    fecha_min_sidebar,
+                )
+                fecha_fin_previa = st.session_state.get(
+                    "fecha_fin_zda_global",
+                    fecha_max_sidebar,
+                )
+
+                try:
+                    fecha_inicio_previa = max(
+                        fecha_min_sidebar,
+                        min(fecha_inicio_previa, fecha_max_sidebar),
+                    )
+                except Exception:
+                    fecha_inicio_previa = fecha_min_sidebar
+
+                try:
+                    fecha_fin_previa = max(
+                        fecha_min_sidebar,
+                        min(fecha_fin_previa, fecha_max_sidebar),
+                    )
+                except Exception:
+                    fecha_fin_previa = fecha_max_sidebar
+
+                # Si el rango previo queda invertido, volver al rango completo.
+                if fecha_inicio_previa > fecha_fin_previa:
+                    fecha_inicio_previa = fecha_min_sidebar
+                    fecha_fin_previa = fecha_max_sidebar
+
+                global_fecha_inicio_zda = st.date_input(
+                    "Fecha inicio",
+                    value=fecha_inicio_previa,
+                    min_value=fecha_min_sidebar,
+                    max_value=fecha_max_sidebar,
+                    key="fecha_inicio_zda_global",
+                    format="DD/MM/YYYY",
+                )
+
+                global_fecha_fin_zda = st.date_input(
+                    "Fecha fin",
+                    value=fecha_fin_previa,
+                    min_value=fecha_min_sidebar,
+                    max_value=fecha_max_sidebar,
+                    key="fecha_fin_zda_global",
+                    format="DD/MM/YYYY",
+                )
+
+                st.caption(
+                    f"Rango mostrado: "
+                    f"{global_fecha_inicio_zda.strftime('%d/%m/%Y')} "
+                    f"→ {global_fecha_fin_zda.strftime('%d/%m/%Y')}"
+                )
+            else:
+                st.caption("Sin fechas ZDA válidas.")
+        else:
+            st.caption("Sin fechas ZDA disponibles.")
 
 
 # ==========================================================
@@ -3481,6 +3941,267 @@ def grafico_b1_participacion_unico(
 
 
 
+
+
+def aplicar_filtro_fechas_global(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica Fecha inicio / Fecha fin del sidebar a un DataFrame
+    usando la columna Fecha_Inicio (dd/mm/YYYY).
+
+    Si no hay rango seleccionado o no existe Fecha_Inicio,
+    devuelve el DataFrame sin cambios.
+    """
+    if df is None or df.empty or "Fecha_Inicio" not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    fecha_inicio = st.session_state.get("fecha_inicio_zda_global")
+    fecha_fin = st.session_state.get("fecha_fin_zda_global")
+
+    if fecha_inicio is None or fecha_fin is None:
+        return df.copy()
+
+    fechas = pd.to_datetime(
+        df["Fecha_Inicio"],
+        format="%d/%m/%Y",
+        errors="coerce",
+    )
+
+    mask = (
+        fechas.notna()
+        & (fechas.dt.date >= fecha_inicio)
+        & (fechas.dt.date <= fecha_fin)
+    )
+
+    return df.loc[mask].copy()
+
+
+def _nombre_jumbo_resumen(valor):
+    texto = str(valor or "").strip()
+    m = re.fullmatch(r"JUMB0*(\d+)", texto, re.IGNORECASE)
+    if m:
+        return f"Jumbo {int(m.group(1))}"
+    return texto or "-"
+
+
+def _fecha_corta_es(valor):
+    if valor is None or pd.isna(valor):
+        return "-"
+    ts = pd.Timestamp(valor)
+    meses = [
+        "ene.", "feb.", "mar.", "abr.", "may.", "jun.",
+        "jul.", "ago.", "sep.", "oct.", "nov.", "dic.",
+    ]
+    return f"{ts.day:02d}-{meses[ts.month - 1]}"
+
+
+def render_kpis_uso_automatico(df_auto: pd.DataFrame):
+    """
+    Resumen superior de la sección Uso Automático.
+
+    Los indicadores se recalculan con el rango Fecha inicio / Fecha fin
+    seleccionado en el panel lateral.
+    """
+    if df_auto is None or df_auto.empty:
+        return
+
+    base = aplicar_filtro_fechas_global(df_auto)
+    total_ciclos = len(base)
+
+    # ------------------------------------------------------
+    # Ciclos cargados + desglose por jumbo
+    # ------------------------------------------------------
+    if "Jumbo" in base.columns:
+        vc = (
+            base["Jumbo"]
+            .fillna("SIN DATO")
+            .astype(str)
+            .value_counts()
+        )
+
+        def _sort_jumbo(item):
+            nombre, _ = item
+            m = re.fullmatch(r"JUMB0*(\d+)", str(nombre), re.IGNORECASE)
+            if m:
+                return (0, int(m.group(1)))
+            return (1, str(nombre))
+
+        jumbo_detalle = " · ".join(
+            f"{_nombre_jumbo_resumen(jumbo)}: {int(n)}"
+            for jumbo, n in sorted(vc.items(), key=_sort_jumbo)
+        )
+    else:
+        jumbo_detalle = f"{total_ciclos} ciclos"
+
+    # ------------------------------------------------------
+    # Rango de fechas
+    # ------------------------------------------------------
+    fechas = pd.Series(dtype="datetime64[ns]")
+    if "Fecha_Inicio" in base.columns:
+        fechas = pd.to_datetime(
+            base["Fecha_Inicio"],
+            format="%d/%m/%Y",
+            errors="coerce",
+        ).dropna()
+
+    fecha_inicio_sel = st.session_state.get("fecha_inicio_zda_global")
+    fecha_fin_sel = st.session_state.get("fecha_fin_zda_global")
+
+    if fecha_inicio_sel is not None and fecha_fin_sel is not None:
+        rango_fecha = (
+            f"{_fecha_corta_es(pd.Timestamp(fecha_inicio_sel))} – "
+            f"{_fecha_corta_es(pd.Timestamp(fecha_fin_sel))}"
+        )
+        fechas_sub = f"{len(fechas)} ciclos en el rango"
+    elif not fechas.empty:
+        fecha_min = fechas.min()
+        fecha_max = fechas.max()
+        rango_fecha = f"{_fecha_corta_es(fecha_min)} – {_fecha_corta_es(fecha_max)}"
+        fechas_sub = f"{len(fechas)} ciclos con fecha"
+    else:
+        rango_fecha = "-"
+        fechas_sub = "Sin fechas válidas"
+
+    # ------------------------------------------------------
+    # Horas automáticas totales
+    # ------------------------------------------------------
+    auto_min = (
+        pd.to_numeric(
+            base.get(
+                "Auto_Total_Brazos_min",
+                pd.Series(index=base.index, dtype=float),
+            ),
+            errors="coerce",
+        )
+    )
+    manual_min = (
+        pd.to_numeric(
+            base.get(
+                "Manual_Total_Brazos_min",
+                pd.Series(index=base.index, dtype=float),
+            ),
+            errors="coerce",
+        )
+    )
+
+    mask_binario = auto_min.notna() & manual_min.notna()
+    ciclos_binarios = int(mask_binario.sum())
+    horas_auto = float(auto_min[mask_binario].sum()) / 60.0 if ciclos_binarios else 0.0
+
+    horas_auto_txt = f"{horas_auto:,.2f} h".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    # ------------------------------------------------------
+    # Sin operador registrado
+    # ------------------------------------------------------
+    if "Operador_Filtro" in base.columns:
+        op = (
+            base["Operador_Filtro"]
+            .fillna("SIN DATO")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        sin_operador = int(
+            op.isin(["", "SIN DATO", "NONE", "NAN"]).sum()
+        )
+    else:
+        campos_op = [
+            c for c in ["Operador_ZDA", "Operador", "Operario"]
+            if c in base.columns
+        ]
+        if campos_op:
+            tiene_op = pd.Series(False, index=base.index)
+            for campo in campos_op:
+                vals = base[campo].fillna("").astype(str).str.strip()
+                tiene_op = tiene_op | vals.ne("")
+            sin_operador = int((~tiene_op).sum())
+        else:
+            sin_operador = total_ciclos
+
+    pct_sin_operador = (
+        sin_operador / total_ciclos * 100
+        if total_ciclos > 0
+        else 0.0
+    )
+
+    # ------------------------------------------------------
+    # Tarjetas
+    # ------------------------------------------------------
+    st.markdown(
+        """
+        <style>
+        .ebr-kpi-card {
+            min-height: 142px;
+            border: 1px solid #e2e8f0;
+            border-radius: 18px;
+            background: #ffffff;
+            padding: 1.15rem 1.25rem 1.05rem 1.25rem;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+            margin-bottom: 0.45rem;
+        }
+        .ebr-kpi-label {
+            font-size: 0.78rem;
+            letter-spacing: 0.055em;
+            text-transform: uppercase;
+            color: #8a8a84;
+            font-weight: 500;
+            margin-bottom: 0.50rem;
+        }
+        .ebr-kpi-value {
+            font-size: 2.00rem;
+            line-height: 1.05;
+            color: #111111;
+            font-weight: 750;
+            margin-bottom: 0.48rem;
+        }
+        .ebr-kpi-sub {
+            font-size: 0.95rem;
+            line-height: 1.30;
+            color: #66645f;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cards = [
+        (
+            "Ciclos cargados",
+            f"{total_ciclos}",
+            jumbo_detalle,
+        ),
+        (
+            "Rango de fechas",
+            rango_fecha,
+            fechas_sub,
+        ),
+        (
+            "Horas automático (total)",
+            horas_auto_txt,
+            f"{ciclos_binarios} ciclos con dato automático/manual",
+        ),
+        (
+            "Sin operador registrado",
+            f"{sin_operador}",
+            f"{pct_sin_operador:.0f}% de los ciclos",
+        ),
+    ]
+
+    cols = st.columns(4)
+    for col, (label, value, sub) in zip(cols, cards):
+        with col:
+            st.markdown(
+                f"""
+                <div class="ebr-kpi-card">
+                    <div class="ebr-kpi-label">{label}</div>
+                    <div class="ebr-kpi-value">{value}</div>
+                    <div class="ebr-kpi-sub">{sub}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+
 # ==========================================================
 # BLOQUE 1 - AUTOMATIZACIÓN
 # ==========================================================
@@ -3491,6 +4212,7 @@ def render_automation_section(
     sel_jumbos,
     sel_tipos,
     sel_rocas,
+    sel_operadores,
     mostrar_auto: bool,
     mostrar_linea_auto: bool,
     mostrar_arm: bool,
@@ -3499,13 +4221,21 @@ def render_automation_section(
         st.info("Sin datos suficientes de automatización.")
         return
 
+    render_kpis_uso_automatico(df_automatico)
+    st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
+
     df_visible = df_automatico[
         df_automatico["Jumbo"].astype(str).isin(
             [str(x) for x in sel_jumbos]
         )
         & df_automatico["Tipo_Disparo"].isin(sel_tipos)
         & df_automatico["Tipo_Roca"].isin(sel_rocas)
+        & df_automatico["Operador_Filtro"].isin(sel_operadores)
     ].copy()
+
+    # El rango de fechas del sidebar también filtra los gráficos de
+    # Uso Automático para que sean consistentes con las tarjetas superiores.
+    df_visible = aplicar_filtro_fechas_global(df_visible)
 
     st.subheader("Evolución del movimiento automático")
 
@@ -3525,6 +4255,33 @@ def render_automation_section(
         st.info(
             "No hay ciclos visibles con datos de movimiento automático "
             "para los filtros globales seleccionados."
+        )
+
+    st.subheader("Evolución del movimiento automático por operador")
+    st.caption(
+        "Cada color representa un operador y cada punto un ciclo/round. "
+        "El porcentaje global de la leyenda se calcula con la suma de los "
+        "tiempos automáticos y manuales de los ciclos visibles. "
+        "El símbolo del punto identifica el jumbo: círculo = JUMB001, "
+        "cuadrado = JUMB002."
+    )
+
+    fig_auto_operador = grafico_auto_por_operador(
+        df_visible,
+        mostrar_auto,
+        mostrar_linea_auto,
+    )
+
+    if fig_auto_operador is not None:
+        st.plotly_chart(
+            fig_auto_operador,
+            width="stretch",
+            config={"displaylogo": False},
+        )
+    else:
+        st.info(
+            "No hay ciclos visibles con operador identificado y datos de "
+            "movimiento automático para los filtros seleccionados."
         )
 
     st.subheader("Uso automático por brazo")
@@ -3575,6 +4332,7 @@ def render_cut_section(
     sel_jumbos,
     sel_tipos,
     sel_rocas,
+    sel_operadores,
     mostrar_cut: bool,
 ):
     st.subheader("Evolución de la longitud perforada en barrenos Cut")
@@ -3599,6 +4357,7 @@ def render_cut_section(
         sel_jumbos,
         sel_tipos,
         sel_rocas,
+        sel_operadores,
         mostrar_cut,
     )
 
@@ -3624,6 +4383,7 @@ def render_zda_section(
     sel_jumbos,
     sel_tipos,
     sel_rocas,
+    sel_operadores,
     mostrar_zda: bool,
 ):
     st.subheader("Tiempos de ciclo de perforación")
@@ -3666,13 +4426,16 @@ def render_zda_section(
         )
         & zda_all["Tipo_Disparo"].isin(sel_tipos)
         & zda_all["Tipo_Roca"].isin(sel_rocas)
+        & zda_all["Operador_Filtro"].isin(sel_operadores)
     ].copy()
 
     # ------------------------------------------------------
-    # FILTRO GLOBAL DE FECHAS APLICADO DESDE EL PANEL LATERAL.
+    # FILTRO GLOBAL DE FECHAS DEL PANEL LATERAL.
+    # Los widgets se muestran siempre en el sidebar; aquí únicamente
+    # se aplican los valores seleccionados a Tiempos de Ciclo.
     # ------------------------------------------------------
-    fecha_inicio_zda = None
-    fecha_fin_zda = None
+    fecha_inicio_zda = st.session_state.get("fecha_inicio_zda_global")
+    fecha_fin_zda = st.session_state.get("fecha_fin_zda_global")
 
     if not zda_rows.empty:
         zda_rows["_Fecha_Operativa_Filtro"] = (
@@ -3680,60 +4443,22 @@ def render_zda_section(
             .apply(zda_operational_date)
         )
 
-        fechas_zda_disponibles = pd.to_datetime(
+        fecha_op_date = pd.to_datetime(
             zda_rows["_Fecha_Operativa_Filtro"],
             errors="coerce",
             utc=True,
-        ).dropna()
+        ).dt.date
 
-        fecha_min_zda = fechas_zda_disponibles.min().date()
-        fecha_max_zda = fechas_zda_disponibles.max().date()
-
-        if sidebar_fecha_container is not None:
-            with sidebar_fecha_container:
-                st.markdown("##### Rango de fechas")
-                st.caption(
-                    "Aplica a los gráficos y resúmenes de tiempos de ciclo."
+        if fecha_inicio_zda is not None and fecha_fin_zda is not None:
+            if fecha_inicio_zda > fecha_fin_zda:
+                st.error("La Fecha inicio no puede ser posterior a la Fecha fin.")
+                zda_rows = zda_rows.iloc[0:0].copy()
+            else:
+                mask_fecha_zda = (
+                    (fecha_op_date >= fecha_inicio_zda)
+                    & (fecha_op_date <= fecha_fin_zda)
                 )
-                fecha_inicio_zda = st.date_input(
-                    "Fecha inicio",
-                    value=fecha_min_zda,
-                    min_value=fecha_min_zda,
-                    max_value=fecha_max_zda,
-                    key="fecha_inicio_zda_global",
-                    format="DD/MM/YYYY",
-                )
-                fecha_fin_zda = st.date_input(
-                    "Fecha fin",
-                    value=fecha_max_zda,
-                    min_value=fecha_min_zda,
-                    max_value=fecha_max_zda,
-                    key="fecha_fin_zda_global",
-                    format="DD/MM/YYYY",
-                )
-                st.caption(
-                    f"Rango mostrado: {fecha_inicio_zda.strftime('%d/%m/%Y')} "
-                    f"→ {fecha_fin_zda.strftime('%d/%m/%Y')}"
-                )
-        else:
-            fecha_inicio_zda = fecha_min_zda
-            fecha_fin_zda = fecha_max_zda
-
-        if fecha_inicio_zda > fecha_fin_zda:
-            st.error("La Fecha inicio no puede ser posterior a la Fecha fin.")
-            zda_rows = zda_rows.iloc[0:0].copy()
-        else:
-            fecha_op_date = pd.to_datetime(
-                zda_rows["_Fecha_Operativa_Filtro"],
-                errors="coerce",
-                utc=True,
-            ).dt.date
-
-            mask_fecha_zda = (
-                (fecha_op_date >= fecha_inicio_zda)
-                & (fecha_op_date <= fecha_fin_zda)
-            )
-            zda_rows = zda_rows[mask_fecha_zda].copy()
+                zda_rows = zda_rows[mask_fecha_zda].copy()
 
     st.caption(
         "Los filtros globales del panel lateral actualizan la gráfica "
@@ -4138,6 +4863,7 @@ def render_classification_section(
     sel_jumbos,
     sel_tipos,
     sel_rocas,
+    sel_operadores,
 ):
     filtrados = df_reportes[
         df_reportes["Jumbo"].astype(str).isin(
@@ -4145,6 +4871,7 @@ def render_classification_section(
         )
         & df_reportes["Tipo_Disparo"].isin(sel_tipos)
         & df_reportes["Tipo_Roca"].isin(sel_rocas)
+        & df_reportes["Operador_Filtro"].isin(sel_operadores)
     ].copy()
 
     st.caption(
@@ -4323,6 +5050,7 @@ def render_classification_section(
         )
         & df_automatico["Tipo_Disparo"].isin(sel_tipos)
         & df_automatico["Tipo_Roca"].isin(sel_rocas)
+        & df_automatico["Operador_Filtro"].isin(sel_operadores)
     ].copy()
 
     cols_auto = [
@@ -4331,6 +5059,7 @@ def render_classification_section(
             "Fecha_Inicio",
             "Jumbo",
             "Ciclo",
+            "Operador_Filtro",
             "Barrenos_Realizados",
             "Tipo_Disparo",
             "Considerado_KPI_Automatizacion",
@@ -4350,6 +5079,7 @@ def render_classification_section(
 
     tabla_auto = tabla_auto.rename(
         columns={
+            "Operador_Filtro": "Operador",
             "Considerado_KPI_Automatizacion": "KPI Auto",
             "Auto_Total_Brazos_min": "Auto total min",
             "Manual_Total_Brazos_min": "Manual total min",
@@ -4779,75 +5509,193 @@ def render_resultados_section(resultados_validos):
                     )
 
 
+# Si ningún operador quedó seleccionado/detectado, no bloquear los gráficos.
+if not global_operadores and "Operador_Filtro" in df_reportes.columns:
+    global_operadores = sorted(
+        df_reportes["Operador_Filtro"]
+        .fillna("SIN DATO")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+
 # ==========================================================
-# PRESENTACIÓN EN BLOQUES VISUALES
+# PRESENTACIÓN POR SECCIONES
 # ==========================================================
 
 st.divider()
 st.header("Consolidado")
+st.markdown(
+    """
+    <div style="
+        padding: 0.65rem 0 0.25rem 0;
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #1f2937;
+    ">
+        Secciones del análisis
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.caption(
+    "Selecciona una sección para mostrar únicamente ese grupo de análisis. "
+    "Se resaltan como accesos principales del app."
+)
 
-with st.container(border=True):
-    render_automation_section(
-        df_automatico,
-        global_jumbos,
-        global_tipos,
-        global_rocas,
-        global_lbl_auto,
-        global_line_auto,
-        global_lbl_arm,
+SECCIONES_ANALISIS = [
+    "Uso Automático",
+    "Perforación",
+    "Tiempos de Ciclo",
+    "Clasificación",
+    "Resultados por archivo",
+]
+
+if "seccion_analisis_principal" not in st.session_state:
+    st.session_state["seccion_analisis_principal"] = SECCIONES_ANALISIS[0]
+
+
+def _cambiar_seccion_analisis(seccion):
+    """
+    Callback de navegación.
+
+    Streamlit ejecuta el callback antes del rerun completo, por lo que
+    la nueva sección ya está guardada cuando se vuelven a dibujar los
+    botones. Así el resaltado cambia con el primer clic.
+    """
+    st.session_state["seccion_analisis_principal"] = seccion
+
+
+st.markdown(
+    """
+    <style>
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
+        min-height: 68px;
+        font-size: 1.02rem;
+        font-weight: 700;
+        border-radius: 14px;
+        border: 1.5px solid #d1d5db;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        white-space: normal;
+        line-height: 1.15;
+        padding: 0.70rem 0.75rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+cols_sec = st.columns(len(SECCIONES_ANALISIS))
+for i, seccion in enumerate(SECCIONES_ANALISIS):
+    activa = st.session_state.get("seccion_analisis_principal") == seccion
+    cols_sec[i].button(
+        seccion,
+        key=f"btn_seccion_{i}",
+        width="stretch",
+        type="primary" if activa else "secondary",
+        help=f"Ir a la sección: {seccion}",
+        on_click=_cambiar_seccion_analisis,
+        args=(seccion,),
     )
 
-with st.container(border=True):
-    render_cut_section(
-        df_resumen,
-        df_reportes,
-        global_jumbos,
-        global_tipos,
-        global_rocas,
-        global_lbl_cut,
-    )
+seccion_activa = st.session_state.get(
+    "seccion_analisis_principal",
+    SECCIONES_ANALISIS[0],
+)
 
-with st.container(border=True):
-    render_zda_section(
-        df_zda,
-        global_jumbos,
-        global_tipos,
-        global_rocas,
-        global_lbl_zda,
-    )
+st.markdown(
+    """
+    <script>
+    const marcarBotonesSeccion = () => {
+      const bloques = window.parent.document.querySelectorAll('button[kind]');
+      bloques.forEach((btn) => {
+        const txt = (btn.innerText || "").trim();
+        if (
+          txt.includes("Uso Automático") ||
+          txt.includes("Perforación") ||
+          txt.includes("Tiempos de Ciclo") ||
+          txt.includes("Clasificación") ||
+          txt.includes("Resultados por archivo")
+        ) {
+          btn.classList.add("seccion-nav");
+        }
+      });
+    };
+    setTimeout(marcarBotonesSeccion, 100);
+    setTimeout(marcarBotonesSeccion, 600);
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
 
-with st.expander(
-    "Clasificación de disparos",
-    expanded=False,
-):
-    render_classification_section(
-        df_reportes,
-        df_automatico,
-        df_atipicos,
-        global_jumbos,
-        global_tipos,
-        global_rocas,
-    )
-
-with st.expander(
-    f"Resultados por archivo · {len(resultados_validos)} archivos procesados",
-    expanded=False,
-):
-    render_resultados_section(
-        resultados_validos,
-    )
-
-if errores:
+if seccion_activa == "Uso Automático":
     with st.container(border=True):
-        st.subheader("Archivos con error")
-        st.dataframe(
-            pd.DataFrame([
-                {
-                    "Archivo": r.get("nombre_archivo"),
-                    "Error": r.get("error"),
-                }
-                for r in errores
-            ]),
-            width="stretch",
-            hide_index=True,
+        render_automation_section(
+            df_automatico,
+            global_jumbos,
+            global_tipos,
+            global_rocas,
+            global_operadores,
+            global_lbl_auto,
+            global_line_auto,
+            global_lbl_arm,
         )
+
+elif seccion_activa == "Perforación":
+    with st.container(border=True):
+        render_cut_section(
+            df_resumen,
+            df_reportes,
+            global_jumbos,
+            global_tipos,
+            global_rocas,
+            global_operadores,
+            global_lbl_cut,
+        )
+
+elif seccion_activa == "Tiempos de Ciclo":
+    with st.container(border=True):
+        render_zda_section(
+            df_zda,
+            global_jumbos,
+            global_tipos,
+            global_rocas,
+            global_operadores,
+            global_lbl_zda,
+        )
+
+elif seccion_activa == "Clasificación":
+    with st.container(border=True):
+        st.subheader("Clasificación")
+        render_classification_section(
+            df_reportes,
+            df_automatico,
+            df_atipicos,
+            global_jumbos,
+            global_tipos,
+            global_rocas,
+            global_operadores,
+        )
+
+elif seccion_activa == "Resultados por archivo":
+    with st.container(border=True):
+        st.subheader("Resultados por archivo")
+        render_resultados_section(
+            resultados_validos,
+        )
+
+        if errores:
+            st.divider()
+            st.subheader("Archivos con error")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Archivo": r.get("nombre_archivo"),
+                        "Error": r.get("error"),
+                    }
+                    for r in errores
+                ]),
+                width="stretch",
+                hide_index=True,
+            )
