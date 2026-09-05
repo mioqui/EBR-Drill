@@ -11,9 +11,11 @@ import shutil
 import uuid
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from plotly.colors import qualitative
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -31,7 +33,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.49-PYTHON-PUNTOS-LINEA-CURVA-SUAVE"
+APP_VERSION_INTERNAL = "V34.81-PYTHON-OPERADORES-ZDA-NORMALIZADOS"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -267,9 +269,11 @@ global_line_auto = False
 global_lbl_arm = False
 global_lbl_cut = False
 global_lbl_zda = False
+sidebar_fecha_container = None
 
 with st.sidebar:
     st.header("Filtros y parámetros")
+    sidebar_fecha_container = st.container()
 
     if not jumbos_detectados:
         st.info(
@@ -730,6 +734,26 @@ def _bd_operador_para_zda(row, op_map):
     return None
 
 
+def _bd_operador_exportado(row, op_map):
+    """
+    Operador para BD-PERFO.
+
+    Prioridad:
+    1) Operador_ZDA leído directamente de round.txt (OP:...)
+    2) Operador normalizado disponible en el registro
+    3) Cruce histórico con PDF por Jumbo/Serie + Ciclo
+    4) Vacío
+    """
+    for campo in ("Operador_ZDA", "Operador"):
+        valor = row.get(campo)
+        if valor is not None and not pd.isna(valor):
+            texto = str(valor).strip()
+            if texto:
+                return texto
+
+    return _bd_operador_para_zda(row, op_map)
+
+
 def _bd_cut_stats(df_detalle, jumbo, ciclo):
     if df_detalle.empty or "Longitud_roca_m" not in df_detalle.columns:
         return None, None
@@ -866,7 +890,7 @@ def construir_bd_perfo(df_reportes, df_detalle):
             "FECHA": datetime(dt.year, dt.month, dt.day) if dt else None,
             "TURNO": _bd_turno(dt),
             "JEFE DE TURNO": None,
-            "OPERADOR": _bd_operador_para_zda(r, op_map),
+            "OPERADOR": _bd_operador_exportado(r, op_map),
             "JUMBO": BD_JUMBO_ALIAS.get(r.get("Jumbo"), r.get("Jumbo")),
             "NIVEL": nivel,
             "BLOCK": block,
@@ -1304,6 +1328,107 @@ def resumen_turnos_zda(rows: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(salida)
 
 
+def resumen_fin_turnos_zda(rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resume la hora de término del último round por jumbo y turno.
+
+    - Ciclos día/noche: cuenta todos los rounds iniciados en cada turno.
+    - Fin prom./más temprano/más tarde: usa únicamente el FIN DEL ÚLTIMO
+      round de cada Jumbo + Fecha operativa + Turno.
+
+    Para el turno noche, la hora se calcula sobre una escala continua
+    19:00 -> 07:00 (por ejemplo, 02:00 = 26.0) y luego se vuelve a mostrar
+    como hora reloj mediante fmt_hora_decimal().
+    """
+    if rows.empty:
+        return pd.DataFrame()
+
+    requeridas = {
+        "Jumbo",
+        "Inicio_Perforacion_TS",
+        "Fin_Perforacion_TS",
+    }
+    if not requeridas.issubset(rows.columns):
+        return pd.DataFrame()
+
+    work = rows[
+        rows["Inicio_Perforacion_TS"].notna()
+        & rows["Fin_Perforacion_TS"].notna()
+        & rows["Jumbo"].notna()
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    # El turno y la fecha operativa se determinan por el INICIO del round.
+    work["_turno"] = work["Inicio_Perforacion_TS"].apply(
+        lambda x: zda_turno(x)[0]
+    )
+    work["_opDate"] = work["Inicio_Perforacion_TS"].apply(
+        zda_operational_date
+    )
+
+    # Hora de fin continua respecto de la fecha operativa.
+    # Esto evita errores al cruzar medianoche en el turno noche.
+    work["_finHour"] = work.apply(
+        lambda r: zda_operational_hour(
+            r["Fin_Perforacion_TS"],
+            r["_opDate"],
+        ),
+        axis=1,
+    )
+
+    # Último round por Jumbo + Fecha operativa + Turno.
+    last_idx = work.groupby(
+        ["Jumbo", "_opDate", "_turno"]
+    )["Fin_Perforacion_TS"].idxmax()
+    last = work.loc[last_idx].copy()
+
+    salida = []
+
+    for jumbo in sorted(work["Jumbo"].dropna().astype(str).unique()):
+        allj = work[work["Jumbo"].astype(str) == jumbo]
+        lastj = last[last["Jumbo"].astype(str) == jumbo]
+
+        day_all = allj[allj["_turno"] == "Día"]
+        night_all = allj[allj["_turno"] == "Noche"]
+
+        day = lastj[lastj["_turno"] == "Día"]
+        night = lastj[lastj["_turno"] == "Noche"]
+
+        salida.append({
+            "Jumbo": jumbo,
+            "Ciclos día": len(day_all),
+            "Fin prom. día": (
+                fmt_hora_decimal(day["_finHour"].mean())
+                if not day.empty else "-"
+            ),
+            "Fin más temprano día": (
+                fmt_hora_decimal(day["_finHour"].min())
+                if not day.empty else "-"
+            ),
+            "Fin más tarde día": (
+                fmt_hora_decimal(day["_finHour"].max())
+                if not day.empty else "-"
+            ),
+            "Ciclos noche": len(night_all),
+            "Fin prom. noche": (
+                fmt_hora_decimal(night["_finHour"].mean())
+                if not night.empty else "-"
+            ),
+            "Fin más temprano noche": (
+                fmt_hora_decimal(night["_finHour"].min())
+                if not night.empty else "-"
+            ),
+            "Fin más tarde noche": (
+                fmt_hora_decimal(night["_finHour"].max())
+                if not night.empty else "-"
+            ),
+        })
+
+    return pd.DataFrame(salida)
+
+
 def resumen_tipos_zda(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return pd.DataFrame()
@@ -1343,7 +1468,17 @@ def grafico_zda_timeline(rows: pd.DataFrame, mostrar_etiquetas: bool):
             fig.add_trace(go.Scatter(
                 x=[x,x], y=[y1,y2], mode="lines+markers", name=jumbo,
                 legendgroup=jumbo, showlegend=jumbo not in legend_done,
-                line=dict(width=12,color=COLORES[idx%len(COLORES)]), marker=dict(size=8), customdata=custom,
+                line=dict(
+                    width=12,
+                    color=COLORES[idx%len(COLORES)],
+                ),
+                marker=dict(
+                    size=[12, 7],
+                    symbol=["diamond", "circle"],
+                    color=COLORES[idx%len(COLORES)],
+                    line=dict(color="#ffffff", width=1.4),
+                ),
+                customdata=custom,
                 hovertemplate=(f"{jumbo} · Ciclo %{{customdata[0]}}<br>Tipo: %{{customdata[6]}}"
                                "<br>Inicio: %{customdata[2]}<br>Fin: %{customdata[3]}<br>Tiempo: %{customdata[4]}"
                                "<br>Barrenos: %{customdata[1]} B<br>Labor: %{customdata[5]}<extra></extra>"),
@@ -1357,20 +1492,1435 @@ def grafico_zda_timeline(rows: pd.DataFrame, mostrar_etiquetas: bool):
                     bordercolor="#dbe3ea", borderpad=3, xanchor="left",
                 ))
 
-    tickvals = [7,9,11,13,15,17,19,21,23,25,27,29,31]
+    # Eje horario cada 1 hora: 07:00 -> 07:00 del día siguiente.
+    tickvals = list(range(7, 32))
     ticktext = [f"{v%24:02d}:00" for v in tickvals]
     op_dates = sorted(rows["_opDate"].unique())
+
+    # Jerarquía visual del eje horario:
+    # - grilla base cada 1 hora (muy tenue)
+    # - línea principal cada 2 horas
+    # - 19:00 se reserva para el cambio de turno
+    major_hour_lines = [
+        dict(
+            type="line",
+            xref="paper",
+            x0=0,
+            x1=1,
+            yref="y",
+            y0=h,
+            y1=h,
+            line=dict(
+                color="#cbd5e1",
+                width=1.15,
+            ),
+            layer="below",
+        )
+        for h in range(7, 32, 2)
+        if h != 19
+    ]
+
     fig.update_layout(**base_layout(
-        520, annotations=annotations, margin=dict(l=80,r=150,t=55,b=72),
+        720, annotations=annotations, margin=dict(l=80,r=150,t=55,b=72),
         xaxis=dict(title="Fecha operativa", tickvals=op_dates,
                    ticktext=[pd.Timestamp(x).strftime("%d/%m") for x in op_dates], gridcolor="#eef2f7"),
-        yaxis=dict(title="Hora", range=[31.2,6.8], tickmode="array", tickvals=tickvals, ticktext=ticktext, gridcolor="#eef2f7"),
+        yaxis=dict(
+            title="Hora",
+            range=[31.2,6.8],
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            gridcolor="#edf2f7",
+            gridwidth=0.55,
+        ),
         shapes=[
-            dict(type="rect",xref="paper",x0=0,x1=1,yref="y",y0=7,y1=19,fillcolor="rgba(37,99,235,.035)",line=dict(width=0),layer="below"),
-            dict(type="rect",xref="paper",x0=0,x1=1,yref="y",y0=19,y1=31,fillcolor="rgba(15,23,42,.035)",line=dict(width=0),layer="below"),
-            dict(type="line",xref="paper",x0=0,x1=1,yref="y",y0=19,y1=19,line=dict(color="#94a3b8",width=1,dash="dot")),
+            dict(
+                type="rect",
+                xref="paper",
+                x0=0,
+                x1=1,
+                yref="y",
+                y0=7,
+                y1=19,
+                fillcolor="rgba(37,99,235,.035)",
+                line=dict(width=0),
+                layer="below",
+            ),
+            dict(
+                type="rect",
+                xref="paper",
+                x0=0,
+                x1=1,
+                yref="y",
+                y0=19,
+                y1=31,
+                fillcolor="rgba(15,23,42,.035)",
+                line=dict(width=0),
+                layer="below",
+            ),
+            *major_hour_lines,
+            dict(
+                type="line",
+                xref="paper",
+                x0=0,
+                x1=1,
+                yref="y",
+                y0=19,
+                y1=19,
+                line=dict(
+                    color="#7c8da6",
+                    width=1.3,
+                    dash="dot",
+                ),
+            ),
         ],
     ))
+    return fig
+
+
+def _turno_inicio_ciclo(ts):
+    d = _utc_dt(ts)
+    h = d.hour + d.minute / 60 + d.second / 3600
+    return "Día" if 7 <= h < 19 else "Noche"
+
+
+def preparar_timeline_ciclos_turno(rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepara ciclos físicos únicos para el timeline por día/turno.
+
+    Identidad del ciclo:
+        Jumbo + número de Ciclo
+
+    Cada fila resultante representa UN round/frente perforado y contiene:
+        - fecha operativa,
+        - turno de inicio,
+        - hora relativa de inicio,
+        - hora relativa de fin,
+        - duración,
+        - jumbo,
+        - número de ciclo.
+
+    No se asigna 1.er/2.º/3.º ciclo. Si existen dos rounds reales del mismo
+    jumbo dentro de un turno, aparecerán naturalmente como dos segmentos.
+    """
+    if rows.empty:
+        return pd.DataFrame()
+
+    requeridas = {
+        "Inicio_Perforacion_TS",
+        "Fin_Perforacion_TS",
+        "Jumbo",
+        "Ciclo",
+    }
+    if not requeridas.issubset(rows.columns):
+        return pd.DataFrame()
+
+    work = rows[
+        rows["Inicio_Perforacion_TS"].notna()
+        & rows["Fin_Perforacion_TS"].notna()
+        & rows["Jumbo"].notna()
+        & rows["Ciclo"].notna()
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    work["_Inicio"] = pd.to_numeric(
+        work["Inicio_Perforacion_TS"],
+        errors="coerce",
+    )
+    work["_Fin"] = pd.to_numeric(
+        work["Fin_Perforacion_TS"],
+        errors="coerce",
+    )
+
+    work = work[
+        work["_Inicio"].notna()
+        & work["_Fin"].notna()
+        & (work["_Fin"] >= work["_Inicio"])
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    work["_Jumbo_Key"] = (
+        work["Jumbo"]
+        .astype(str)
+        .str.strip()
+    )
+    work["_Ciclo_Key"] = (
+        work["Ciclo"]
+        .astype(str)
+        .str.strip()
+    )
+
+    work["_Duracion_s"] = (
+        work["_Fin"] - work["_Inicio"]
+    )
+
+    # Un mismo número de ciclo del mismo jumbo se considera el mismo round.
+    # Si aparece duplicado, conservamos el registro con mayor ventana temporal.
+    work = (
+        work.sort_values(
+            [
+                "_Jumbo_Key",
+                "_Ciclo_Key",
+                "_Duracion_s",
+            ],
+            ascending=[True, True, False],
+        )
+        .drop_duplicates(
+            subset=[
+                "_Jumbo_Key",
+                "_Ciclo_Key",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    salida = []
+
+    for _, r in work.iterrows():
+        start_ts = float(r["_Inicio"])
+        end_ts = float(r["_Fin"])
+
+        op_date = zda_operational_date(start_ts)
+        turno = _turno_inicio_ciclo(start_ts)
+
+        if turno == "Día":
+            shift_start = op_date + timedelta(hours=7)
+        else:
+            shift_start = op_date + timedelta(hours=19)
+
+        shift_start_ts = shift_start.timestamp()
+
+        x_inicio = (
+            start_ts - shift_start_ts
+        ) / 3600.0
+
+        x_fin = (
+            end_ts - shift_start_ts
+        ) / 3600.0
+
+        salida.append({
+            "Fecha_Operativa_DT": op_date,
+            "Fecha_Operativa": op_date.strftime("%d/%m/%Y"),
+            "Turno": turno,
+            "Dia_Turno": (
+                f"{op_date.strftime('%d/%m')} · {turno}"
+            ),
+            "Jumbo": str(r.get("Jumbo") or "-"),
+            "Ciclo": r.get("Ciclo"),
+            "X_Inicio": x_inicio,
+            "X_Fin": x_fin,
+            "Inicio": (
+                r.get("Inicio_Perforacion")
+                or _utc_dt(start_ts).strftime("%d/%m/%Y %H:%M:%S")
+            ),
+            "Fin": (
+                r.get("Fin_Perforacion")
+                or _utc_dt(end_ts).strftime("%d/%m/%Y %H:%M:%S")
+            ),
+            "Duracion": (
+                r.get("Tiempo_Perforacion_hms")
+                or format_duration_hms(end_ts - start_ts)
+            ),
+            "Duracion_h": (
+                end_ts - start_ts
+            ) / 3600.0,
+            "Tipo_Disparo": r.get("Tipo_Disparo") or "-",
+            "Tipo_Roca": r.get("Tipo_Roca") or "SIN DATO",
+            "Labor": r.get("Labor") or "-",
+            "Operador": (
+                r.get("Operador_ZDA")
+                or r.get("Operador")
+                or "-"
+            ),
+            "Barrenos": (
+                r.get("Barrenos_ZDA")
+                if pd.notna(r.get("Barrenos_ZDA"))
+                else r.get("Barrenos_Realizados")
+            ),
+            "Sobrepasa_Turno": bool(x_fin > 12),
+        })
+
+    if not salida:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(salida)
+        .sort_values(
+            [
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+                "X_Inicio",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+def grafico_timeline_ciclos_turno(
+    ciclos: pd.DataFrame,
+    turno: str,
+    solo_puntos_inicio: bool = False,
+    solo_primer_inicio: bool = False,
+):
+    """
+    Timeline horizontal por fecha operativa.
+
+    X:
+        horas transcurridas desde el inicio del turno.
+
+    Y:
+        fecha operativa + turno.
+
+    Dentro de cada fila:
+        JUMB001 se dibuja ligeramente arriba,
+        JUMB002 ligeramente abajo.
+
+    Cada round real es un segmento completo Inicio -> Fin.
+    Si un jumbo ejecuta dos rounds, aparecen dos segmentos consecutivos
+    sobre la misma pista de ese jumbo.
+
+    Por defecto se muestran barras horizontales Inicio -> Fin.
+    Si solo_puntos_inicio=True, las barras se ocultan completamente y
+    se muestran únicamente los puntos de inicio para analizar patrones horarios.
+    Si además solo_primer_inicio=True, se muestra únicamente el primer
+    inicio de cada equipo por cada combinación fecha operativa + turno.
+    """
+    if ciclos.empty:
+        return None
+
+    g = ciclos[
+        ciclos["Turno"].eq(turno)
+    ].copy()
+
+    if g.empty:
+        return None
+
+    # Vista de patrones de arranque:
+    # cuando se pide solo el primer inicio, conservar únicamente
+    # el round que empezó más temprano para cada Jumbo + fecha operativa + turno.
+    if solo_puntos_inicio and solo_primer_inicio:
+        g = (
+            g.sort_values(
+                [
+                    "Fecha_Operativa_DT",
+                    "Jumbo",
+                    "X_Inicio",
+                    "Ciclo",
+                ]
+            )
+            .drop_duplicates(
+                subset=[
+                    "Fecha_Operativa_DT",
+                    "Turno",
+                    "Jumbo",
+                ],
+                keep="first",
+            )
+            .copy()
+        )
+
+    fechas = sorted(
+        g["Fecha_Operativa_DT"].dropna().unique()
+    )
+
+    if not fechas:
+        return None
+
+    y_map = {
+        pd.Timestamp(fecha): i
+        for i, fecha in enumerate(fechas)
+    }
+
+    offsets = {
+        "JUMB001": -0.16,
+        "JUMB002": 0.16,
+    }
+
+    estilos = {
+        "JUMB001": {
+            "line_color": "#64748b",
+            "dash": "solid",
+            "marker_color": "#64748b",
+            "legend_name": "JUMB001",
+        },
+        "JUMB002": {
+            "line_color": "#111827",
+            "dash": "solid",
+            "marker_color": "#111827",
+            "legend_name": "JUMB002",
+        },
+    }
+
+    fig = go.Figure()
+    legend_done = set()
+
+    # Eje X fijo para mantener siempre la misma referencia visual.
+    # 0 = inicio del turno y 12 = fin del turno.
+    x_max = 12.0
+
+    for _, r in g.iterrows():
+        jumbo = str(r["Jumbo"])
+        estilo = estilos.get(
+            jumbo,
+            estilos["JUMB001"],
+        )
+
+        fecha_ts = pd.Timestamp(
+            r["Fecha_Operativa_DT"]
+        )
+        y_base = y_map[fecha_ts]
+        y = y_base + offsets.get(jumbo, 0)
+
+        x1 = float(r["X_Inicio"])
+        x2 = float(r["X_Fin"])
+
+        custom = [[
+            jumbo,
+            r.get("Ciclo"),
+            r.get("Inicio"),
+            r.get("Fin"),
+            r.get("Duracion"),
+            r.get("Tipo_Disparo"),
+            r.get("Tipo_Roca"),
+            r.get("Labor"),
+            r.get("Barrenos"),
+            r.get("Fecha_Operativa"),
+            "Sí" if r.get("Sobrepasa_Turno") else "No",
+            r.get("Operador") or "-",
+        ]] * 2
+
+        if solo_puntos_inicio:
+            # Modo análisis de inicios:
+            # ocultar completamente la barra y mostrar solo el inicio.
+            if jumbo == "JUMB001":
+                # En símbolos "open", Plotly usa marker.color como
+                # color principal del contorno. No debe ser blanco.
+                symbol = "square-open"
+                marker_color = "#64748b"
+                marker_line_color = "#64748b"
+            else:
+                symbol = "square"
+                marker_color = "#111827"
+                marker_line_color = "#111827"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[x1],
+                    y=[y],
+                    mode="markers",
+                    name=estilo["legend_name"],
+                    legendgroup=jumbo,
+                    showlegend=jumbo not in legend_done,
+                    marker=dict(
+                        size=11,
+                        symbol=symbol,
+                        color=marker_color,
+                        line=dict(
+                            color=marker_line_color,
+                            width=1.8,
+                        ),
+                    ),
+                    customdata=[custom[0]],
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b>"
+                        "<br>Ciclo / round: %{customdata[1]}"
+                        "<br>Fecha operativa: %{customdata[9]}"
+                        "<br>Inicio: %{customdata[2]}"
+                        "<br>Fin: %{customdata[3]}"
+                        "<br>Duración: %{customdata[4]}"
+                        "<br>Tipo: %{customdata[5]}"
+                        "<br>Tipo de roca: %{customdata[6]}"
+                        "<br>Labor: %{customdata[7]}"
+                        "<br>Operador: %{customdata[11]}"
+                        "<br>Barrenos: %{customdata[8]}"
+                        "<br>Sobrepasa turno: %{customdata[10]}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+        else:
+            # Modo timeline completo, sincronizado con la vista de puntos:
+            # JUMB001 = barra hueca con contorno cerrado.
+            # JUMB002 = barra negra sólida.
+            hover_barra = (
+                "<b>%{customdata[0]}</b>"
+                "<br>Ciclo / round: %{customdata[1]}"
+                "<br>Fecha operativa: %{customdata[9]}"
+                "<br>Inicio: %{customdata[2]}"
+                "<br>Fin: %{customdata[3]}"
+                "<br>Duración: %{customdata[4]}"
+                "<br>Tipo: %{customdata[5]}"
+                "<br>Tipo de roca: %{customdata[6]}"
+                "<br>Labor: %{customdata[7]}"
+                "<br>Operador: %{customdata[11]}"
+                "<br>Barrenos: %{customdata[8]}"
+                "<br>Sobrepasa turno: %{customdata[10]}"
+                "<extra></extra>"
+            )
+
+            duracion = max(float(x2 - x1), 0.02)
+            ancho_barra = 0.15
+            show_legend_actual = jumbo not in legend_done
+
+            if jumbo == "JUMB001":
+                fig.add_trace(
+                    go.Bar(
+                        x=[duracion],
+                        y=[y],
+                        base=[x1],
+                        orientation="h",
+                        width=ancho_barra,
+                        name=estilo["legend_name"],
+                        legendgroup=jumbo,
+                        showlegend=show_legend_actual,
+                        marker=dict(
+                            color="rgba(255,255,255,0)",
+                            line=dict(
+                                color="#64748b",
+                                width=1.8,
+                            ),
+                        ),
+                        customdata=[custom[0]],
+                        hovertemplate=hover_barra,
+                    )
+                )
+            else:
+                fig.add_trace(
+                    go.Bar(
+                        x=[duracion],
+                        y=[y],
+                        base=[x1],
+                        orientation="h",
+                        width=ancho_barra,
+                        name=estilo["legend_name"],
+                        legendgroup=jumbo,
+                        showlegend=show_legend_actual,
+                        marker=dict(
+                            color="#111827",
+                            line=dict(
+                                color="#111827",
+                                width=0.8,
+                            ),
+                        ),
+                        customdata=[custom[0]],
+                        hovertemplate=hover_barra,
+                    )
+                )
+
+        legend_done.add(jumbo)
+
+    tickvals = list(range(0, 13))
+
+    if turno == "Día":
+        ticktext = [f"{(7 + h) % 24:02d}:00" for h in tickvals]
+        titulo = "Turno Día · 07:00–19:00"
+    else:
+        ticktext = [f"{(19 + h) % 24:02d}:00" for h in tickvals]
+        titulo = "Turno Noche · 19:00–07:00"
+
+    y_tickvals = [y_map[pd.Timestamp(fecha)] for fecha in fechas]
+    y_ticktext = [f"{pd.Timestamp(fecha).strftime('%d/%m')} · {turno}" for fecha in fechas]
+
+    height = max(420, min(980, 150 + len(fechas) * 30))
+
+    fig.update_layout(
+        **base_layout(
+            height,
+            title=dict(text=f"<b>{titulo}</b>", x=0.01, xanchor="left"),
+            margin=dict(l=125, r=30, t=58, b=75),
+            xaxis=dict(
+                title="Hora del turno",
+                range=[0, 12],
+                tickmode="array",
+                tickvals=tickvals,
+                ticktext=ticktext,
+                gridcolor="#e5e7eb",
+                zeroline=False,
+                fixedrange=True,
+            ),
+            yaxis=dict(
+                title="Fecha operativa · turno",
+                tickmode="array",
+                tickvals=y_tickvals,
+                ticktext=y_ticktext,
+                gridcolor="#eef2f7",
+                zeroline=False,
+                fixedrange=True,
+                # Margen extra arriba para que la primera barra no quede recortada.
+                range=[len(fechas) - 0.5, -0.85],
+            ),
+            legend=dict(orientation="h", y=-0.12, x=0),
+            hovermode="closest",
+        )
+    )
+
+    fig.add_vline(
+        x=12,
+        line_width=1.6,
+        line_dash="dash",
+        line_color="#b45309",
+        annotation_text="Fin turno",
+        annotation_position="top",
+    )
+
+    for x_ref in [2, 4, 6, 8, 10]:
+        fig.add_vline(
+            x=x_ref,
+            line_width=0.9,
+            line_dash="dot",
+            line_color="#cbd5e1",
+        )
+
+    return fig
+
+
+
+
+
+def preparar_primeros_inicios_distribucion(ciclos: pd.DataFrame) -> pd.DataFrame:
+    """
+    Conserva únicamente el primer inicio de cada Jumbo + fecha operativa + turno.
+    X_Inicio está en horas relativas desde el inicio del turno (0..12), por lo
+    que el turno noche se maneja correctamente aunque cruce medianoche.
+    """
+    if ciclos.empty:
+        return pd.DataFrame()
+
+    requeridas = {
+        "Fecha_Operativa_DT",
+        "Turno",
+        "Jumbo",
+        "X_Inicio",
+    }
+    if not requeridas.issubset(ciclos.columns):
+        return pd.DataFrame()
+
+    work = ciclos.copy()
+    work["X_Inicio"] = pd.to_numeric(work["X_Inicio"], errors="coerce")
+    work = work[
+        work["Fecha_Operativa_DT"].notna()
+        & work["Turno"].notna()
+        & work["Jumbo"].notna()
+        & work["X_Inicio"].notna()
+        & work["X_Inicio"].between(0, 12, inclusive="both")
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    primeros = (
+        work.sort_values(
+            [
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+                "X_Inicio",
+                "Ciclo",
+            ]
+        )
+        .drop_duplicates(
+            subset=[
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    return primeros.reset_index(drop=True)
+
+
+def _densidad_gaussiana_horas(valores, grid):
+    """
+    KDE gaussiana simple sin scipy.
+    El ancho de banda usa una adaptación de Silverman y se limita para evitar
+    curvas demasiado irregulares cuando existen pocos ciclos.
+    """
+    vals = np.asarray(valores, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    grid = np.asarray(grid, dtype=float)
+
+    if vals.size == 0:
+        return np.zeros_like(grid, dtype=float)
+
+    if vals.size == 1:
+        bandwidth = 0.40
+    else:
+        std = float(np.std(vals, ddof=1))
+        q75, q25 = np.percentile(vals, [75, 25])
+        iqr_sigma = float((q75 - q25) / 1.349) if q75 > q25 else std
+        escala = min(std, iqr_sigma) if std > 0 and iqr_sigma > 0 else max(std, iqr_sigma)
+        if not np.isfinite(escala) or escala <= 0:
+            escala = 0.50
+        bandwidth = 0.9 * escala * (vals.size ** (-1 / 5))
+        bandwidth = float(np.clip(bandwidth, 0.25, 0.85))
+
+    z = (grid[:, None] - vals[None, :]) / bandwidth
+    densidad = np.exp(-0.5 * z * z).sum(axis=1)
+    densidad /= vals.size * bandwidth * np.sqrt(2 * np.pi)
+    return densidad
+
+
+def grafico_distribucion_primeros_inicios(
+    primeros: pd.DataFrame,
+    turno: str,
+):
+    """
+    Histograma de primeros inicios + curva de densidad para un turno.
+
+    Histograma: frecuencia en intervalos de 30 min.
+    Curva: KDE gaussiana en eje Y secundario.
+    Incluye Promedio, Mediana y Pico aproximado de la densidad.
+    """
+    if primeros.empty:
+        return None
+
+    g = primeros[primeros["Turno"].eq(turno)].copy()
+    if g.empty:
+        return None
+
+    valores = pd.to_numeric(g["X_Inicio"], errors="coerce").dropna().to_numpy(dtype=float)
+    valores = valores[(valores >= 0) & (valores <= 12)]
+    if len(valores) == 0:
+        return None
+
+    # Intervalos de 30 minutos.
+    edges = np.arange(0, 12.0001 + 0.5, 0.5)
+    counts, _ = np.histogram(valores, bins=edges)
+    centers = (edges[:-1] + edges[1:]) / 2
+
+    # Curva de densidad suave.
+    grid = np.linspace(0, 12, 241)
+    densidad = _densidad_gaussiana_horas(valores, grid)
+
+    promedio = float(np.mean(valores))
+    mediana = float(np.median(valores))
+    pico = float(grid[int(np.argmax(densidad))]) if len(densidad) else mediana
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=centers,
+            y=counts,
+            width=0.46,
+            name="Frecuencia · 30 min",
+            marker=dict(
+                color="rgba(100,116,139,0.42)",
+                line=dict(color="#64748b", width=0.8),
+            ),
+            customdata=[
+                [
+                    _hora_relativa_turno_a_texto(max(0, c - 0.25), turno),
+                    _hora_relativa_turno_a_texto(min(12, c + 0.25), turno),
+                    int(n),
+                ]
+                for c, n in zip(centers, counts)
+            ],
+            hovertemplate=(
+                "<b>Primeros inicios</b>"
+                "<br>Rango: %{customdata[0]}–%{customdata[1]}"
+                "<br>Cantidad: %{customdata[2]}"
+                "<extra></extra>"
+            ),
+        ),
+        secondary_y=False,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=grid,
+            y=densidad,
+            mode="lines",
+            name="Densidad suavizada",
+            line=dict(color="#0f766e", width=3),
+            hovertemplate=(
+                "<b>Densidad</b>"
+                "<br>Hora: %{customdata}"
+                "<br>Densidad: %{y:.3f}"
+                "<extra></extra>"
+            ),
+            customdata=[_hora_relativa_turno_a_texto(v, turno) for v in grid],
+        ),
+        secondary_y=True,
+    )
+
+    # Promedio y mediana.
+    fig.add_vline(
+        x=promedio,
+        line_width=1.6,
+        line_dash="dash",
+        line_color="#111827",
+        annotation_text=f"Promedio {_hora_relativa_turno_a_texto(promedio, turno)}",
+        annotation_position="top right",
+    )
+    fig.add_vline(
+        x=mediana,
+        line_width=1.8,
+        line_dash="dot",
+        line_color="#2563eb",
+        annotation_text=f"Mediana {_hora_relativa_turno_a_texto(mediana, turno)}",
+        annotation_position="top left",
+    )
+
+    # Pico aproximado de la densidad.
+    fig.add_vline(
+        x=pico,
+        line_width=1.1,
+        line_dash="dot",
+        line_color="#0f766e",
+        opacity=0.65,
+    )
+
+    tickvals = list(range(0, 13))
+    if turno == "Día":
+        ticktext = [f"{(7 + h) % 24:02d}:00" for h in tickvals]
+        titulo = "Turno Día · Distribución de primeros inicios"
+    else:
+        ticktext = [f"{(19 + h) % 24:02d}:00" for h in tickvals]
+        titulo = "Turno Noche · Distribución de primeros inicios"
+
+    equipos = int(g["Jumbo"].nunique())
+    observaciones = int(len(g))
+
+    fig.update_layout(
+        **base_layout(
+            480,
+            title=dict(
+                text=f"<b>{titulo}</b>",
+                x=0.01,
+                xanchor="left",
+            ),
+            margin=dict(l=70, r=70, t=80, b=70),
+            xaxis=dict(
+                title="Hora del primer inicio",
+                range=[0, 12],
+                tickmode="array",
+                tickvals=tickvals,
+                ticktext=ticktext,
+                fixedrange=True,
+                gridcolor="#e5e7eb",
+                zeroline=False,
+            ),
+            legend=dict(
+                orientation="h",
+                y=-0.18,
+                x=0,
+            ),
+            hovermode="closest",
+        )
+    )
+
+    fig.update_yaxes(
+        title_text="Cantidad de primeros inicios",
+        rangemode="tozero",
+        fixedrange=True,
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="Densidad",
+        rangemode="tozero",
+        fixedrange=True,
+        showgrid=False,
+        secondary_y=True,
+    )
+
+    # Nota compacta dentro del gráfico.
+    fig.add_annotation(
+        x=0.995,
+        y=1.11,
+        xref="paper",
+        yref="paper",
+        xanchor="right",
+        yanchor="top",
+        showarrow=False,
+        align="right",
+        text=(
+            f"Pico aprox.: <b>{_hora_relativa_turno_a_texto(pico, turno)}</b> · "
+            f"{observaciones} inicios · {equipos} equipo(s)"
+        ),
+        font=dict(size=11, color="#475569"),
+    )
+
+    return fig
+
+
+def preparar_tendencia_inicio_diario(ciclos: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye un valor diario consolidado de primer inicio por turno.
+
+    1) Para cada Fecha operativa + Turno + Jumbo conserva únicamente
+       el primer inicio del equipo.
+    2) Para cada Fecha operativa + Turno calcula:
+       - Promedio de los primeros inicios de los equipos disponibles.
+       - Mediana de los primeros inicios de los equipos disponibles.
+
+    X_Inicio está expresado como horas transcurridas desde el inicio
+    del turno, por lo que el cálculo del turno noche es continuo y no
+    se distorsiona al cruzar medianoche.
+    """
+    if ciclos.empty:
+        return pd.DataFrame()
+
+    requeridas = {
+        "Fecha_Operativa_DT",
+        "Turno",
+        "Jumbo",
+        "X_Inicio",
+    }
+    if not requeridas.issubset(ciclos.columns):
+        return pd.DataFrame()
+
+    work = ciclos.copy()
+    work["X_Inicio"] = pd.to_numeric(
+        work["X_Inicio"],
+        errors="coerce",
+    )
+    work = work[
+        work["Fecha_Operativa_DT"].notna()
+        & work["Turno"].notna()
+        & work["Jumbo"].notna()
+        & work["X_Inicio"].notna()
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    # Primer inicio real de cada equipo en cada fecha-turno.
+    primeros = (
+        work.sort_values(
+            [
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+                "X_Inicio",
+                "Ciclo",
+            ]
+        )
+        .drop_duplicates(
+            subset=[
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    resumen = (
+        primeros.groupby(
+            ["Fecha_Operativa_DT", "Turno"],
+            as_index=False,
+        )
+        .agg(
+            Promedio_h=("X_Inicio", "mean"),
+            Mediana_h=("X_Inicio", "median"),
+            Equipos=("Jumbo", "nunique"),
+        )
+        .sort_values(["Turno", "Fecha_Operativa_DT"])
+        .reset_index(drop=True)
+    )
+
+    return resumen
+
+
+def _hora_relativa_turno_a_texto(valor_h, turno: str) -> str:
+    """Convierte hora relativa del turno a HH:MM."""
+    if valor_h is None or pd.isna(valor_h):
+        return "-"
+
+    minutos = int(round(float(valor_h) * 60))
+    inicio_h = 7 if turno == "Día" else 19
+    total_min = (inicio_h * 60 + minutos) % (24 * 60)
+    hh = total_min // 60
+    mm = total_min % 60
+    return f"{hh:02d}:{mm:02d}"
+
+
+def grafico_tendencia_inicio_diario(
+    resumen: pd.DataFrame,
+    turno: str,
+    mostrar_promedio: bool = True,
+    mostrar_mediana: bool = True,
+):
+    """
+    Curva diaria de la hora consolidada del primer inicio.
+
+    Eje X: fecha operativa.
+    Eje Y: hora dentro del turno (0 a 12 h desde el inicio).
+    """
+    if resumen.empty:
+        return None
+
+    g = resumen[
+        resumen["Turno"].eq(turno)
+    ].copy()
+
+    if g.empty or (not mostrar_promedio and not mostrar_mediana):
+        return None
+
+    g = g.sort_values("Fecha_Operativa_DT")
+
+    fig = go.Figure()
+
+    fechas_txt = [
+        pd.Timestamp(x).strftime("%d/%m/%Y")
+        for x in g["Fecha_Operativa_DT"]
+    ]
+
+    if mostrar_promedio:
+        horas_prom = [
+            _hora_relativa_turno_a_texto(v, turno)
+            for v in g["Promedio_h"]
+        ]
+        custom_prom = list(
+            zip(
+                fechas_txt,
+                horas_prom,
+                g["Equipos"].astype(int).tolist(),
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=g["Fecha_Operativa_DT"],
+                y=g["Promedio_h"],
+                mode="lines+markers",
+                name="Promedio",
+                line=dict(
+                    color="#111827",
+                    width=2.4,
+                    dash="solid",
+                ),
+                marker=dict(
+                    size=7,
+                    symbol="circle",
+                    color="#111827",
+                ),
+                customdata=custom_prom,
+                hovertemplate=(
+                    "<b>Promedio</b>"
+                    "<br>Fecha: %{customdata[0]}"
+                    "<br>Hora: %{customdata[1]}"
+                    "<br>Equipos considerados: %{customdata[2]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    if mostrar_mediana:
+        horas_med = [
+            _hora_relativa_turno_a_texto(v, turno)
+            for v in g["Mediana_h"]
+        ]
+        custom_med = list(
+            zip(
+                fechas_txt,
+                horas_med,
+                g["Equipos"].astype(int).tolist(),
+            )
+        )
+
+        # La mediana se dibuja después del promedio y con línea punteada.
+        # Con 2 equipos ambos valores coinciden; el patrón punteado permite
+        # reconocer que ambas series están superpuestas.
+        fig.add_trace(
+            go.Scatter(
+                x=g["Fecha_Operativa_DT"],
+                y=g["Mediana_h"],
+                mode="lines+markers",
+                name="Mediana",
+                line=dict(
+                    color="#64748b",
+                    width=2.4,
+                    dash="dash",
+                ),
+                marker=dict(
+                    size=8,
+                    symbol="square-open",
+                    color="#64748b",
+                    line=dict(
+                        color="#64748b",
+                        width=1.5,
+                    ),
+                ),
+                customdata=custom_med,
+                hovertemplate=(
+                    "<b>Mediana</b>"
+                    "<br>Fecha: %{customdata[0]}"
+                    "<br>Hora: %{customdata[1]}"
+                    "<br>Equipos considerados: %{customdata[2]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    tickvals_y = list(range(0, 13))
+    if turno == "Día":
+        ticktext_y = [
+            f"{(7 + h) % 24:02d}:00"
+            for h in tickvals_y
+        ]
+        titulo = "Turno Día · Tendencia del primer inicio consolidado"
+    else:
+        ticktext_y = [
+            f"{(19 + h) % 24:02d}:00"
+            for h in tickvals_y
+        ]
+        titulo = "Turno Noche · Tendencia del primer inicio consolidado"
+
+    fechas = g["Fecha_Operativa_DT"].tolist()
+    tickvals_x = fechas[::2] if len(fechas) > 12 else fechas
+    ticktext_x = [
+        pd.Timestamp(x).strftime("%d/%m")
+        for x in tickvals_x
+    ]
+
+    fig.update_layout(
+        **base_layout(
+            460,
+            title=dict(
+                text=f"<b>{titulo}</b>",
+                x=0.01,
+                xanchor="left",
+            ),
+            margin=dict(l=90, r=30, t=60, b=80),
+            xaxis=dict(
+                title="Fecha operativa",
+                tickmode="array",
+                tickvals=tickvals_x,
+                ticktext=ticktext_x,
+                tickangle=-35,
+                gridcolor="#eef2f7",
+                fixedrange=True,
+            ),
+            yaxis=dict(
+                title="Hora de primer inicio",
+                range=[0, 12],
+                tickmode="array",
+                tickvals=tickvals_y,
+                ticktext=ticktext_y,
+                gridcolor="#e5e7eb",
+                zeroline=False,
+                fixedrange=True,
+            ),
+            legend=dict(
+                orientation="h",
+                y=1.09,
+                x=0.70,
+                xanchor="left",
+            ),
+            hovermode="x unified",
+        )
+    )
+
+    # Guías cada 2 horas para mantener consistencia con el timeline.
+    for y_ref in [2, 4, 6, 8, 10]:
+        fig.add_hline(
+            y=y_ref,
+            line_width=0.8,
+            line_dash="dot",
+            line_color="#cbd5e1",
+            layer="below",
+        )
+
+    return fig
+
+
+def preparar_tendencia_ultimo_fin_diario(ciclos: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye un valor diario consolidado de la hora de término del último
+    ciclo/round por turno.
+
+    1) Para cada Fecha operativa + Turno + Jumbo conserva el ciclo cuyo
+       X_Fin sea más tardío dentro de ese turno. Si un equipo realizó dos
+       o más rounds, se toma el Fin del último round ejecutado.
+    2) Para cada Fecha operativa + Turno calcula:
+       - Promedio de las últimas horas de término de los equipos disponibles.
+       - Mediana de las últimas horas de término de los equipos disponibles.
+
+    X_Fin está expresado como horas transcurridas desde el inicio del turno,
+    por lo que el cálculo del turno noche permanece continuo al cruzar
+    medianoche.
+    """
+    if ciclos.empty:
+        return pd.DataFrame()
+
+    requeridas = {
+        "Fecha_Operativa_DT",
+        "Turno",
+        "Jumbo",
+        "X_Fin",
+    }
+    if not requeridas.issubset(ciclos.columns):
+        return pd.DataFrame()
+
+    work = ciclos.copy()
+    work["X_Fin"] = pd.to_numeric(
+        work["X_Fin"],
+        errors="coerce",
+    )
+    work = work[
+        work["Fecha_Operativa_DT"].notna()
+        & work["Turno"].notna()
+        & work["Jumbo"].notna()
+        & work["X_Fin"].notna()
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    # Último término real de cada equipo en cada fecha-turno.
+    ultimos = (
+        work.sort_values(
+            [
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+                "X_Fin",
+                "Ciclo",
+            ],
+            ascending=[True, True, True, False, False],
+        )
+        .drop_duplicates(
+            subset=[
+                "Fecha_Operativa_DT",
+                "Turno",
+                "Jumbo",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    resumen = (
+        ultimos.groupby(
+            ["Fecha_Operativa_DT", "Turno"],
+            as_index=False,
+        )
+        .agg(
+            Promedio_h=("X_Fin", "mean"),
+            Mediana_h=("X_Fin", "median"),
+            Equipos=("Jumbo", "nunique"),
+        )
+        .sort_values(["Turno", "Fecha_Operativa_DT"])
+        .reset_index(drop=True)
+    )
+
+    return resumen
+
+
+def grafico_tendencia_ultimo_fin_diario(
+    resumen: pd.DataFrame,
+    turno: str,
+    mostrar_promedio: bool = True,
+    mostrar_mediana: bool = True,
+):
+    """
+    Curva diaria de la hora consolidada de término del último ciclo.
+
+    Eje X: fecha operativa.
+    Eje Y: hora dentro del turno medida desde el inicio del turno.
+    """
+    if resumen.empty:
+        return None
+
+    g = resumen[
+        resumen["Turno"].eq(turno)
+    ].copy()
+
+    if g.empty or (not mostrar_promedio and not mostrar_mediana):
+        return None
+
+    g = g.sort_values("Fecha_Operativa_DT")
+
+    fig = go.Figure()
+
+    fechas_txt = [
+        pd.Timestamp(x).strftime("%d/%m/%Y")
+        for x in g["Fecha_Operativa_DT"]
+    ]
+
+    if mostrar_promedio:
+        horas_prom = [
+            _hora_relativa_turno_a_texto(v, turno)
+            for v in g["Promedio_h"]
+        ]
+        custom_prom = list(
+            zip(
+                fechas_txt,
+                horas_prom,
+                g["Equipos"].astype(int).tolist(),
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=g["Fecha_Operativa_DT"],
+                y=g["Promedio_h"],
+                mode="lines+markers",
+                name="Promedio",
+                line=dict(
+                    color="#111827",
+                    width=2.4,
+                    dash="solid",
+                ),
+                marker=dict(
+                    size=7,
+                    symbol="circle",
+                    color="#111827",
+                ),
+                customdata=custom_prom,
+                hovertemplate=(
+                    "<b>Promedio</b>"
+                    "<br>Fecha: %{customdata[0]}"
+                    "<br>Último término: %{customdata[1]}"
+                    "<br>Equipos considerados: %{customdata[2]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    if mostrar_mediana:
+        horas_med = [
+            _hora_relativa_turno_a_texto(v, turno)
+            for v in g["Mediana_h"]
+        ]
+        custom_med = list(
+            zip(
+                fechas_txt,
+                horas_med,
+                g["Equipos"].astype(int).tolist(),
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=g["Fecha_Operativa_DT"],
+                y=g["Mediana_h"],
+                mode="lines+markers",
+                name="Mediana",
+                line=dict(
+                    color="#64748b",
+                    width=2.4,
+                    dash="dash",
+                ),
+                marker=dict(
+                    size=8,
+                    symbol="square-open",
+                    color="#64748b",
+                    line=dict(
+                        color="#64748b",
+                        width=1.5,
+                    ),
+                ),
+                customdata=custom_med,
+                hovertemplate=(
+                    "<b>Mediana</b>"
+                    "<br>Fecha: %{customdata[0]}"
+                    "<br>Último término: %{customdata[1]}"
+                    "<br>Equipos considerados: %{customdata[2]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    # Mantener referencia del turno completo, pero permitir visualizar
+    # ciclos que terminen ligeramente después de las 12 horas.
+    max_val = pd.to_numeric(
+        g[["Promedio_h", "Mediana_h"]].stack(),
+        errors="coerce",
+    ).max()
+    y_max = max(12.0, float(max_val) if pd.notna(max_val) else 12.0)
+    y_max = min(max(12.0, y_max + 0.25), 16.0)
+
+    tickvals_y = list(range(0, int(y_max) + 1))
+    if turno == "Día":
+        ticktext_y = [
+            f"{(7 + h) % 24:02d}:00"
+            for h in tickvals_y
+        ]
+        titulo = "Turno Día · Tendencia del término del último ciclo"
+    else:
+        ticktext_y = [
+            f"{(19 + h) % 24:02d}:00"
+            for h in tickvals_y
+        ]
+        titulo = "Turno Noche · Tendencia del término del último ciclo"
+
+    fechas = g["Fecha_Operativa_DT"].tolist()
+    tickvals_x = fechas[::2] if len(fechas) > 12 else fechas
+    ticktext_x = [
+        pd.Timestamp(x).strftime("%d/%m")
+        for x in tickvals_x
+    ]
+
+    fig.update_layout(
+        **base_layout(
+            460,
+            title=dict(
+                text=f"<b>{titulo}</b>",
+                x=0.01,
+                xanchor="left",
+            ),
+            margin=dict(l=90, r=30, t=60, b=80),
+            xaxis=dict(
+                title="Fecha operativa",
+                tickmode="array",
+                tickvals=tickvals_x,
+                ticktext=ticktext_x,
+                tickangle=-35,
+                gridcolor="#eef2f7",
+                fixedrange=True,
+            ),
+            yaxis=dict(
+                title="Hora de término del último ciclo",
+                range=[0, y_max],
+                tickmode="array",
+                tickvals=tickvals_y,
+                ticktext=ticktext_y,
+                gridcolor="#e5e7eb",
+                zeroline=False,
+                fixedrange=True,
+            ),
+            legend=dict(
+                orientation="h",
+                y=1.09,
+                x=0.70,
+                xanchor="left",
+            ),
+            hovermode="x unified",
+        )
+    )
+
+    # Línea de referencia del fin nominal del turno.
+    fig.add_hline(
+        y=12,
+        line_width=1.4,
+        line_dash="dash",
+        line_color="#b45309",
+        annotation_text="Fin turno",
+        annotation_position="top right",
+    )
+
+    for y_ref in [2, 4, 6, 8, 10]:
+        fig.add_hline(
+            y=y_ref,
+            line_width=0.8,
+            line_dash="dot",
+            line_color="#cbd5e1",
+            layer="below",
+        )
+
     return fig
 
 
@@ -1481,13 +3031,13 @@ with col_process:
     procesar = st.button(
         "Procesar lote",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not seleccion,
     )
 with col_clear:
     st.button(
         "Limpiar",
-        use_container_width=True,
+        width="stretch",
         on_click=limpiar_analisis,
     )
 
@@ -1563,7 +3113,7 @@ if not resultados_validos:
                 }
                 for r in errores
             ]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -1616,6 +3166,321 @@ st.download_button(
 )
 
 
+
+def preparar_barrenos_por_brazo(
+    df_detalle: pd.DataFrame,
+    df_reportes: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Cuenta los barrenos realizados por Brazo 1 y Brazo 2 en cada ciclo.
+
+    Si para un mismo Jumbo+Ciclo existen registros PDF y ZDA, se prioriza
+    ZDA para evitar duplicar el mismo round.
+    El conteo incluye todos los tipos de barreno disponibles en el detalle.
+    """
+    if df_detalle.empty:
+        return pd.DataFrame()
+
+    requeridas = {"Jumbo", "Ciclo", "Boom"}
+    if not requeridas.issubset(df_detalle.columns):
+        return pd.DataFrame()
+
+    det = df_detalle.copy()
+    det["Boom"] = pd.to_numeric(det["Boom"], errors="coerce")
+    det = det[det["Boom"].isin([1, 2])].copy()
+    if det.empty:
+        return pd.DataFrame()
+
+    # Clave de ciclo. Fecha ayuda a evitar colisiones si un número de ciclo
+    # se reutilizara en fechas diferentes.
+    keys = ["Jumbo", "Ciclo"]
+    if "Fecha_Inicio" in det.columns:
+        keys.append("Fecha_Inicio")
+
+    # Priorizar ZDA sobre PDF si el mismo ciclo está presente en ambos.
+    if "Fuente" in det.columns:
+        det["_fuente_norm"] = det["Fuente"].fillna("").astype(str).str.upper()
+        zda_keys = set(
+            map(
+                tuple,
+                det.loc[det["_fuente_norm"].eq("ZDA"), keys]
+                .astype(str)
+                .to_numpy(),
+            )
+        )
+
+        if zda_keys:
+            tuples = list(map(tuple, det[keys].astype(str).to_numpy()))
+            keep = [
+                (t not in zda_keys) or (fuente == "ZDA")
+                for t, fuente in zip(tuples, det["_fuente_norm"])
+            ]
+            det = det.loc[keep].copy()
+
+    counts = (
+        det.groupby(keys + ["Boom"], dropna=False)
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+
+    if 1 not in counts.columns:
+        counts[1] = 0
+    if 2 not in counts.columns:
+        counts[2] = 0
+
+    counts = counts.rename(
+        columns={
+            1: "Barrenos_B1",
+            2: "Barrenos_B2",
+        }
+    )
+    counts["Barrenos_B1"] = pd.to_numeric(
+        counts["Barrenos_B1"], errors="coerce"
+    ).fillna(0).astype(int)
+    counts["Barrenos_B2"] = pd.to_numeric(
+        counts["Barrenos_B2"], errors="coerce"
+    ).fillna(0).astype(int)
+    counts["Total_Barrenos_Brazos"] = (
+        counts["Barrenos_B1"] + counts["Barrenos_B2"]
+    )
+
+    # Participación porcentual por brazo dentro de cada ciclo.
+    total_seguro = counts["Total_Barrenos_Brazos"].replace(0, pd.NA)
+    counts["Pct_B1"] = (
+        counts["Barrenos_B1"] / total_seguro * 100
+    ).fillna(0.0)
+    counts["Pct_B2"] = (
+        counts["Barrenos_B2"] / total_seguro * 100
+    ).fillna(0.0)
+
+    # Añadir metadatos del ciclo para filtros y tooltip.
+    if not df_reportes.empty:
+        meta_cols = [
+            c
+            for c in [
+                "Jumbo",
+                "Ciclo",
+                "Fecha_Inicio",
+                "Hora_Inicio",
+                "Tipo_Disparo",
+                "Tipo_Roca",
+                "Fuente",
+            ]
+            if c in df_reportes.columns
+        ]
+        meta = df_reportes[meta_cols].copy()
+
+        # Prioridad ZDA en el metadata si hay PDF y ZDA del mismo ciclo.
+        if "Fuente" in meta.columns:
+            meta["_prioridad"] = (
+                meta["Fuente"]
+                .fillna("")
+                .astype(str)
+                .str.upper()
+                .eq("ZDA")
+                .astype(int)
+            )
+            meta = meta.sort_values("_prioridad", ascending=False)
+
+        merge_keys = [
+            c
+            for c in ["Jumbo", "Ciclo", "Fecha_Inicio"]
+            if c in counts.columns and c in meta.columns
+        ]
+        if not merge_keys:
+            merge_keys = [
+                c
+                for c in ["Jumbo", "Ciclo"]
+                if c in counts.columns and c in meta.columns
+            ]
+
+        meta = meta.drop_duplicates(subset=merge_keys, keep="first")
+        meta = meta.drop(
+            columns=["_prioridad"],
+            errors="ignore",
+        )
+
+        # Evita duplicar columnas que ya vienen desde el detalle.
+        add_cols = merge_keys + [
+            c
+            for c in [
+                "Hora_Inicio",
+                "Tipo_Disparo",
+                "Tipo_Roca",
+                "Fuente",
+            ]
+            if c in meta.columns and c not in merge_keys
+        ]
+        counts = counts.merge(
+            meta[add_cols],
+            on=merge_keys,
+            how="left",
+        )
+
+    if "Tipo_Disparo" not in counts.columns:
+        counts["Tipo_Disparo"] = "SIN CLASIFICAR"
+    if "Tipo_Roca" not in counts.columns:
+        counts["Tipo_Roca"] = "SIN DATO"
+
+    return counts
+
+
+def grafico_b1_participacion_unico(
+    df_brazos: pd.DataFrame,
+):
+    """
+    Gráfico único por ciclo con la participación del Brazo 1.
+
+    - Eje Y: % de participación de B1 respecto al total B1+B2.
+    - Si el valor es > 50%, B1 realizó más barrenos que B2.
+    - Si el valor es < 50%, B2 realizó más barrenos que B1.
+    - Una línea horizontal en 50% sirve como referencia visual.
+    """
+    if df_brazos.empty:
+        return None
+
+    g = df_brazos.copy()
+    g = asegurar_fechahora(g)
+    if g.empty:
+        return None
+
+    g["Ciclo_Label"] = g["Ciclo"].apply(
+        lambda v: (
+            f"C{int(v)}"
+            if pd.notna(v)
+            and str(v).replace(".", "", 1).isdigit()
+            else f"C{v}"
+        )
+    )
+
+    # Texto corto del estado de balance.
+    def _dominancia(row):
+        if float(row.get("Pct_B1", 0)) > 50:
+            return "B1 > B2"
+        if float(row.get("Pct_B1", 0)) < 50:
+            return "B2 > B1"
+        return "Balanceado"
+
+    g["Dominancia_B1"] = g.apply(_dominancia, axis=1)
+
+    # Orden cronológico y etiqueta compacta para un gráfico único.
+    g = g.reset_index(drop=True)
+    g["Orden_Ciclo"] = range(1, len(g) + 1)
+    g["X_Label"] = g.apply(
+        lambda r: f"{str(r['Jumbo'])[-3:]}·{r['Ciclo_Label']}",
+        axis=1,
+    )
+
+    fig = go.Figure()
+    colores = {
+        "JUMB001": "#4f6df5",
+        "JUMB002": "#f05a3b",
+    }
+
+    for jumbo in sorted(g["Jumbo"].dropna().astype(str).unique()):
+        gj = g[g["Jumbo"].astype(str).eq(str(jumbo))].copy()
+        if gj.empty:
+            continue
+
+        custom = gj[
+            [
+                "Jumbo",
+                "Ciclo",
+                "Barrenos_B1",
+                "Barrenos_B2",
+                "Total_Barrenos_Brazos",
+                "Pct_B1",
+                "Pct_B2",
+                "Tipo_Roca",
+                "Tipo_Disparo",
+                "Fecha_Inicio",
+                "Dominancia_B1",
+            ]
+        ].astype(object).to_numpy()
+
+        fig.add_trace(
+            go.Scatter(
+                name=jumbo,
+                x=gj["X_Label"],
+                y=gj["Pct_B1"],
+                mode="lines+markers",
+                customdata=custom,
+                line=dict(
+                    width=2.5,
+                    shape="spline",
+                    smoothing=0.80,
+                    color=colores.get(jumbo),
+                ),
+                marker=dict(size=8, color=colores.get(jumbo)),
+                hovertemplate=(
+                    "<b>%{customdata[0]} · Ciclo %{customdata[1]}</b><br>"
+                    "Participación B1: %{customdata[5]:.1f}%<br>"
+                    "Participación B2: %{customdata[6]:.1f}%<br>"
+                    "Lectura visual: %{customdata[10]}<br>"
+                    "Brazo 1: %{customdata[2]} barrenos<br>"
+                    "Brazo 2: %{customdata[3]} barrenos<br>"
+                    "Total: %{customdata[4]} barrenos<br>"
+                    "Tipo de roca: %{customdata[7]}<br>"
+                    "Tipo de disparo: %{customdata[8]}<br>"
+                    "Fecha: %{customdata[9]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        **base_layout(
+            480,
+            margin=dict(l=72, r=30, t=70, b=95),
+            xaxis=dict(
+                title="Ciclo / round",
+                type="category",
+                categoryorder="array",
+                categoryarray=g["X_Label"].tolist(),
+                tickangle=-45,
+                gridcolor="#eef2f7",
+            ),
+            yaxis=dict(
+                title="Participación del Brazo 1 (%)",
+                range=[0, 100],
+                tickmode="array",
+                tickvals=[0, 20, 40, 50, 60, 80, 100],
+                ticktext=["0%", "20%", "40%", "50%", "60%", "80%", "100%"],
+                gridcolor="#eef2f7",
+            ),
+            shapes=[
+                dict(
+                    type="line",
+                    xref="paper",
+                    x0=0,
+                    x1=1,
+                    yref="y",
+                    y0=50,
+                    y1=50,
+                    line=dict(
+                        color="#475569",
+                        width=2.0,
+                        dash="dot",
+                    ),
+                    layer="above",
+                ),
+            ],
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+        )
+    )
+
+    return fig
+
+
+
+
 # ==========================================================
 # BLOQUE 1 - AUTOMATIZACIÓN
 # ==========================================================
@@ -1653,7 +3518,7 @@ def render_automation_section(
     if fig_auto is not None:
         st.plotly_chart(
             fig_auto,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False},
         )
     else:
@@ -1689,7 +3554,7 @@ def render_automation_section(
             hubo_grafico = True
             st.plotly_chart(
                 fig_arm,
-                use_container_width=True,
+                width="stretch",
                 config={"displaylogo": False},
             )
 
@@ -1740,7 +3605,7 @@ def render_cut_section(
     if fig_cut is not None:
         st.plotly_chart(
             fig_cut,
-            use_container_width=True,
+            width="stretch",
             config={"displaylogo": False},
         )
     else:
@@ -1785,8 +3650,7 @@ def render_zda_section(
         return
 
     st.caption(
-        "Eje X: fecha operativa (07:00–07:00). Eje Y: hora. "
-        "Cada barra va desde el primer registro MWD hasta el último. "
+        "Análisis de las ventanas reales de perforación por fecha operativa y turno. "
         "Turno día: 07:00–19:00 · Turno noche: 19:00–07:00."
     )
 
@@ -1804,6 +3668,73 @@ def render_zda_section(
         & zda_all["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
+    # ------------------------------------------------------
+    # FILTRO GLOBAL DE FECHAS APLICADO DESDE EL PANEL LATERAL.
+    # ------------------------------------------------------
+    fecha_inicio_zda = None
+    fecha_fin_zda = None
+
+    if not zda_rows.empty:
+        zda_rows["_Fecha_Operativa_Filtro"] = (
+            zda_rows["Inicio_Perforacion_TS"]
+            .apply(zda_operational_date)
+        )
+
+        fechas_zda_disponibles = pd.to_datetime(
+            zda_rows["_Fecha_Operativa_Filtro"],
+            errors="coerce",
+            utc=True,
+        ).dropna()
+
+        fecha_min_zda = fechas_zda_disponibles.min().date()
+        fecha_max_zda = fechas_zda_disponibles.max().date()
+
+        if sidebar_fecha_container is not None:
+            with sidebar_fecha_container:
+                st.markdown("##### Rango de fechas")
+                st.caption(
+                    "Aplica a los gráficos y resúmenes de tiempos de ciclo."
+                )
+                fecha_inicio_zda = st.date_input(
+                    "Fecha inicio",
+                    value=fecha_min_zda,
+                    min_value=fecha_min_zda,
+                    max_value=fecha_max_zda,
+                    key="fecha_inicio_zda_global",
+                    format="DD/MM/YYYY",
+                )
+                fecha_fin_zda = st.date_input(
+                    "Fecha fin",
+                    value=fecha_max_zda,
+                    min_value=fecha_min_zda,
+                    max_value=fecha_max_zda,
+                    key="fecha_fin_zda_global",
+                    format="DD/MM/YYYY",
+                )
+                st.caption(
+                    f"Rango mostrado: {fecha_inicio_zda.strftime('%d/%m/%Y')} "
+                    f"→ {fecha_fin_zda.strftime('%d/%m/%Y')}"
+                )
+        else:
+            fecha_inicio_zda = fecha_min_zda
+            fecha_fin_zda = fecha_max_zda
+
+        if fecha_inicio_zda > fecha_fin_zda:
+            st.error("La Fecha inicio no puede ser posterior a la Fecha fin.")
+            zda_rows = zda_rows.iloc[0:0].copy()
+        else:
+            fecha_op_date = pd.to_datetime(
+                zda_rows["_Fecha_Operativa_Filtro"],
+                errors="coerce",
+                utc=True,
+            ).dt.date
+
+            mask_fecha_zda = (
+                (fecha_op_date >= fecha_inicio_zda)
+                & (fecha_op_date <= fecha_fin_zda)
+            )
+            zda_rows = zda_rows[mask_fecha_zda].copy()
+
     st.caption(
         "Los filtros globales del panel lateral actualizan la gráfica "
         "y los resúmenes de esta sección."
@@ -1818,7 +3749,7 @@ def render_zda_section(
     if not shift.empty:
         st.dataframe(
             shift,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         st.caption(
@@ -1832,6 +3763,29 @@ def render_zda_section(
             "No hay ciclos visibles para calcular los indicadores de inicio."
         )
 
+    st.markdown("#### Hora promedio de fin por jumbo y turno")
+
+    shift_fin = resumen_fin_turnos_zda(
+        zda_rows
+    )
+
+    if not shift_fin.empty:
+        st.dataframe(
+            shift_fin,
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "“Ciclos día/noche” cuenta todos los rounds iniciados en el turno. "
+            "Para promedio, fin más temprano y fin más tarde se considera "
+            "únicamente el término del último round de cada jumbo por "
+            "fecha operativa y turno."
+        )
+    else:
+        st.info(
+            "No hay ciclos visibles para calcular los indicadores de fin."
+        )
+
     with st.expander(
         "Tipo de disparo",
         expanded=False,
@@ -1843,7 +3797,7 @@ def render_zda_section(
         if not type_summary.empty:
             st.dataframe(
                 type_summary,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -1857,25 +3811,319 @@ def render_zda_section(
             "Reaming y Casing no se consideran para la clasificación."
         )
 
-    st.markdown(
-        "#### Gráfica de tiempos x fecha operativa"
+
+    ciclos_turno = preparar_timeline_ciclos_turno(
+        zda_rows
     )
 
-    fig_zda = grafico_zda_timeline(
-        zda_rows,
-        mostrar_zda,
-    )
-
-    if fig_zda is not None:
-        st.plotly_chart(
-            fig_zda,
-            use_container_width=True,
-            config={"displaylogo": False},
+    if ciclos_turno.empty:
+        st.markdown(
+            "#### Piloto · Timeline de ciclos por día y turno"
+        )
+        st.info(
+            "No hay ciclos suficientes para construir el timeline por turno."
         )
     else:
-        st.info(
-            "No hay ciclos visibles con los filtros globales seleccionados."
+        st.markdown(
+            "#### Piloto · Timeline de ciclos por día y turno"
         )
+        st.caption(
+            "Cada segmento representa un ciclo/round físico completo desde "
+            "Inicio hasta Fin. JUMB001 se representa como contorno cerrado y "
+            "JUMB002 como sólido, manteniendo la misma codificación en barras "
+            "y puntos. El filtro de fechas de la cabecera aplica a ambos turnos."
+        )
+
+        ciclos_turno_filtrado = ciclos_turno.copy()
+
+        solo_puntos_inicio_timeline = st.checkbox(
+            "Mostrar solo puntos de inicio",
+            value=False,
+            key="solo_puntos_inicio_timeline",
+            help=(
+                "Oculta las barras completas y muestra únicamente la hora "
+                "de inicio de cada ciclo para facilitar la identificación "
+                "de patrones de arranque."
+            ),
+        )
+
+        solo_primer_inicio_timeline = st.checkbox(
+            "Mostrar solo el primer inicio por equipo y turno",
+            value=False,
+            key="solo_primer_inicio_timeline",
+            disabled=not solo_puntos_inicio_timeline,
+            help=(
+                "Disponible cuando se activa la vista de puntos. "
+                "Si un jumbo tiene dos o más ciclos en el mismo turno, "
+                "solo se muestra el primer inicio y se ocultan los demás."
+            ),
+        )
+
+        # Orden de lectura fijo: primero Turno Día y luego Turno Noche.
+        fig_turno_dia = grafico_timeline_ciclos_turno(
+            ciclos_turno_filtrado,
+            "Día",
+            solo_puntos_inicio=solo_puntos_inicio_timeline,
+            solo_primer_inicio=solo_primer_inicio_timeline,
+        )
+
+        if fig_turno_dia is not None:
+            st.plotly_chart(
+                fig_turno_dia,
+                width="stretch",
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": False,
+                },
+            )
+        else:
+            st.info(
+                "No hay ciclos visibles en el Turno Día."
+            )
+
+        fig_turno_noche = grafico_timeline_ciclos_turno(
+            ciclos_turno_filtrado,
+            "Noche",
+            solo_puntos_inicio=solo_puntos_inicio_timeline,
+            solo_primer_inicio=solo_primer_inicio_timeline,
+        )
+
+        if fig_turno_noche is not None:
+            st.plotly_chart(
+                fig_turno_noche,
+                width="stretch",
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": False,
+                },
+            )
+        else:
+            st.info(
+                "No hay ciclos visibles en el Turno Noche."
+            )
+
+        # ------------------------------------------------------
+        # DISTRIBUCIÓN DE PRIMEROS INICIOS
+        # ------------------------------------------------------
+        st.markdown(
+            "#### Distribución de primeros inicios"
+        )
+        st.caption(
+            "El histograma agrupa el primer inicio de cada jumbo por fecha y turno "
+            "en intervalos de 30 minutos. La curva suavizada permite identificar "
+            "visualmente las horas de mayor concentración."
+        )
+
+        primeros_distribucion = preparar_primeros_inicios_distribucion(
+            ciclos_turno_filtrado
+        )
+
+        if primeros_distribucion.empty:
+            st.info(
+                "No hay información suficiente para construir la distribución "
+                "de primeros inicios."
+            )
+        else:
+            fig_dist_dia = grafico_distribucion_primeros_inicios(
+                primeros_distribucion,
+                "Día",
+            )
+            if fig_dist_dia is not None:
+                st.plotly_chart(
+                    fig_dist_dia,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+            fig_dist_noche = grafico_distribucion_primeros_inicios(
+                primeros_distribucion,
+                "Noche",
+            )
+            if fig_dist_noche is not None:
+                st.plotly_chart(
+                    fig_dist_noche,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+        # ------------------------------------------------------
+        # TENDENCIA DIARIA DEL PRIMER INICIO CONSOLIDADO
+        # ------------------------------------------------------
+        st.markdown(
+            "#### Tendencia diaria de la hora de primer inicio"
+        )
+        st.caption(
+            "Para cada fecha y turno se toma únicamente el primer inicio "
+            "de cada jumbo disponible. Luego se calcula el promedio y la "
+            "mediana entre los equipos. Con 2 equipos ambos valores son "
+            "iguales; con 3 o más pueden diferenciarse."
+        )
+
+        ctrl_prom, ctrl_med, _ = st.columns([1.0, 1.0, 3.2])
+        with ctrl_prom:
+            mostrar_promedio_inicio = st.checkbox(
+                "Mostrar promedio",
+                value=True,
+                key="mostrar_promedio_inicio_diario",
+            )
+        with ctrl_med:
+            mostrar_mediana_inicio = st.checkbox(
+                "Mostrar mediana",
+                value=True,
+                key="mostrar_mediana_inicio_diario",
+            )
+
+        resumen_inicio_diario = preparar_tendencia_inicio_diario(
+            ciclos_turno_filtrado
+        )
+
+        if not mostrar_promedio_inicio and not mostrar_mediana_inicio:
+            st.info(
+                "Activa Promedio y/o Mediana para mostrar la tendencia."
+            )
+        elif resumen_inicio_diario.empty:
+            st.info(
+                "No hay información suficiente para calcular la tendencia diaria."
+            )
+        else:
+            fig_inicio_dia = grafico_tendencia_inicio_diario(
+                resumen_inicio_diario,
+                "Día",
+                mostrar_promedio=mostrar_promedio_inicio,
+                mostrar_mediana=mostrar_mediana_inicio,
+            )
+            if fig_inicio_dia is not None:
+                st.plotly_chart(
+                    fig_inicio_dia,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+            fig_inicio_noche = grafico_tendencia_inicio_diario(
+                resumen_inicio_diario,
+                "Noche",
+                mostrar_promedio=mostrar_promedio_inicio,
+                mostrar_mediana=mostrar_mediana_inicio,
+            )
+            if fig_inicio_noche is not None:
+                st.plotly_chart(
+                    fig_inicio_noche,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+        # ------------------------------------------------------
+        # TENDENCIA DIARIA DEL TÉRMINO DEL ÚLTIMO CICLO
+        # ------------------------------------------------------
+        st.markdown(
+            "#### Tendencia diaria de la hora de término del último ciclo"
+        )
+        st.caption(
+            "Para cada fecha y turno se toma el Fin más tardío de cada jumbo. "
+            "Si un equipo realizó dos o más rounds, se considera el término "
+            "del último round. Luego se calcula el promedio y la mediana "
+            "entre los equipos disponibles."
+        )
+
+        ctrl_prom_fin, ctrl_med_fin, _ = st.columns([1.0, 1.0, 3.2])
+        with ctrl_prom_fin:
+            mostrar_promedio_fin = st.checkbox(
+                "Mostrar promedio",
+                value=True,
+                key="mostrar_promedio_ultimo_fin_diario",
+            )
+        with ctrl_med_fin:
+            mostrar_mediana_fin = st.checkbox(
+                "Mostrar mediana",
+                value=True,
+                key="mostrar_mediana_ultimo_fin_diario",
+            )
+
+        resumen_ultimo_fin_diario = preparar_tendencia_ultimo_fin_diario(
+            ciclos_turno_filtrado
+        )
+
+        if not mostrar_promedio_fin and not mostrar_mediana_fin:
+            st.info(
+                "Activa Promedio y/o Mediana para mostrar la tendencia."
+            )
+        elif resumen_ultimo_fin_diario.empty:
+            st.info(
+                "No hay información suficiente para calcular el término "
+                "diario del último ciclo."
+            )
+        else:
+            fig_fin_dia = grafico_tendencia_ultimo_fin_diario(
+                resumen_ultimo_fin_diario,
+                "Día",
+                mostrar_promedio=mostrar_promedio_fin,
+                mostrar_mediana=mostrar_mediana_fin,
+            )
+            if fig_fin_dia is not None:
+                st.plotly_chart(
+                    fig_fin_dia,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+            fig_fin_noche = grafico_tendencia_ultimo_fin_diario(
+                resumen_ultimo_fin_diario,
+                "Noche",
+                mostrar_promedio=mostrar_promedio_fin,
+                mostrar_mediana=mostrar_mediana_fin,
+            )
+            if fig_fin_noche is not None:
+                st.plotly_chart(
+                    fig_fin_noche,
+                    width="stretch",
+                    config={
+                        "displaylogo": False,
+                        "scrollZoom": False,
+                    },
+                )
+
+        with st.expander(
+            "Detalle de ciclos mostrados en el timeline",
+            expanded=False,
+        ):
+            detalle_timeline = ciclos_turno_filtrado[
+                [
+                    "Fecha_Operativa",
+                    "Turno",
+                    "Jumbo",
+                    "Ciclo",
+                    "Inicio",
+                    "Fin",
+                    "Duracion",
+                    "Tipo_Disparo",
+                    "Tipo_Roca",
+                    "Labor",
+                    "Operador",
+                    "Barrenos",
+                    "Sobrepasa_Turno",
+                ]
+            ].copy()
+
+            st.dataframe(
+                detalle_timeline,
+                width="stretch",
+                hide_index=True,
+            )
 
 
 # ==========================================================
@@ -1934,7 +4182,7 @@ def render_classification_section(
 
             st.dataframe(
                 resumen_clase,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2125,7 +4373,7 @@ def render_classification_section(
 
     st.dataframe(
         tabla_auto,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=360,
     )
@@ -2196,7 +4444,7 @@ def render_resultados_section(resultados_validos):
             "← Anterior",
             key="resultados_prev",
             disabled=page <= 1,
-            use_container_width=True,
+            width="stretch",
         ):
             page = max(1, page - 1)
             st.session_state[page_key] = page
@@ -2206,7 +4454,7 @@ def render_resultados_section(resultados_validos):
             "Siguiente →",
             key="resultados_next",
             disabled=page >= n_pages,
-            use_container_width=True,
+            width="stretch",
         ):
             page = min(n_pages, page + 1)
             st.session_state[page_key] = page
@@ -2250,36 +4498,47 @@ def render_resultados_section(resultados_validos):
             col_info, col_nav = st.columns([4.7, 1.3])
 
             with col_info:
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 
                 m1.metric(
                     "Serie",
                     rep.get("Numero_Serie") or "-",
                 )
                 m2.metric(
+                    "Operador",
+                    rep.get("Operador_ZDA")
+                    or rep.get("Operador")
+                    or rep.get("Operario")
+                    or "-",
+                    help=(
+                        rep.get("Fuente_Operador")
+                        or ("PDF · campo Operario" if rep.get("Operario") else None)
+                    ),
+                )
+                m3.metric(
                     "Sección",
                     seccion_desde_plan_texto(
                         rep.get("Plan_Perforacion")
                     ),
                 )
-                m3.metric(
+                m4.metric(
                     "Tipo de roca",
                     rep.get("Tipo_Roca")
                     or tipo_roca_desde_plan_texto(
                         rep.get("Plan_Perforacion")
                     ),
                 )
-                m4.metric(
+                m5.metric(
                     "Tipo de disparo",
                     rep.get("Tipo_Disparo") or "-",
                 )
-                m5.metric(
+                m6.metric(
                     "Barrenos",
                     int(rep["Barrenos_Realizados"])
                     if pd.notna(rep.get("Barrenos_Realizados"))
                     else "-",
                 )
-                m6.metric(
+                m7.metric(
                     "Metros perforados",
                     fmt(
                         rep.get("Metros_Perforados"),
@@ -2332,6 +4591,26 @@ def render_resultados_section(resultados_validos):
                     ),
                 )
 
+                # Conteo individual por brazo para este ciclo.
+                detalle_round = r.get("detalle")
+                b1_count = b2_count = 0
+                if (
+                    isinstance(detalle_round, pd.DataFrame)
+                    and not detalle_round.empty
+                    and "Boom" in detalle_round.columns
+                ):
+                    boom_round = pd.to_numeric(
+                        detalle_round["Boom"],
+                        errors="coerce",
+                    )
+                    b1_count = int(boom_round.eq(1).sum())
+                    b2_count = int(boom_round.eq(2).sum())
+
+                b1m, b2m, btm = st.columns(3)
+                b1m.metric("Barrenos Brazo 1", b1_count)
+                b2m.metric("Barrenos Brazo 2", b2_count)
+                btm.metric("Total por brazos", b1_count + b2_count)
+
                 if fuente == "ZDA":
                     z1, z2, z3 = st.columns(3)
                     z1.metric(
@@ -2369,12 +4648,12 @@ def render_resultados_section(resultados_validos):
                         )
                     else:
                         st.caption("Plano de navegación del PDF")
-                    st.image(str(nav_path), use_container_width=True)
+                    st.image(str(nav_path), width="stretch")
                 elif not mostrar_detalle:
                     st.caption("Plano disponible bajo demanda")
 
             if box_path:
-                st.image(str(box_path), use_container_width=True)
+                st.image(str(box_path), width="stretch")
                 with open(box_path, "rb") as fh:
                     png_bytes = fh.read()
                 st.download_button(
@@ -2411,7 +4690,7 @@ def render_resultados_section(resultados_validos):
                     ]
                     st.dataframe(
                         val[cols],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=220,
                     )
@@ -2439,7 +4718,7 @@ def render_resultados_section(resultados_validos):
                     ]
                     st.dataframe(
                         vm[cols],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=220,
                     )
@@ -2464,7 +4743,7 @@ def render_resultados_section(resultados_validos):
                 ]
                 st.dataframe(
                     extras[cols],
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     height=180,
                 )
@@ -2494,7 +4773,7 @@ def render_resultados_section(resultados_validos):
                     ]
                     st.dataframe(
                         mwd[cols],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=260,
                     )
@@ -2569,6 +4848,6 @@ if errores:
                 }
                 for r in errores
             ]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )

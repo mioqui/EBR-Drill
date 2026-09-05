@@ -6,6 +6,7 @@ import math
 import re
 import struct
 import zipfile
+import unicodedata
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
@@ -20,7 +21,7 @@ ORDEN_TIPOS = ["Bottom", "Easer", "Cut", "Contour", "Reaming", "Casing"]
 JUMBOS = {"125D114796": "JUMB001", "125D98943": "JUMB002"}
 NUM = r"-?\d+(?:\.\d+)?"
 
-VERSION_PROCESADOR = "V34.44-Python-MASIVO-DISK-BACKED"
+VERSION_PROCESADOR = "V34.46-Python-MASIVO-OPERADORES-ZDA-NORMALIZADOS"
 
 
 def limpiar_texto(texto) -> str:
@@ -1135,6 +1136,82 @@ def _zda_kv(texto: str) -> Dict[str, str]:
     return out
 
 
+CATALOGO_OPERADORES_ZDA = {
+    "RIVERA": "Josue Rivera",
+    "CELIS": "Nilton Celis",
+    "CASAS": "Abraham Casas",
+    "SOLIS": "Roy Solis",
+    "OSORIO": "John Osorio",
+    "CUCHULA": "Rogelio Cuchula",
+}
+
+
+def _zda_texto_normalizado(valor: Optional[str]) -> str:
+    texto = str(valor or "").strip()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        c for c in texto
+        if not unicodedata.combining(c)
+    )
+    return re.sub(r"\s+", " ", texto).strip().upper()
+
+
+def _zda_normalizar_operador(valor: Optional[str]) -> Optional[str]:
+    """
+    Normaliza un nombre/apellido contra el catálogo conocido.
+    Si OP: trae un valor nuevo, conserva el texto detectado.
+    """
+    texto = str(valor or "").strip().strip(",;:-")
+    if not texto:
+        return None
+
+    norm = _zda_texto_normalizado(texto)
+
+    for apellido, nombre_completo in CATALOGO_OPERADORES_ZDA.items():
+        if re.search(rf"\b{re.escape(apellido)}\b", norm):
+            return nombre_completo
+
+    return " ".join(
+        palabra.capitalize()
+        for palabra in re.split(r"\s+", texto)
+        if palabra
+    ) or None
+
+
+def _zda_operador_desde_tunnel_id(tunnel_id: Optional[str]) -> Optional[str]:
+    """
+    Extrae el operador desde tunnel_id / ID Auxiliar de round.txt.
+
+    Prioridad:
+      1) Campo explícito OP:...
+      2) Apellido conocido en cualquier parte del texto
+
+    Ejemplos:
+      GL:898 NV:4055 OP:RIVERA T:N -> Josue Rivera
+      nv 4055 Gl. 7939w Celis     -> Nilton Celis
+    """
+    texto = str(tunnel_id or "").strip()
+    if not texto:
+        return None
+
+    m = re.search(
+        r"(?:^|\s)OP\s*:\s*(.+?)(?=\s+(?:T|TURN|NV|VN|GL|RMR|B|BLOCK)\s*:|$)",
+        texto,
+        re.IGNORECASE,
+    )
+    if m:
+        operador = _zda_normalizar_operador(m.group(1))
+        if operador:
+            return operador
+
+    norm = _zda_texto_normalizado(texto)
+    for apellido, nombre_completo in CATALOGO_OPERADORES_ZDA.items():
+        if re.search(rf"\b{re.escape(apellido)}\b", norm):
+            return nombre_completo
+
+    return None
+
+
 def _zda_parse_ts(valor: Optional[str]) -> Optional[int]:
     if not valor:
         return None
@@ -1802,6 +1879,9 @@ def procesar_zda(
             raise ValueError("El round.txt no contiene rig/round; formato ZDA no reconocido.")
 
         serie = _zda_base_serie(kv.get("rig"))
+        operador_zda = _zda_operador_desde_tunnel_id(
+            kv.get("tunnel_id")
+        )
         nav_ts = _zda_parse_ts(kv.get("navigation"))
         decl_start = _zda_parse_ts(kv.get("start"))
         decl_end = _zda_parse_ts(kv.get("end"))
@@ -1811,6 +1891,13 @@ def procesar_zda(
             "Ciclo": int(kv["round"]), "Fecha_Inicio": _zda_fmt_date(cycle_start),
             "Hora_Inicio": _zda_fmt_time(cycle_start), "Numero_Serie": serie,
             "Jumbo": identificar_jumbo(serie), "Plan_Perforacion": kv.get("drill_plan") or None,
+            "Operador_ZDA": operador_zda,
+            "Operador": operador_zda,
+            "Operador_ZDA_Raw": kv.get("tunnel_id") or None,
+            "Fuente_Operador": (
+                "ZDA round.txt · tunnel_id / ID Auxiliar"
+                if operador_zda else None
+            ),
         }
 
         boom_name = next((n for n in names if re.search(r"-boom\.dat$", n, re.I)), None)
@@ -1857,6 +1944,13 @@ def procesar_zda(
             "Estado": "OK" if boom_count_ok else "REVISAR", "Estado_Conteo": "OK" if boom_count_ok else "REVISAR",
             "Estado_Metros_Tipos": "OK", "Lectura_Confiable": "OK" if lectura_ok else "REVISAR",
             "Rig_ZDA": kv.get("rig"), "Labor": kv.get("tunnel_id") or None,
+            "Operador_ZDA": operador_zda,
+            "Operador": operador_zda,
+            "Operador_ZDA_Raw": kv.get("tunnel_id") or None,
+            "Fuente_Operador": (
+                "ZDA round.txt · tunnel_id / ID Auxiliar"
+                if operador_zda else None
+            ),
             "Tabla_Curvas": kv.get("curve_table") or None, "PEG": float(kv["peg"]) if kv.get("peg") not in (None,"") else None,
             "Navegacion_ZDA": kv.get("navigation") or None, "Inicio_Declarado_ZDA": kv.get("start") or None,
             "Fin_Declarado_ZDA": kv.get("end") or None, "Inicio_Perforacion": _zda_fmt_datetime(actual_start),
