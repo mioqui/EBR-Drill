@@ -33,7 +33,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V34.95-PYTHON-AUTO-OPERADOR-ETIQUETAS-SIN-SOLAPE-FIX"
+APP_VERSION_INTERNAL = "V34.96-PYTHON-CUCHULA-NEGRO"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -1186,7 +1186,21 @@ def grafico_auto_por_operador(
         "JUMB002": "square",
     }
 
+    # Paleta fija para facilitar el seguimiento visual de cada operador.
+    # Cuchula se muestra en negro para diferenciarlo claramente de Osorio.
+    color_map_operador = {
+        "John Osorio": "#4F67F2",
+        "Josue Rivera": "#F05A3A",
+        "Nilton Celis": "#16C48A",
+        "Rogelio Cuchula": "#111111",
+    }
+
     for idx, operador in enumerate(operadores):
+        color_operador = color_map_operador.get(
+            str(operador),
+            COLORES[idx % len(COLORES)],
+        )
+
         g = df[
             df["Operador_Filtro"].astype(str).eq(str(operador))
         ].sort_values("FechaHora").copy()
@@ -1266,7 +1280,7 @@ def grafico_auto_por_operador(
                 line=(
                     dict(
                         width=2.8,
-                        color=COLORES[idx % len(COLORES)],
+                        color=color_operador,
                         shape="spline",
                         smoothing=1.0,
                     )
@@ -1276,7 +1290,7 @@ def grafico_auto_por_operador(
                 marker=dict(
                     size=9,
                     symbol=symbols,
-                    color=COLORES[idx % len(COLORES)],
+                    color=color_operador,
                     line=dict(
                         color="#ffffff",
                         width=1.1,
@@ -1316,7 +1330,7 @@ def grafico_auto_por_operador(
             "x": ultimo["FechaHora"],
             "y": float(ultimo["Pct_Movimiento_Automatico_Brazos"]),
             "texto": operador.split()[-1],
-            "color": COLORES[idx % len(COLORES)],
+            "color": color_operador,
         })
 
     # ------------------------------------------------------
