@@ -9,6 +9,8 @@ import re
 import gc
 import shutil
 import uuid
+import zipfile
+import struct
 
 import pandas as pd
 import numpy as np
@@ -33,7 +35,7 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V35.01-PYTHON-CLUSTER-RESUMEN-DIA-NOCHE"
+APP_VERSION_INTERNAL = "V35.03-PYTHON-ROP-NUMERO-BARRENOS"
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -44,7 +46,7 @@ st.title("EBR Drill Analytics")
 st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de reportes de perforación de equipos Jumbo Sandvik")
 st.info(
     "Consolida y analiza información de perforación de reportes PDF y ZDA, mostrando automatización por jumbo y brazo, "
-    "longitud perforada en barrenos Cut, tiempos de ciclo, clasificación de disparos y exportación de datos a Excel."
+    "longitud perforada en barrenos Cut, tasa de penetración ROP, tiempos de ciclo, clasificación de disparos y exportación de datos a Excel."
 )
 
 st.markdown(
@@ -6087,6 +6089,786 @@ def render_classification_section(
 # ==========================================================
 
 @fragment
+
+def _extraer_rop_mwd_desde_zda(
+    source_path: Path,
+    archivo_interno: str,
+) -> pd.DataFrame:
+    """
+    Extrae la progresión del barreno y la tasa de penetración ROP
+    registrada en el archivo MWD interno del ZDA.
+
+    Layout MWD usado por los ZDA DD322i analizados:
+      timestamp  -> bytes 0..7 del registro
+      posición   -> float32 en offset +8
+      ROP        -> float32 en offset +44
+
+    Cada registro ocupa 122 bytes y el encabezado del archivo 131 bytes.
+    """
+    cols = [
+        "Timestamp",
+        "Profundidad_m",
+        "ROP_m_min",
+    ]
+
+    if (
+        source_path is None
+        or not source_path.exists()
+        or not archivo_interno
+        or source_path.suffix.lower() != ".zda"
+    ):
+        return pd.DataFrame(columns=cols)
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as zf:
+            if archivo_interno not in zf.namelist():
+                return pd.DataFrame(columns=cols)
+
+            data = zf.read(archivo_interno)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+    if len(data) < 131 + 122:
+        return pd.DataFrame(columns=cols)
+
+    filas = []
+    nrec = (len(data) - 131) // 122
+
+    for i in range(nrec):
+        off = 131 + i * 122
+        if off + 122 > len(data):
+            break
+
+        try:
+            lo, hi = struct.unpack_from("<II", data, off)
+            ts = lo + hi * 4294967296
+            profundidad = struct.unpack_from("<f", data, off + 8)[0]
+            rop = struct.unpack_from("<f", data, off + 44)[0]
+        except Exception:
+            continue
+
+        if not (
+            1577836800 < ts < 2051222400
+            and np.isfinite(profundidad)
+            and np.isfinite(rop)
+            and 0 <= profundidad < 30
+            and 0 <= rop < 20
+        ):
+            continue
+
+        filas.append(
+            {
+                "Timestamp": pd.to_datetime(
+                    ts,
+                    unit="s",
+                    utc=True,
+                    errors="coerce",
+                ),
+                "Profundidad_m": float(profundidad),
+                "ROP_m_min": float(rop),
+            }
+        )
+
+    df = pd.DataFrame(filas, columns=cols)
+    if df.empty:
+        return df
+
+    df = (
+        df.dropna(
+            subset=[
+                "Profundidad_m",
+                "ROP_m_min",
+            ]
+        )
+        .sort_values(
+            [
+                "Profundidad_m",
+                "Timestamp",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    # El MWD puede registrar más de una muestra en la misma progresión.
+    # Consolidar por profundidad evita líneas verticales artificiales.
+    df = (
+        df.groupby(
+            "Profundidad_m",
+            as_index=False,
+        )
+        .agg(
+            Timestamp=("Timestamp", "min"),
+            ROP_m_min=("ROP_m_min", "median"),
+        )
+        .sort_values("Profundidad_m")
+        .reset_index(drop=True)
+    )
+
+    # Suavizado visual robusto. El valor original continúa disponible
+    # en el tooltip; no se reemplaza el dato fuente.
+    df["ROP_suave_m_min"] = (
+        df["ROP_m_min"]
+        .rolling(
+            window=5,
+            center=True,
+            min_periods=1,
+        )
+        .median()
+    )
+
+    return df
+
+
+def _catalogo_rop_resultados(
+    resultados_validos,
+    df_reportes: pd.DataFrame,
+    sel_jumbos,
+    sel_tipos,
+    sel_rocas,
+    sel_operadores,
+):
+    """
+    Construye catálogo de ciclos ZDA visibles para la viñeta ROP.
+    Respeta filtros globales y rango de fechas.
+    """
+    if not resultados_validos:
+        return []
+
+    permitidos = None
+
+    if (
+        isinstance(df_reportes, pd.DataFrame)
+        and not df_reportes.empty
+    ):
+        rep = df_reportes.copy()
+
+        if "Fuente" in rep.columns:
+            rep = rep[
+                rep["Fuente"]
+                .fillna("")
+                .astype(str)
+                .str.upper()
+                .eq("ZDA")
+            ].copy()
+
+        if "Jumbo" in rep.columns:
+            rep = rep[
+                rep["Jumbo"]
+                .astype(str)
+                .isin([str(x) for x in sel_jumbos])
+            ]
+
+        if "Tipo_Disparo" in rep.columns:
+            rep = rep[
+                rep["Tipo_Disparo"].isin(sel_tipos)
+            ]
+
+        if "Tipo_Roca" in rep.columns:
+            rep = rep[
+                rep["Tipo_Roca"].isin(sel_rocas)
+            ]
+
+        if "Operador_Filtro" in rep.columns:
+            rep = rep[
+                rep["Operador_Filtro"].isin(sel_operadores)
+            ]
+
+        rep = aplicar_filtro_fechas_global(rep)
+
+        if {
+            "Jumbo",
+            "Ciclo",
+        }.issubset(rep.columns):
+            permitidos = set(
+                zip(
+                    rep["Jumbo"].astype(str),
+                    rep["Ciclo"].astype(str),
+                )
+            )
+
+    catalogo = []
+
+    for idx, r in enumerate(resultados_validos):
+        rep = r.get("resumen_reporte") or {}
+        meta = r.get("metadata") or {}
+
+        fuente = str(
+            rep.get("Fuente")
+            or meta.get("Fuente")
+            or r.get("fuente")
+            or ""
+        ).upper()
+
+        if fuente != "ZDA":
+            continue
+
+        mwd = r.get("mwd_barrenos")
+        if (
+            not isinstance(mwd, pd.DataFrame)
+            or mwd.empty
+            or "Archivo_Interno" not in mwd.columns
+        ):
+            continue
+
+        jumbo = str(
+            rep.get("Jumbo")
+            or meta.get("Jumbo")
+            or ""
+        )
+        ciclo = str(
+            rep.get("Ciclo")
+            or meta.get("Ciclo")
+            or ""
+        )
+
+        if (
+            permitidos is not None
+            and (jumbo, ciclo) not in permitidos
+        ):
+            continue
+
+        fecha = (
+            rep.get("Fecha_Inicio")
+            or meta.get("Fecha_Inicio")
+            or "-"
+        )
+        operador = (
+            rep.get("Operador_Filtro")
+            or meta.get("Operador")
+            or meta.get("Operador_ZDA")
+            or "SIN DATO"
+        )
+
+        # Total de barrenos del ciclo.
+        # Prioridad: Barrenos_Realizados -> Barrenos_ZDA -> cantidad MWD.
+        barrenos_ciclo = pd.to_numeric(
+            pd.Series([
+                rep.get("Barrenos_Realizados")
+                if rep.get("Barrenos_Realizados") is not None
+                else rep.get("Barrenos_ZDA")
+            ]),
+            errors="coerce",
+        ).iloc[0]
+
+        if pd.isna(barrenos_ciclo):
+            barrenos_ciclo = pd.to_numeric(
+                pd.Series([
+                    meta.get("Barrenos_Realizados")
+                    if meta.get("Barrenos_Realizados") is not None
+                    else meta.get("Barrenos_ZDA")
+                ]),
+                errors="coerce",
+            ).iloc[0]
+
+        if pd.isna(barrenos_ciclo):
+            barrenos_ciclo = len(mwd)
+
+        barrenos_ciclo = int(round(float(barrenos_ciclo)))
+
+        catalogo.append(
+            {
+                "idx": idx,
+                "resultado": r,
+                "Jumbo": jumbo,
+                "Ciclo": ciclo,
+                "Fecha": fecha,
+                "Operador": operador,
+                "Barrenos": barrenos_ciclo,
+                "Archivo": r.get(
+                    "nombre_archivo",
+                    rep.get("Archivo_ZDA", "-"),
+                ),
+            }
+        )
+
+    def _sort_key(x):
+        fecha = pd.to_datetime(
+            x.get("Fecha"),
+            format="%d/%m/%Y",
+            errors="coerce",
+        )
+        return (
+            fecha if pd.notna(fecha) else pd.Timestamp.min,
+            x.get("Jumbo", ""),
+            str(x.get("Ciclo", "")),
+        )
+
+    return sorted(
+        catalogo,
+        key=_sort_key,
+        reverse=True,
+    )
+
+
+def grafico_rop_por_barreno(
+    df_rop: pd.DataFrame,
+):
+    """
+    Curva ROP vs progresión/profundidad del barreno.
+    """
+    if (
+        df_rop is None
+        or df_rop.empty
+        or "Profundidad_m" not in df_rop.columns
+        or "ROP_m_min" not in df_rop.columns
+    ):
+        return None
+
+    work = df_rop.copy()
+
+    y_plot = (
+        work["ROP_suave_m_min"]
+        if "ROP_suave_m_min" in work.columns
+        else work["ROP_m_min"]
+    )
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=work["Profundidad_m"],
+            y=y_plot,
+            mode="lines",
+            name="ROP",
+            line=dict(
+                width=2.7,
+                color="#2F7ED8",
+                shape="spline",
+                smoothing=0.55,
+            ),
+            fill="tozeroy",
+            fillcolor="rgba(47,126,216,0.10)",
+            customdata=np.column_stack(
+                [
+                    work["ROP_m_min"],
+                ]
+            ),
+            hovertemplate=(
+                "<b>Profundidad: %{x:.2f} m</b>"
+                "<br>ROP: %{customdata[0]:.2f} m/min"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    rop_prom = pd.to_numeric(
+        work["ROP_m_min"],
+        errors="coerce",
+    ).mean()
+
+    if pd.notna(rop_prom):
+        fig.add_hline(
+            y=float(rop_prom),
+            line_width=1.2,
+            line_dash="dot",
+            line_color="#64748b",
+            opacity=0.75,
+            annotation_text=f"Promedio {rop_prom:.2f} m/min",
+            annotation_position="top right",
+        )
+
+    ymax = pd.to_numeric(
+        y_plot,
+        errors="coerce",
+    ).max()
+
+    y_top = max(
+        3.5,
+        float(ymax) * 1.12
+        if pd.notna(ymax)
+        else 3.5,
+    )
+
+    fig.update_layout(
+        **base_layout(
+            450,
+            margin=dict(
+                l=75,
+                r=40,
+                t=38,
+                b=65,
+            ),
+            xaxis=dict(
+                title="Progresión del barreno (m)",
+                rangemode="tozero",
+                gridcolor="#e6edf5",
+                zeroline=False,
+            ),
+            yaxis=dict(
+                title="ROP (m/min)",
+                range=[0, y_top],
+                gridcolor="#e6edf5",
+                zeroline=False,
+            ),
+            hovermode="x",
+            showlegend=False,
+        )
+    )
+
+    return fig
+
+
+def render_rop_section(
+    resultados_validos,
+    df_reportes,
+    sel_jumbos,
+    sel_tipos,
+    sel_rocas,
+    sel_operadores,
+):
+    """
+    Viñeta ROP: selección de ciclo y barreno + perfil de penetración.
+    """
+    st.subheader("ROP por barreno")
+    st.caption(
+        "Visualiza la tasa de penetración (ROP) registrada en el MWD "
+        "y su comportamiento a lo largo de la perforación del barreno."
+    )
+
+    catalogo = _catalogo_rop_resultados(
+        resultados_validos,
+        df_reportes,
+        sel_jumbos,
+        sel_tipos,
+        sel_rocas,
+        sel_operadores,
+    )
+
+    if not catalogo:
+        st.info(
+            "No hay ciclos ZDA visibles con información MWD "
+            "para los filtros seleccionados."
+        )
+        return
+
+    labels_ciclo = []
+    map_ciclo = {}
+
+    for item in catalogo:
+        label = (
+            f"{item['Fecha']} · {item['Jumbo']} · "
+            f"Ciclo {item['Ciclo']} · {item['Operador']} · "
+            f"{item['Barrenos']} barrenos"
+        )
+        # Garantizar claves únicas incluso si el label coincide.
+        key = f"{label} · {item['idx']}"
+        labels_ciclo.append(key)
+        map_ciclo[key] = item
+
+    col_sel1, col_sel2 = st.columns(
+        [1.35, 1.0]
+    )
+
+    with col_sel1:
+        ciclo_sel_key = st.selectbox(
+            "Ciclo / archivo",
+            labels_ciclo,
+            key="rop_ciclo_sel",
+            format_func=lambda x: x.rsplit(" · ", 1)[0],
+        )
+
+    item_sel = map_ciclo[ciclo_sel_key]
+    r = item_sel["resultado"]
+    mwd = r.get("mwd_barrenos").copy()
+
+    # Preferir barrenos con profundidad útil.
+    if "Profundidad_Max_MWD_m" in mwd.columns:
+        mwd["_Prof"] = pd.to_numeric(
+            mwd["Profundidad_Max_MWD_m"],
+            errors="coerce",
+        )
+        mwd = mwd[
+            mwd["_Prof"].notna()
+            & (mwd["_Prof"] > 0)
+        ].copy()
+
+    if mwd.empty:
+        st.info(
+            "El ciclo seleccionado no tiene barrenos MWD "
+            "con profundidad válida."
+        )
+        return
+
+    mwd = mwd.sort_values(
+        [
+            c
+            for c in [
+                "Brazo",
+                "Secuencia",
+            ]
+            if c in mwd.columns
+        ]
+    ).reset_index(drop=True)
+
+    opciones_barreno = list(mwd.index)
+
+    def _label_barreno(i):
+        row = mwd.loc[i]
+        brazo = row.get("Brazo", "-")
+        seq = row.get("Secuencia", "-")
+        prof = pd.to_numeric(
+            pd.Series(
+                [row.get("Profundidad_Max_MWD_m")]
+            ),
+            errors="coerce",
+        ).iloc[0]
+        prof_txt = (
+            f"{prof:.2f} m"
+            if pd.notna(prof)
+            else "-"
+        )
+        estado = row.get("Estado_MWD", "")
+        return (
+            f"Brazo {brazo} · Secuencia {seq} · "
+            f"{prof_txt}"
+            + (
+                f" · {estado}"
+                if estado
+                else ""
+            )
+        )
+
+    with col_sel2:
+        barreno_idx = st.selectbox(
+            "Barreno",
+            opciones_barreno,
+            key="rop_barreno_sel",
+            format_func=_label_barreno,
+        )
+
+    row = mwd.loc[barreno_idx]
+    source_path = Path(
+        r.get("_source_path")
+        or ""
+    )
+    archivo_interno = str(
+        row.get("Archivo_Interno")
+        or ""
+    )
+
+    df_rop = _extraer_rop_mwd_desde_zda(
+        source_path,
+        archivo_interno,
+    )
+
+    if df_rop.empty:
+        st.warning(
+            "No se pudo recuperar la curva ROP del barreno seleccionado. "
+            "Verifica que el archivo ZDA fuente siga disponible en la sesión."
+        )
+        return
+
+    rop_promedio = pd.to_numeric(
+        df_rop["ROP_m_min"],
+        errors="coerce",
+    ).mean()
+
+    rop_mediana = pd.to_numeric(
+        df_rop["ROP_m_min"],
+        errors="coerce",
+    ).median()
+
+    profundidad = pd.to_numeric(
+        pd.Series(
+            [row.get("Profundidad_Max_MWD_m")]
+        ),
+        errors="coerce",
+    ).iloc[0]
+
+    rep = r.get("resumen_reporte") or {}
+    meta = r.get("metadata") or {}
+
+    operador = (
+        rep.get("Operador_Filtro")
+        or meta.get("Operador")
+        or meta.get("Operador_ZDA")
+        or "SIN DATO"
+    )
+    tipo_roca = (
+        rep.get("Tipo_Roca")
+        or meta.get("Tipo_Roca")
+        or "SIN DATO"
+    )
+
+    # ------------------------------------------------------
+    # Tarjetas superiores
+    # ------------------------------------------------------
+    st.markdown(
+        """
+        <style>
+        .rop-kpi-card {
+            min-height: 210px;
+            border: 1px solid #dfe7f1;
+            border-radius: 16px;
+            background: #ffffff;
+            padding: 1.25rem 1.35rem;
+            box-shadow: 0 3px 12px rgba(15,23,42,0.045);
+        }
+        .rop-kpi-label {
+            font-size: 1.02rem;
+            color: #344054;
+            font-weight: 650;
+            margin-bottom: 0.55rem;
+        }
+        .rop-kpi-value {
+            font-size: 2.75rem;
+            line-height: 1.0;
+            color: #111827;
+            font-weight: 780;
+            margin-bottom: 0.65rem;
+        }
+        .rop-kpi-unit {
+            font-size: 1.35rem;
+            font-weight: 500;
+            color: #475467;
+        }
+        .rop-kpi-foot {
+            font-size: 0.88rem;
+            color: #667085;
+        }
+        .rop-info-card {
+            min-height: 210px;
+            border: 1px solid #e4e7ec;
+            border-radius: 16px;
+            background: #f8fafc;
+            padding: 1.05rem 1.20rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.65rem 1.35rem;
+        }
+        .rop-info-label {
+            font-size: 0.72rem;
+            color: #98a2b3;
+            text-transform: uppercase;
+            letter-spacing: 0.045em;
+        }
+        .rop-info-value {
+            font-size: 0.95rem;
+            color: #1d2939;
+            font-weight: 650;
+            margin-top: 0.10rem;
+        }
+        .rop-info-wide {
+            grid-column: 1 / -1;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c_kpi, c_info = st.columns(
+        [0.95, 1.25]
+    )
+
+    with c_kpi:
+        prom_txt = (
+            f"{rop_promedio:.2f}"
+            if pd.notna(rop_promedio)
+            else "-"
+        )
+        med_txt = (
+            f"{rop_mediana:.2f}"
+            if pd.notna(rop_mediana)
+            else "-"
+        )
+
+        st.markdown(
+            f"""
+            <div class="rop-kpi-card">
+                <div class="rop-kpi-label">ROP promedio del barreno</div>
+                <div class="rop-kpi-value">
+                    {prom_txt}
+                    <span class="rop-kpi-unit">m/min</span>
+                </div>
+                <div class="rop-kpi-foot">
+                    Mediana: {med_txt} m/min · {len(df_rop)} muestras válidas
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c_info:
+        prof_txt = (
+            f"{profundidad:.2f} m"
+            if pd.notna(profundidad)
+            else "-"
+        )
+
+        st.markdown(
+            f"""
+            <div class="rop-info-card">
+                <div>
+                    <div class="rop-info-label">Jumbo</div>
+                    <div class="rop-info-value">{item_sel['Jumbo']}</div>
+                </div>
+                <div>
+                    <div class="rop-info-label">Ciclo</div>
+                    <div class="rop-info-value">{item_sel['Ciclo']}</div>
+                </div>
+                <div>
+                    <div class="rop-info-label">Barrenos</div>
+                    <div class="rop-info-value">{item_sel['Barrenos']}</div>
+                </div>
+                <div>
+                    <div class="rop-info-label">Profundidad</div>
+                    <div class="rop-info-value">{prof_txt}</div>
+                </div>
+                <div>
+                    <div class="rop-info-label">Barreno</div>
+                    <div class="rop-info-value">
+                        Brazo {row.get('Brazo','-')} · Secuencia {row.get('Secuencia','-')}
+                    </div>
+                </div>
+                <div>
+                    <div class="rop-info-label">Tipo de roca</div>
+                    <div class="rop-info-value">{tipo_roca}</div>
+                </div>
+                <div class="rop-info-wide">
+                    <div class="rop-info-label">Operador</div>
+                    <div class="rop-info-value">{operador}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        "<div style='height:0.55rem'></div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        st.markdown(
+            "#### Tasa de penetración ROP (m/min)"
+        )
+        st.caption(
+            "La curva muestra la variación de la tasa de penetración "
+            "a lo largo de la progresión del barreno. La línea se suaviza "
+            "visualmente con una mediana móvil de 5 muestras; el tooltip "
+            "mantiene el valor ROP registrado."
+        )
+
+        fig_rop = grafico_rop_por_barreno(
+            df_rop,
+        )
+
+        if fig_rop is not None:
+            st.plotly_chart(
+                fig_rop,
+                width="stretch",
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": False,
+                },
+            )
+
+    st.caption(
+        "ROP = Rate of Penetration · unidad mostrada: metros por minuto (m/min)."
+    )
+
+
+
 def render_resultados_section(resultados_validos):
     st.caption(
         f"{len(resultados_validos)} archivo(s) procesado(s) acumulado(s)"
@@ -6522,6 +7304,7 @@ SECCIONES_ANALISIS = [
     "Perforación",
     "Tiempos de Ciclo",
     "Clasificación",
+    "ROP",
     "Resultados por archivo",
 ]
 
@@ -6589,6 +7372,7 @@ st.markdown(
           txt.includes("Perforación") ||
           txt.includes("Tiempos de Ciclo") ||
           txt.includes("Clasificación") ||
+          txt === "ROP" ||
           txt.includes("Resultados por archivo")
         ) {
           btn.classList.add("seccion-nav");
@@ -6645,6 +7429,17 @@ elif seccion_activa == "Clasificación":
             df_reportes,
             df_automatico,
             df_atipicos,
+            global_jumbos,
+            global_tipos,
+            global_rocas,
+            global_operadores,
+        )
+
+elif seccion_activa == "ROP":
+    with st.container(border=True):
+        render_rop_section(
+            resultados_validos,
+            df_reportes,
             global_jumbos,
             global_tipos,
             global_rocas,
