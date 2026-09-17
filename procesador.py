@@ -1492,3 +1492,541 @@ def procesar_archivo(
         nombre_archivo=nombre_archivo,
         generar_visuales=generar_visuales,
     )
+
+
+# ==========================================================
+# EFICIENCIA DE PERFORACIÓN · MOTOR ZDA INTEGRADO
+# ==========================================================
+
+
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import math
+import re
+import struct
+import zipfile
+
+import numpy as np
+import pandas as pd
+
+try:
+    from shapely.geometry import Polygon
+except Exception:
+    Polygon = None
+
+
+TIPO_CODES = {
+    0: "Reaming",
+    1: "Contour",
+    4: "Cut",
+    5: "Easer",
+    8: "Bottom",
+    9: "Casing",
+}
+
+PERIMETER_TYPES = {"Contour", "Bottom"}
+BOOM_RECORD_SIZE = 297
+BOOM_FIRST_RECORD = 4
+
+VERSION = "V1.0-ZDA-VOLUMETRIA"
+
+
+def _ascii(data: bytes) -> str:
+    return data.split(b"\x00", 1)[0].decode("utf-8", "ignore").strip()
+
+
+def _f64(data: bytes, offset: int) -> float:
+    return struct.unpack_from("<d", data, offset)[0]
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _u64(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _polygon_area(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return float("nan")
+    arr = np.asarray(points, dtype=float)
+    x = arr[:, 0]
+    z = arr[:, 1]
+    return float(abs(np.dot(x, np.roll(z, -1)) - np.dot(z, np.roll(x, -1))) / 2.0)
+
+
+def _order_points_radial(points: List[Tuple[float, float]]) -> List[int]:
+    arr = np.asarray(points, dtype=float)
+    cx, cz = np.nanmean(arr[:, 0]), np.nanmean(arr[:, 1])
+    angles = np.arctan2(arr[:, 1] - cz, arr[:, 0] - cx)
+    return list(np.argsort(angles))
+
+
+def _segment_key(p: Tuple[float, float], nd: int = 5):
+    return (round(float(p[0]), nd), round(float(p[1]), nd))
+
+
+def _arc_center(p1, p2, curvature):
+    """
+    El 7mo double observado en round.dat se comporta como curvatura k=1/R.
+    Signo positivo: arco horario de p1 a p2.
+    """
+    x1, z1 = p1
+    x2, z2 = p2
+    k = float(curvature)
+    if abs(k) < 1e-12:
+        return None, None, None
+    r = 1.0 / abs(k)
+    dx, dz = x2 - x1, z2 - z1
+    chord = math.hypot(dx, dz)
+    if chord <= 1e-12 or chord > 2 * r + 1e-9:
+        return None, None, None
+    mx, mz = (x1 + x2) / 2, (z1 + z2) / 2
+    h = math.sqrt(max(r * r - (chord / 2) ** 2, 0.0))
+    ux, uz = -dz / chord, dx / chord
+    candidates = [(mx + ux * h, mz + uz * h), (mx - ux * h, mz - uz * h)]
+
+    def signed_minor(center):
+        cx, cz = center
+        a1 = math.atan2(z1 - cz, x1 - cx)
+        a2 = math.atan2(z2 - cz, x2 - cx)
+        d = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+        return d
+
+    want_clockwise = k > 0
+    for c in candidates:
+        d = signed_minor(c)
+        if (want_clockwise and d < 0) or ((not want_clockwise) and d > 0):
+            return c, r, d
+    c = candidates[0]
+    return c, r, signed_minor(c)
+
+
+def _sample_segment(seg: Dict, n_arc: int = 18) -> List[Tuple[float, float]]:
+    p1 = (seg["x1"], seg["z1"])
+    p2 = (seg["x2"], seg["z2"])
+    k = float(seg.get("curvature", 0.0) or 0.0)
+    if abs(k) < 1e-12:
+        return [p1, p2]
+
+    center, r, delta = _arc_center(p1, p2, k)
+    if center is None:
+        return [p1, p2]
+    cx, cz = center
+    a1 = math.atan2(p1[1] - cz, p1[0] - cx)
+    ts = np.linspace(0.0, 1.0, n_arc)
+    return [(cx + r * math.cos(a1 + delta * t), cz + r * math.sin(a1 + delta * t)) for t in ts]
+
+
+def _chain_segments(segments: List[Dict]) -> List[Dict]:
+    if not segments:
+        return []
+    unused = list(range(len(segments)))
+    chain = [segments[unused.pop(0)].copy()]
+
+    while unused:
+        end = (chain[-1]["x2"], chain[-1]["z2"])
+        endk = _segment_key(end)
+        found = None
+        reverse = False
+        for j, idx in enumerate(unused):
+            s = segments[idx]
+            if _segment_key((s["x1"], s["z1"])) == endk:
+                found = j
+                reverse = False
+                break
+            if _segment_key((s["x2"], s["z2"])) == endk:
+                found = j
+                reverse = True
+                break
+        if found is None:
+            break
+        idx = unused.pop(found)
+        s = segments[idx].copy()
+        if reverse:
+            s["x1"], s["x2"] = s["x2"], s["x1"]
+            s["y1"], s["y2"] = s["y2"], s["y1"]
+            s["z1"], s["z2"] = s["z2"], s["z1"]
+            s["curvature"] = -float(s.get("curvature", 0.0) or 0.0)
+        chain.append(s)
+    return chain
+
+
+def parse_round_txt(text: str) -> Dict:
+    kv = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        kv[k.strip()] = v.strip()
+    return {
+        "rig": kv.get("rig"),
+        "boom_count": int(kv["boom_count"]) if str(kv.get("boom_count", "")).isdigit() else None,
+        "round": int(kv["round"]) if str(kv.get("round", "")).isdigit() else None,
+        "drill_plan": kv.get("drill_plan"),
+        "planned_face_holes": int(kv["planned_face_holes"]) if str(kv.get("planned_face_holes", "")).isdigit() else None,
+        "navigation": kv.get("navigation"),
+        "start": kv.get("start"),
+        "end": kv.get("end"),
+        "drilled_holes": int(kv["drilled_holes"]) if str(kv.get("drilled_holes", "")).isdigit() else None,
+        "tunnel_id": kv.get("tunnel_id"),
+        "curve_table": kv.get("curve_table"),
+        "operator": _extract_operator(kv.get("tunnel_id", "")),
+    }
+
+
+def _extract_operator(tunnel_id: str) -> Optional[str]:
+    txt = str(tunnel_id or "")
+    m = re.search(r"\bOP\s*[:.=]\s*([^:]+?)(?=\s+\b[A-Z]{1,3}\s*[:.=]|$)", txt, re.I)
+    if m:
+        v = m.group(1).strip()
+        return v or None
+    return None
+
+
+def parse_boom_dat(data: bytes) -> pd.DataFrame:
+    rows = []
+    for start in range(BOOM_FIRST_RECORD, len(data) - BOOM_RECORD_SIZE + 1, BOOM_RECORD_SIZE):
+        try:
+            boom0 = data[start + 159]
+            sec = data[start + 160]
+            type_code = data[start + 175]
+            tipo = TIPO_CODES.get(type_code)
+            if tipo is None or boom0 not in (0, 1) or not (0 < sec < 100):
+                continue
+
+            hole_id = _ascii(data[start + 26:start + 56])
+            boom = boom0 + 1
+            if not hole_id:
+                hole_id = f"R{boom}-{sec}" if tipo == "Reaming" else f"S{boom}-{sec}"
+
+            p = [_f64(data, start + o) for o in (111, 119, 127)]
+            p2 = [_f64(data, start + o) for o in (135, 143, 151)]
+            a = [_f64(data, start + o) for o in (183, 191, 199)]
+            a2 = [_f64(data, start + o) for o in (257, 265, 273)]
+
+            if not all(math.isfinite(v) for v in p + p2 + a + a2):
+                continue
+
+            plan_len = math.dist(p, p2)
+            actual_len = math.dist(a, a2)
+            actual_dy = a2[1] - a[1]
+
+            planned_exists = (
+                not hole_id.upper().startswith("E")
+                and plan_len > 0.1
+                and plan_len < 20
+            )
+
+            rows.append({
+                "ID": hole_id,
+                "Brazo": boom,
+                "Secuencia": int(sec),
+                "Tipo": tipo,
+                "Extra": hole_id.upper().startswith("E"),
+                "Plan_X": p[0] if planned_exists else np.nan,
+                "Plan_Y": p[1] if planned_exists else np.nan,
+                "Plan_Z": p[2] if planned_exists else np.nan,
+                "Plan_X2": p2[0] if planned_exists else np.nan,
+                "Plan_Y2": p2[1] if planned_exists else np.nan,
+                "Plan_Z2": p2[2] if planned_exists else np.nan,
+                "Plan_Longitud_m": plan_len if planned_exists else np.nan,
+                "X": a[0], "Y": a[1], "Z": a[2],
+                "X2": a2[0], "Y2": a2[1], "Z2": a2[2],
+                "Longitud_m": actual_len,
+                "Avance_Y_m": actual_dy,
+                "Inicio_TS": _u32(data, start + 163),
+                "Fin_TS": _u32(data, start + 240),
+            })
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Desv_Collar_m"] = np.sqrt(
+            (df["X"] - df["Plan_X"]) ** 2
+            + (df["Y"] - df["Plan_Y"]) ** 2
+            + (df["Z"] - df["Plan_Z"]) ** 2
+        )
+        df["Desv_Toe_m"] = np.sqrt(
+            (df["X2"] - df["Plan_X2"]) ** 2
+            + (df["Y2"] - df["Plan_Y2"]) ** 2
+            + (df["Z2"] - df["Plan_Z2"]) ** 2
+        )
+    return df
+
+
+def parse_round_dat_profile(data: bytes) -> Dict:
+    """
+    Recupera la geometría nominal del frente desde round-*.dat.
+
+    En los ZDA DD322i analizados, el perfil aparece como registros:
+      tipo=3, timestamp uint64, payload_len=56, 7 doubles
+    con:
+      x1,y1,z1,x2,y2,z2,curvature
+    donde curvature=0 es línea y |curvature|=1/R para arcos.
+    """
+    segments = []
+    for pos in range(0, max(0, len(data) - 69)):
+        if data[pos] != 3:
+            continue
+        try:
+            ts = _u64(data, pos + 1)
+            length = _u32(data, pos + 9)
+            if length != 56 or pos + 13 + 56 > len(data):
+                continue
+            vals = struct.unpack_from("<7d", data, pos + 13)
+            if not all(math.isfinite(v) for v in vals):
+                continue
+            x1, y1, z1, x2, y2, z2, k = vals
+            if max(abs(x1), abs(y1), abs(z1), abs(x2), abs(y2), abs(z2)) > 50:
+                continue
+            if math.dist((x1, y1, z1), (x2, y2, z2)) < 0.05:
+                continue
+            segments.append({
+                "offset": pos,
+                "timestamp": ts,
+                "x1": x1, "y1": y1, "z1": z1,
+                "x2": x2, "y2": y2, "z2": z2,
+                "curvature": k,
+            })
+        except Exception:
+            continue
+
+    # Deduplicar por endpoints+curvatura
+    uniq = []
+    seen = set()
+    for s in segments:
+        key = tuple(round(s[k], 6) for k in ("x1","y1","z1","x2","y2","z2","curvature"))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+
+    chain = _chain_segments(uniq)
+    sampled = []
+    for i, seg in enumerate(chain):
+        pts = _sample_segment(seg)
+        if i > 0:
+            pts = pts[1:]
+        sampled.extend(pts)
+
+    area = _polygon_area(sampled) if len(sampled) >= 3 else float("nan")
+    return {
+        "segments": uniq,
+        "chain": chain,
+        "polygon": sampled,
+        "area_m2": area,
+        "decoded": len(sampled) >= 3 and math.isfinite(area),
+    }
+
+
+def _perimeter_rows(df: pd.DataFrame) -> pd.DataFrame:
+    out = df[
+        df["Tipo"].isin(PERIMETER_TYPES)
+        & (~df["Extra"].fillna(False))
+    ].copy()
+    out = out[
+        out[["Plan_X","Plan_Z","X","Z","X2","Z2"]].notna().all(axis=1)
+    ].copy()
+    return out
+
+
+def _build_ordered_profiles(df: pd.DataFrame) -> Dict:
+    per = _perimeter_rows(df)
+    if per.empty:
+        return {}
+    planned_pts = list(zip(per["Plan_X"], per["Plan_Z"]))
+    order = _order_points_radial(planned_pts)
+    per = per.iloc[order].reset_index(drop=True)
+
+    planned = list(zip(per["Plan_X"], per["Plan_Z"]))
+    actual_start = list(zip(per["X"], per["Z"]))
+    actual_end = list(zip(per["X2"], per["Z2"]))
+
+    return {
+        "rows": per,
+        "planned": planned,
+        "actual_start": actual_start,
+        "actual_end": actual_end,
+        "area_planned_m2": _polygon_area(planned),
+        "area_start_m2": _polygon_area(actual_start),
+        "area_end_m2": _polygon_area(actual_end),
+    }
+
+
+def _interpolate_profile(p0, p1, t: float):
+    return [
+        (x0 + (x1-x0)*t, z0 + (z1-z0)*t)
+        for (x0,z0),(x1,z1) in zip(p0,p1)
+    ]
+
+
+def _safe_polygon(points):
+    if Polygon is None or len(points) < 3:
+        return None
+    try:
+        p = Polygon(points)
+        if not p.is_valid:
+            p = p.buffer(0)
+        return p if not p.is_empty else None
+    except Exception:
+        return None
+
+
+def calculate_volumetry(df: pd.DataFrame, nominal_profile: Dict, n_sections: int = 41) -> Dict:
+    prof = _build_ordered_profiles(df)
+    if not prof:
+        return {"ok": False, "reason": "No se pudo construir el perímetro Contour+Bottom."}
+
+    cuts = df[(df["Tipo"] == "Cut") & (df["Longitud_m"] > 0.1)].copy()
+    referencia = cuts
+    referencia_tipo = "Cut"
+
+    if referencia.empty:
+        referencia = df[
+            (df["Tipo"] == "Easer")
+            & (pd.to_numeric(df["Longitud_m"], errors="coerce") > 0.1)
+        ].copy()
+        referencia_tipo = "Easer"
+
+    if referencia.empty:
+        referencia = df[
+            df["Tipo"].isin(["Bottom", "Easer", "Cut", "Contour"])
+            & (pd.to_numeric(df["Longitud_m"], errors="coerce") > 0.1)
+        ].copy()
+        referencia_tipo = "Frente"
+
+    if referencia.empty:
+        return {
+            "ok": False,
+            "reason": "No existen barrenos de frente válidos para determinar la profundidad común.",
+        }
+
+    L = float(pd.to_numeric(referencia["Longitud_m"], errors="coerce").median())
+    Ly = float(pd.to_numeric(referencia["Avance_Y_m"], errors="coerce").abs().median())
+
+    p0 = prof["actual_start"]
+    p1 = prof["actual_end"]
+    ts = np.linspace(0.0, 1.0, max(5, int(n_sections)))
+    areas = []
+    over_areas = []
+    under_areas = []
+    nominal_poly = _safe_polygon(nominal_profile.get("polygon", [])) if nominal_profile else None
+
+    for t in ts:
+        pts = _interpolate_profile(p0, p1, float(t))
+        a = _polygon_area(pts)
+        areas.append(a)
+
+        if nominal_poly is not None:
+            p = _safe_polygon(pts)
+            if p is not None:
+                over_areas.append(float(p.difference(nominal_poly).area))
+                under_areas.append(float(nominal_poly.difference(p).area))
+            else:
+                over_areas.append(np.nan)
+                under_areas.append(np.nan)
+
+    # Integración trapezoidal sobre profundidad longitudinal de referencia.
+    s = ts * Ly
+    v3 = float(np.trapezoid(np.asarray(areas, dtype=float), s))
+    v1 = float(prof["area_start_m2"] * Ly)
+    v2 = float(prof["area_end_m2"] * Ly)
+
+    # Simpson prismoidal simple usando perfil medio.
+    mid_pts = _interpolate_profile(p0, p1, 0.5)
+    a_mid = _polygon_area(mid_pts)
+    v3_simpson = float(Ly / 6.0 * (prof["area_start_m2"] + 4*a_mid + prof["area_end_m2"]))
+
+    nominal_area = float(nominal_profile.get("area_m2", np.nan)) if nominal_profile else np.nan
+    v_nominal = float(nominal_area * Ly) if math.isfinite(nominal_area) else np.nan
+
+    over_v = float(np.trapezoid(np.asarray(over_areas, dtype=float), s)) if over_areas and np.isfinite(over_areas).any() else np.nan
+    under_v = float(np.trapezoid(np.asarray(under_areas, dtype=float), s)) if under_areas and np.isfinite(under_areas).any() else np.nan
+
+    # Calidad/representatividad: qué proporción del perímetro alcanzó al menos 85% del avance Cut longitudinal.
+    per = prof["rows"].copy()
+    per["Avance_Y_abs_m"] = (per["Y2"] - per["Y"]).abs()
+    threshold = 0.85 * Ly
+    complete = per["Avance_Y_abs_m"] >= threshold
+    ratio_complete = float(complete.mean()) if len(per) else np.nan
+    if ratio_complete >= 0.85:
+        confidence = "ALTA"
+    elif ratio_complete >= 0.60:
+        confidence = "MEDIA"
+    else:
+        confidence = "BAJA"
+
+    return {
+        "ok": True,
+        "perimeter_rows": per,
+        "planned_polygon": prof["planned"],
+        "start_polygon": p0,
+        "end_polygon": p1,
+        "mid_polygon": mid_pts,
+        "area_planned_m2": prof["area_planned_m2"],
+        "area_start_m2": prof["area_start_m2"],
+        "area_mid_m2": a_mid,
+        "area_end_m2": prof["area_end_m2"],
+        "cut_median_length_m": L,
+        "cut_median_advance_y_m": Ly,
+        "reference_hole_type": referencia_tipo,
+        "v1_m3": v1,
+        "v2_m3": v2,
+        "v3_integrated_m3": v3,
+        "v3_simpson_m3": v3_simpson,
+        "nominal_area_m2": nominal_area,
+        "nominal_volume_m3": v_nominal,
+        "overprofile_potential_m3": over_v,
+        "underprofile_potential_m3": under_v,
+        "overprofile_potential_pct_nominal": (over_v / v_nominal * 100.0) if math.isfinite(over_v) and v_nominal > 0 else np.nan,
+        "perimeter_holes_n": int(len(per)),
+        "perimeter_holes_ge85pct_cut_n": int(complete.sum()),
+        "perimeter_holes_ge85pct_cut_pct": ratio_complete * 100.0,
+        "confidence": confidence,
+        "sections_t": ts.tolist(),
+        "sections_area_m2": [float(x) for x in areas],
+        "sections_over_m2": [float(x) if math.isfinite(x) else None for x in over_areas],
+        "sections_under_m2": [float(x) if math.isfinite(x) else None for x in under_areas],
+    }
+
+
+def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
+    with zipfile.ZipFile(BytesIO(raw)) as z:
+        names = z.namelist()
+        txt_name = next((n for n in names if re.match(r"round-.*\.txt$", n, re.I) and "hole_comment" not in n.lower()), None)
+        boom_name = next((n for n in names if n.lower().endswith("-boom.dat")), None)
+        round_dat_name = next((
+            n for n in names
+            if re.match(r"round-.*\.dat$", n, re.I)
+            and not any(k in n.lower() for k in ("-boom", "-counters", "-mwd-"))
+        ), None)
+
+        if boom_name is None:
+            raise ValueError("El ZDA no contiene boom.dat.")
+
+        meta = parse_round_txt(z.read(txt_name).decode("utf-8", "ignore")) if txt_name else {}
+        holes = parse_boom_dat(z.read(boom_name))
+        nominal = parse_round_dat_profile(z.read(round_dat_name)) if round_dat_name else {
+            "segments": [], "chain": [], "polygon": [], "area_m2": float("nan"), "decoded": False
+        }
+
+    volumetry = calculate_volumetry(holes, nominal)
+
+    return {
+        "filename": filename,
+        "metadata": meta,
+        "holes": holes,
+        "nominal_profile": nominal,
+        "volumetry": volumetry,
+        "internal_files": names,
+        "version": VERSION,
+    }
+
+
+def process_zda_file(path: str | Path) -> Dict:
+    p = Path(path)
+    return process_zda_bytes(p.read_bytes(), p.name)

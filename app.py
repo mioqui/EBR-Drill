@@ -27,6 +27,7 @@ from procesador import (
     clasificar_tipo_disparo_v33,
     generar_grafico,
     generar_plano_zda_png,
+    process_zda_bytes as procesar_eficiencia_zda,
 )
 
 
@@ -34,9 +35,9 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V35.08-PYTHON-ZDA-ONLY-CARPETA-OPERADOR"
+APP_VERSION_INTERNAL = "V35.18-ZDA-CONTORNOS-GRUPOS"
 PUBLIC_VERSION = "v1.0"
-CACHE_SCHEMA_VERSION = "v35_07_python_zda_only_20260917"
+CACHE_SCHEMA_VERSION = "v35_17_contornos_real_programado_20260917"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
 COLORES = qualitative.Plotly
 
@@ -373,6 +374,25 @@ global_lbl_zda = False
 sidebar_fecha_container = None
 
 with st.sidebar:
+    st.markdown(
+        """
+        <div style="position:sticky; top:0; z-index:999;
+                    background:transparent;
+                    padding:0.25rem 0 0.85rem 0;
+                    margin-bottom:0.45rem;
+                    border-bottom:1px solid rgba(255,255,255,0.22);">
+            <div style="font-size:1.18rem; font-weight:700; line-height:1.2;
+                        color:#ffffff; letter-spacing:-0.01em;">
+                EBR Drill Analytics
+            </div>
+            <div style="font-size:0.78rem; color:rgba(255,255,255,0.72);
+                        margin-top:0.20rem; font-weight:400;">
+                ZDA Analytics
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.header("Filtros y parámetros")
     sidebar_fecha_container = st.container()
 
@@ -7380,6 +7400,542 @@ def render_resultados_section(resultados_validos):
 
 
 # ==========================================================
+# EFICIENCIA DE PERFORACIÓN · GEOMETRÍA ZDA
+# ==========================================================
+
+COLORES_BARRENO_3D = {
+    "Contour": "#173F5F",
+    "Bottom": "#2A6F97",
+    "Cut": "#7A1F5D",
+    "Easer": "#E07A1F",
+    "Reaming": "#5B6770",
+    "Casing": "#8A8A8A",
+}
+
+
+def _color_barreno_3d(tipo):
+    return COLORES_BARRENO_3D.get(str(tipo).strip().title(), "#8A8A8A")
+
+
+def _area_poligono_xz(puntos):
+    a = np.asarray(puntos, dtype=float)
+    if len(a) < 3:
+        return 0.0
+    x, z = a[:, 0], a[:, 1]
+    return float(abs(np.dot(x, np.roll(z, -1)) - np.dot(z, np.roll(x, -1))) / 2.0)
+
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def _cargar_eficiencia_desde_path(path_str, mtime_ns, size_bytes):
+    # mtime/size forman parte de la clave del cache para invalidar si cambia el ZDA.
+    raw = Path(path_str).read_bytes()
+    return procesar_eficiencia_zda(raw, filename=Path(path_str).name)
+
+
+def render_eficiencia_perforacion_section(resultados):
+    st.subheader("Eficiencia de Perforación")
+    st.caption(
+        "Compara la geometría programada con la geometría realmente perforada usando únicamente el archivo ZDA. "
+        "La comparación volumétrica se realiza a una profundidad común alcanzada."
+    )
+
+    disponibles = []
+    for r in resultados:
+        path_str = r.get("_source_path")
+        if r.get("error") or not path_str or not Path(path_str).exists():
+            continue
+        rep = r.get("resumen_reporte") or {}
+        n_barrenos_lista = (
+            rep.get("N_Barrenos")
+            or rep.get("Barrenos")
+            or rep.get("Barrenos_Realizados")
+        )
+        if n_barrenos_lista is None:
+            det_lista = r.get("detalle")
+            if isinstance(det_lista, pd.DataFrame) and not det_lista.empty:
+                n_barrenos_lista = len(det_lista)
+
+        barrenos_txt = (
+            f" · {int(n_barrenos_lista)} barrenos"
+            if n_barrenos_lista is not None and pd.notna(n_barrenos_lista)
+            else ""
+        )
+        etiqueta = (
+            f"{rep.get('Jumbo') or '-'} · Ciclo {rep.get('Ciclo') or '-'} · "
+            f"{rep.get('Fecha_Inicio') or '-'}{barrenos_txt} · "
+            f"{r.get('nombre_archivo') or Path(path_str).name}"
+        )
+        disponibles.append((etiqueta, r))
+
+    if not disponibles:
+        st.info("Carga y procesa al menos un archivo ZDA para visualizar la eficiencia de perforación.")
+        return
+
+    etiquetas = [x[0] for x in disponibles]
+    seleccion = st.selectbox(
+        "Ciclo a analizar",
+        etiquetas,
+        key="eficiencia_ciclo_seleccionado",
+    )
+    rsel = dict(disponibles)[seleccion]
+    path = Path(rsel["_source_path"])
+
+    try:
+        stat = path.stat()
+        with st.spinner("Reconstruyendo geometría programada y real desde el ZDA..."):
+            rr = _cargar_eficiencia_desde_path(
+                str(path), stat.st_mtime_ns, stat.st_size
+            )
+    except Exception as exc:
+        st.error(f"No se pudo reconstruir la geometría del ciclo: {exc}")
+        return
+
+    v = rr.get("volumetry") or {}
+    df = rr.get("holes")
+    meta = rr.get("metadata") or {}
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.warning("El ZDA no contiene barrenos válidos para reconstruir la geometría.")
+        return
+
+    # --------------------------------------------------------------
+    # Conteos ZDA
+    # --------------------------------------------------------------
+    n_prog = meta.get("planned_face_holes")
+    n_real = meta.get("drilled_holes")
+    if n_prog is None:
+        n_prog = int(df["Plan_X"].notna().sum()) if "Plan_X" in df.columns else 0
+    if n_real is None:
+        n_real = int(len(df))
+
+    # --------------------------------------------------------------
+    # Volumetría/perímetro. IMPORTANTE:
+    # no asumir que perimeter_rows existe. Algunos ciclos pueden no
+    # tener suficientes Contour/Bottom o una profundidad de referencia.
+    # El 3D se genera de todas maneras con los barrenos disponibles.
+    # --------------------------------------------------------------
+    volumetria_ok = bool(v.get("ok"))
+    per = v.get("perimeter_rows")
+    if not isinstance(per, pd.DataFrame):
+        per = pd.DataFrame()
+
+    L = np.nan
+    Lp = np.nan
+    t = 1.0
+    prog_common = []
+    ss = np.array([], dtype=float)
+    areas_prog = []
+    areas_real = []
+    Vprog = np.nan
+    Vreal = np.nan
+    delta = np.nan
+    delta_pct = np.nan
+
+    if volumetria_ok and not per.empty:
+        try:
+            L = float(v.get("cut_median_advance_y_m"))
+            Lp = float(np.nanmedian(np.abs(per["Plan_Y2"] - per["Plan_Y"])))
+
+            if np.isfinite(L) and L > 0 and np.isfinite(Lp) and Lp > 0:
+                t = min(1.0, L / Lp)
+
+                prog_common = [
+                    (
+                        q.Plan_X + (q.Plan_X2 - q.Plan_X) * t,
+                        q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * t,
+                    )
+                    for _, q in per.iterrows()
+                ]
+
+                ss = np.linspace(0.0, L, 81)
+                for d in ss:
+                    td = min(1.0, d / Lp)
+                    pts = [
+                        (
+                            q.Plan_X + (q.Plan_X2 - q.Plan_X) * td,
+                            q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * td,
+                        )
+                        for _, q in per.iterrows()
+                    ]
+                    areas_prog.append(_area_poligono_xz(pts))
+
+                Vprog = float(np.trapezoid(np.asarray(areas_prog), ss))
+                Vreal = float(v.get("v3_integrated_m3", np.nan))
+                delta = Vreal - Vprog
+                delta_pct = (delta / Vprog * 100.0) if Vprog > 0 else np.nan
+
+                # El procesador entrega la evolución real en secciones normalizadas.
+                real_src = v.get("sections_area_m2") or []
+                if len(real_src) >= 2:
+                    x_src = np.linspace(0.0, L, len(real_src))
+                    areas_real = np.interp(
+                        ss, x_src, np.asarray(real_src, dtype=float)
+                    ).tolist()
+        except Exception:
+            volumetria_ok = False
+
+    # --------------------------------------------------------------
+    # Tarjetas
+    # --------------------------------------------------------------
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Barrenos programados", f"{int(n_prog)}" if n_prog is not None else "-")
+    c2.metric("Barrenos realizados", f"{int(n_real)}" if n_real is not None else "-")
+    c3.metric("Longitud de perforación alcanzada", f"{L:.2f} m" if np.isfinite(L) else "-")
+    c4.metric("Volumen programado", f"{Vprog:.2f} m³" if np.isfinite(Vprog) else "-")
+    c5.metric("Volumen real barrenado", f"{Vreal:.2f} m³" if np.isfinite(Vreal) else "-")
+    c6.metric(
+        "Real − programado",
+        f"{delta:+.2f} m³" if np.isfinite(delta) else "-",
+        f"{delta_pct:+.1f}%" if np.isfinite(delta_pct) else None,
+    )
+
+    st.caption(
+        "La longitud de perforación alcanzada se utiliza como longitud común de referencia para comparar "
+        "la geometría programada y la geometría real."
+    )
+    st.caption(
+        "El indicador Real − programado representa diferencia geométrica de perforación; "
+        "no corresponde a sobrerotura real post-voladura."
+    )
+
+    if not volumetria_ok or per.empty or not np.isfinite(L):
+        motivo = v.get("reason") or "No se pudo construir un perímetro volumétrico confiable para este ciclo."
+        st.info(
+            f"Comparación volumétrica no disponible para este ciclo: {motivo} "
+            "El modelo 3D de los barrenos disponibles se muestra igualmente."
+        )
+
+    # --------------------------------------------------------------
+    # 2D · perfiles de control
+    # --------------------------------------------------------------
+    if volumetria_ok and not per.empty and np.isfinite(L):
+        fig2 = go.Figure()
+
+        def add_poly2(pts, name, dash, group, group_title, color):
+            pts = list(pts)
+            if not pts:
+                return
+            fig2.add_trace(go.Scatter(
+                x=[p[0] for p in pts] + [pts[0][0]],
+                y=[p[1] for p in pts] + [pts[0][1]],
+                mode="lines",
+                name=name,
+                legendgroup=group,
+                legendgrouptitle_text=group_title,
+                line=dict(width=3, dash=dash, color=color),
+            ))
+
+        add_poly2(
+            v.get("planned_polygon", []),
+            "Programado · Collar (0 m)", "dot",
+            "collar", "INICIO · COLLAR", "#E4573D",
+        )
+        add_poly2(
+            v.get("start_polygon", []),
+            "Real · Collar", "solid",
+            "collar", None, "#00A878",
+        )
+        add_poly2(
+            prog_common,
+            f"Programado · {L:.2f} m", "dashdot",
+            "fondo", f"FONDO · {L:.2f} m", "#7B61FF",
+        )
+        add_poly2(
+            v.get("end_polygon", []),
+            "Real · Fondo", "solid",
+            "fondo", None, "#F4A261",
+        )
+
+        fig2.update_layout(
+            template="plotly_white",
+            height=610,
+            xaxis_title="X (m)",
+            yaxis_title="Z (m)",
+            yaxis=dict(scaleanchor="x", scaleratio=1),
+            legend=dict(orientation="h", traceorder="grouped", y=1.14),
+            margin=dict(t=95),
+        )
+        st.markdown("#### Perfiles de control")
+        st.plotly_chart(
+            fig2,
+            width="stretch",
+            key=f"eficiencia_perfiles_2d_{meta.get('round', 'x')}",
+        )
+
+        # ----------------------------------------------------------
+        # Evolución de las áreas · gráfico recuperado
+        # ----------------------------------------------------------
+        if len(areas_prog) == len(ss) and len(areas_real) == len(ss):
+            fig_area = go.Figure()
+            fig_area.add_trace(go.Scatter(
+                x=ss,
+                y=areas_real,
+                mode="lines",
+                name="Real",
+                line=dict(width=3, color="#5B6CFF"),
+            ))
+            fig_area.add_trace(go.Scatter(
+                x=ss,
+                y=areas_prog,
+                mode="lines",
+                name="Programado",
+                line=dict(width=3, dash="dash", color="#FF5538"),
+            ))
+
+            nominal_area = v.get("nominal_area_m2")
+            if nominal_area is not None:
+                try:
+                    nominal_area = float(nominal_area)
+                except Exception:
+                    nominal_area = np.nan
+            if nominal_area is not None and np.isfinite(nominal_area):
+                fig_area.add_trace(go.Scatter(
+                    x=[0.0, L],
+                    y=[nominal_area, nominal_area],
+                    mode="lines",
+                    name="Nominal",
+                    line=dict(width=2, dash="dot", color="#334A73"),
+                ))
+
+            fig_area.update_layout(
+                template="plotly_white",
+                height=520,
+                xaxis_title="Profundidad longitudinal (m)",
+                yaxis_title="Área (m²)",
+                legend=dict(orientation="h", y=1.10),
+                margin=dict(t=70),
+            )
+            st.markdown("#### Evolución de las áreas")
+            st.latex(r"V = \int A(s)\,ds")
+            st.plotly_chart(
+                fig_area,
+                width="stretch",
+                key=f"eficiencia_areas_{meta.get('round', 'x')}",
+            )
+
+    # --------------------------------------------------------------
+    # 3D · independiente de perimeter_rows.
+    # Esto evita que un ciclo sin perímetro volumétrico bloquee el 3D.
+    # --------------------------------------------------------------
+    fig3 = go.Figure()
+    trazas_3d = 0
+
+    plan_cols = ["Plan_X", "Plan_Y", "Plan_Z", "Plan_X2", "Plan_Y2", "Plan_Z2"]
+    real_cols = ["X", "Y", "Z", "X2", "Y2", "Z2"]
+
+    if all(c in df.columns for c in plan_cols):
+        plan3d = df.copy()
+        for c in plan_cols:
+            plan3d[c] = pd.to_numeric(plan3d[c], errors="coerce")
+        plan3d = plan3d.dropna(subset=plan_cols)
+
+        for _, q in plan3d.iterrows():
+            tp = t if np.isfinite(L) and np.isfinite(Lp) and Lp > 0 else 1.0
+            e = (
+                q.Plan_X + (q.Plan_X2 - q.Plan_X) * tp,
+                q.Plan_Y + (q.Plan_Y2 - q.Plan_Y) * tp,
+                q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * tp,
+            )
+            fig3.add_trace(go.Scatter3d(
+                x=[q.Plan_X, e[0]],
+                y=[q.Plan_Y, e[1]],
+                z=[q.Plan_Z, e[2]],
+                mode="lines",
+                line=dict(
+                    width=2,
+                    dash="dot",
+                    color=_color_barreno_3d(q.Tipo),
+                ),
+                showlegend=False,
+                hovertemplate=(
+                    f"Programado · {q.Tipo}<br>"
+                    f"ID: {q.ID}<extra></extra>"
+                ),
+            ))
+            trazas_3d += 1
+
+    if all(c in df.columns for c in real_cols):
+        real3d = df.copy()
+        for c in real_cols:
+            real3d[c] = pd.to_numeric(real3d[c], errors="coerce")
+        real3d = real3d.dropna(subset=real_cols)
+
+        for _, q in real3d.iterrows():
+            tipo_q = str(q.get("Tipo", "Other"))
+            id_q = q.get("ID", "-")
+            color_q = _color_barreno_3d(tipo_q)
+            fig3.add_trace(go.Scatter3d(
+                x=[float(q["X"]), float(q["X2"])],
+                y=[float(q["Y"]), float(q["Y2"])],
+                z=[float(q["Z"]), float(q["Z2"])],
+                mode="lines+markers",
+                line=dict(width=4, color=color_q),
+                marker=dict(size=2, color=color_q),
+                showlegend=False,
+                hovertemplate=(
+                    f"Real · {tipo_q}<br>"
+                    f"ID: {id_q}<extra></extra>"
+                ),
+            ))
+            trazas_3d += 1
+
+    for typ in ["Contour", "Bottom", "Cut", "Easer", "Reaming", "Casing"]:
+        if "Tipo" in df.columns and (df["Tipo"].astype(str) == typ).any():
+            fig3.add_trace(go.Scatter3d(
+                x=[None], y=[None], z=[None],
+                mode="lines",
+                name=typ,
+                line=dict(width=5, color=_color_barreno_3d(typ)),
+                legendgroup="tipos",
+            ))
+
+    # Contornos gruesos de referencia en 3D.
+    # Se muestran Programado · Collar, Programado · Fondo común y Real · Fondo.
+    if not per.empty:
+        try:
+            pc = list(zip(per.Plan_X, per.Plan_Y, per.Plan_Z))
+            if pc:
+                pc.append(pc[0])
+                fig3.add_trace(go.Scatter3d(
+                    x=[p[0] for p in pc],
+                    y=[p[1] for p in pc],
+                    z=[p[2] for p in pc],
+                    mode="lines",
+                    name="Contorno programado · Collar (0 m)",
+                    line=dict(width=9, dash="dot", color="#111827"),
+                    legendgroup="contornos_collar",
+                ))
+
+            # Contorno real del collar: puntos X/Y/Z realmente registrados
+            # para los barrenos perimetrales.
+            real_collar = []
+            for _, q in per.iterrows():
+                vals = [
+                    pd.to_numeric(q.get("X"), errors="coerce"),
+                    pd.to_numeric(q.get("Y"), errors="coerce"),
+                    pd.to_numeric(q.get("Z"), errors="coerce"),
+                ]
+                if all(pd.notna(vv) for vv in vals):
+                    real_collar.append((float(vals[0]), float(vals[1]), float(vals[2])))
+
+            if len(real_collar) >= 3:
+                real_collar.append(real_collar[0])
+                fig3.add_trace(go.Scatter3d(
+                    x=[p[0] for p in real_collar],
+                    y=[p[1] for p in real_collar],
+                    z=[p[2] for p in real_collar],
+                    mode="lines",
+                    name="Contorno real · Collar",
+                    line=dict(width=9, color="#00A878"),
+                    legendgroup="contornos_collar",
+                ))
+
+            if np.isfinite(L) and np.isfinite(Lp) and Lp > 0:
+                pf = [
+                    (
+                        q.Plan_X + (q.Plan_X2 - q.Plan_X) * t,
+                        q.Plan_Y + (q.Plan_Y2 - q.Plan_Y) * t,
+                        q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * t,
+                    )
+                    for _, q in per.iterrows()
+                ]
+                if pf:
+                    pf.append(pf[0])
+                    fig3.add_trace(go.Scatter3d(
+                        x=[p[0] for p in pf],
+                        y=[p[1] for p in pf],
+                        z=[p[2] for p in pf],
+                        mode="lines",
+                        name=f"Contorno programado · {L:.2f} m",
+                        line=dict(width=9, dash="dash", color="#6D28D9"),
+                        legendgroup="contornos_fondo",
+                    ))
+
+            # Contorno real del fondo: usa los extremos reales X2/Y2/Z2
+            # de los mismos barrenos perimetrales.
+            real_fondo = []
+            for _, q in per.iterrows():
+                vals = [
+                    pd.to_numeric(q.get("X2"), errors="coerce"),
+                    pd.to_numeric(q.get("Y2"), errors="coerce"),
+                    pd.to_numeric(q.get("Z2"), errors="coerce"),
+                ]
+                if all(pd.notna(vv) for vv in vals):
+                    real_fondo.append((float(vals[0]), float(vals[1]), float(vals[2])))
+
+            if len(real_fondo) >= 3:
+                real_fondo.append(real_fondo[0])
+                fig3.add_trace(go.Scatter3d(
+                    x=[p[0] for p in real_fondo],
+                    y=[p[1] for p in real_fondo],
+                    z=[p[2] for p in real_fondo],
+                    mode="lines",
+                    name="Contorno real · Fondo",
+                    line=dict(width=9, color="#F4A261"),
+                    legendgroup="contornos_fondo",
+                ))
+        except Exception:
+            pass
+
+    st.markdown("#### Modelo 3D giratorio")
+    st.caption(
+        "Color = tipo de barreno · Programado = punteado · Real = continuo"
+    )
+
+    n_real_3d = len(real3d) if "real3d" in locals() else 0
+    n_plan_3d = len(plan3d) if "plan3d" in locals() else 0
+    if n_real_3d > 0 and n_plan_3d < n_real_3d:
+        st.caption(
+            f"Geometría 3D disponible: {n_real_3d} barrenos reales y "
+            f"{n_plan_3d} trayectorias programadas con coordenadas completas."
+        )
+
+    if trazas_3d == 0:
+        st.warning("Este ciclo no contiene coordenadas 3D válidas para representar los barrenos.")
+    else:
+        fig3.update_layout(
+            template="plotly_white",
+            height=860,
+            scene=dict(
+                domain=dict(x=[0.03, 0.97], y=[0.20, 0.98]),
+                aspectmode="data",
+                xaxis=dict(
+                    title="X (m)",
+                    showaxeslabels=True,
+                    showticklabels=True,
+                    showspikes=True,
+                ),
+                yaxis=dict(
+                    title="Y / avance (m)",
+                    showaxeslabels=True,
+                    showticklabels=True,
+                    showspikes=True,
+                ),
+                zaxis=dict(
+                    title="Z (m)",
+                    showaxeslabels=True,
+                    showticklabels=True,
+                    showspikes=True,
+                ),
+                bgcolor="white",
+            ),
+            legend=dict(
+                orientation="h",
+                x=0.01,
+                xanchor="left",
+                y=0.02,
+                yanchor="bottom",
+                traceorder="grouped",
+            ),
+            margin=dict(l=10, r=10, t=20, b=10),
+        )
+        st.plotly_chart(
+            fig3,
+            width="stretch",
+            key=f"eficiencia_modelo_3d_{meta.get('round', 'x')}",
+        )
+
+# ==========================================================
 # PRESENTACIÓN POR SECCIONES
 # ==========================================================
 
@@ -7407,6 +7963,7 @@ SECCIONES_ANALISIS = [
     "Uso Automático",
     "Longitud de Perforación",
     "Primer Golpe",
+    "Eficiencia de Perforación",
     "Clasificación",
     "Resultados por archivo",
     "ROP por barreno",
@@ -7515,6 +8072,7 @@ st.markdown(
           txt.includes("Uso Automático") ||
           txt.includes("Longitud de Perforación") ||
           txt.includes("Primer Golpe") ||
+          txt.includes("Eficiencia de Perforación") ||
           txt.includes("Clasificación") ||
           txt.includes("ROP por barreno") ||
           txt.includes("Resultados por archivo")
@@ -7565,6 +8123,10 @@ elif seccion_activa == "Primer Golpe":
             global_operadores,
             global_lbl_zda,
         )
+
+elif seccion_activa == "Eficiencia de Perforación":
+    with st.container(border=True):
+        render_eficiencia_perforacion_section(resultados_validos)
 
 elif seccion_activa == "Clasificación":
     with st.container(border=True):
