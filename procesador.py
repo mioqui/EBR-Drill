@@ -10,7 +10,6 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
-import pdfplumber
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,9 +18,8 @@ from matplotlib.patches import Patch
 
 ORDEN_TIPOS = ["Bottom", "Easer", "Cut", "Contour", "Reaming", "Casing"]
 JUMBOS = {"125D114796": "JUMB001", "125D98943": "JUMB002"}
-NUM = r"-?\d+(?:\.\d+)?"
 
-VERSION_PROCESADOR = "V34.46-Python-MASIVO-OPERADORES-ZDA-NORMALIZADOS"
+VERSION_PROCESADOR = "V34.47-Python-ZDA-ONLY"
 
 
 def limpiar_texto(texto) -> str:
@@ -64,432 +62,19 @@ def pct(parte: Optional[float], total: Optional[float]) -> Optional[float]:
     return (parte / total) * 100.0
 
 
-def leer_metadatos(pdf_path: Path, nombre_archivo: Optional[str] = None) -> Dict:
-    datos = {
-        "Archivo_PDF": nombre_archivo or pdf_path.name,
-        "Ciclo": None,
-        "Fecha_Inicio": None,
-        "Hora_Inicio": None,
-        "Jumbo": None,
-        "Numero_Serie": None,
-        "Plan_Perforacion": None,
-        "Metros_Perforados": None,
-        "Barrenos_Realizados": None,
-        "Barrenos_Planificados": None,
-        "Fuente_Barrenos_Realizados": None,
-        "Operario": None,
-    }
-
-    textos_paginas = []
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for pagina in pdf.pages[:4]:
-            textos_paginas.append(
-                pagina.extract_text() or ""
-            )
-
-    # BD-PERFO: OPERADOR = código numérico del campo "Operario"
-    # ubicado en la página física 2 del PDF.
-    if len(textos_paginas) >= 2:
-        texto_pagina_2 = limpiar_texto(textos_paginas[1])
-        m_operario = re.search(
-            r"\bOperario\b\s*:?\s*(\d+)",
-            texto_pagina_2,
-            re.IGNORECASE,
-        )
-        if m_operario:
-            datos["Operario"] = m_operario.group(1)
-
-    texto = "\n".join(textos_paginas)
-    texto_normalizado = re.sub(
-        r"\s+",
-        " ",
-        texto,
-    )
-
-    m = re.search(
-        r"Ciclo\s*:?\s*(\d+)",
-        texto_normalizado,
-        re.IGNORECASE,
-    )
-    if m:
-        datos["Ciclo"] = int(m.group(1))
-
-    m = re.search(
-        r"N[º°o]?\s*de\s*serie\s*:?\s*([A-Za-z0-9-]+)",
-        texto_normalizado,
-        re.IGNORECASE,
-    )
-    if m:
-        serie_base = _normalizar_serie(
-            m.group(1)
-        )
-        datos["Numero_Serie"] = serie_base
-        datos["Jumbo"] = identificar_jumbo(
-            serie_base
-        )
-
-    m = re.search(
-        r"Iniciado\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})\s+(\d{2}:\d{2}:\d{2})",
-        texto_normalizado,
-        re.IGNORECASE,
-    )
-    if m:
-        datos["Fecha_Inicio"] = m.group(1)
-        datos["Hora_Inicio"] = m.group(2)
-
-    m = re.search(
-        r"Plan\s+de\s+perforaci[oó]n\s*:?\s*(.+?)(?=\s+Plan\s+de\s+bulonaje\b|\s+Metros\s+perforados\b|$)",
-        texto_normalizado,
-        re.IGNORECASE,
-    )
-    if m:
-        datos["Plan_Perforacion"] = limpiar_texto(
-            m.group(1)
-        )
-
-    m = re.search(
-        r"Metros\s+perforados\s*\[m\]\s*:?\s*([0-9]+(?:\.[0-9]+)?)",
-        texto_normalizado,
-        re.IGNORECASE,
-    )
-    if m:
-        datos["Metros_Perforados"] = float(
-            m.group(1)
-        )
-
-    # ------------------------------------------------------
-    # Barrenos de perforación en frentes
-    # ------------------------------------------------------
-    # Se toleran saltos de línea y pequeñas variaciones
-    # en la extracción de texto de iSURE.
-    patrones_inicio = [
-        r"Barrenos?\s+de\s+perforaci[oó]n\s+en\s+frentes?",
-        r"Barrenos?\s+de\s+perforaci[oó]n.*?\bfrentes?\b",
-        r"Barrenos?.{0,80}\bfrentes?\b",
-    ]
-
-    bloque = None
-
-    for patron in patrones_inicio:
-        m_inicio = re.search(
-            patron,
-            texto_normalizado,
-            re.IGNORECASE,
-        )
-
-        if m_inicio:
-            bloque = texto_normalizado[
-                m_inicio.start():
-                m_inicio.start() + 800
-            ]
-            break
-
-    if bloque:
-        m_plan = re.search(
-            r"Planificad[oa]\s*:?\s*(\d+)",
-            bloque,
-            re.IGNORECASE,
-        )
-
-        m_real = re.search(
-            r"Realizad[oa]\s*:?\s*(\d+)",
-            bloque,
-            re.IGNORECASE,
-        )
-
-        if m_plan:
-            datos["Barrenos_Planificados"] = int(
-                m_plan.group(1)
-            )
-
-        if m_real:
-            datos["Barrenos_Realizados"] = int(
-                m_real.group(1)
-            )
-            datos[
-                "Fuente_Barrenos_Realizados"
-            ] = (
-                "Reporte iSURE - "
-                "barrenos de perforación en frentes"
-            )
-
-    return datos
-
-def leer_movimiento_brazos(pdf_path: Path) -> Dict:
-    resultado = {
-        "Auto_Brazo1_min": None,
-        "Auto_Brazo2_min": None,
-        "Auto_Total_min": None,
-        "Manual_Brazo1_min": None,
-        "Manual_Brazo2_min": None,
-        "Manual_Total_min": None,
-        "Pct_Movimiento_Automatico": None,
-        "Pct_Movimiento_Manual": None,
-        "Pct_Automatico_Brazo1": None,
-        "Pct_Automatico_Brazo2": None,
-        "Pagina_Movimiento_Brazos": None,
-    }
-
-    patron_auto = re.compile(
-        r"Autom[aá]tico\s*\[h\]\s+(?P<b1>\d+:\d{2})\s+(?P<b2>\d+:\d{2})\s+(?P<suma>\d+:\d{2})(?:\s+(?P<prom>\d+:\d{2}))?",
-        re.IGNORECASE,
-    )
-    patron_manual = re.compile(
-        r"Manual\s*\[h\]\s+(?P<b1>\d+:\d{2})\s+(?P<b2>\d+:\d{2})\s+(?P<suma>\d+:\d{2})(?:\s+(?P<prom>\d+:\d{2}))?",
-        re.IGNORECASE,
-    )
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for numero_pagina, pagina in enumerate(pdf.pages, start=1):
-            texto = pagina.extract_text() or ""
-            if "Tiempo de movimiento del brazo" not in texto:
-                continue
-
-            m_auto = patron_auto.search(texto)
-            m_manual = patron_manual.search(texto)
-            if not (m_auto and m_manual):
-                continue
-
-            auto_b1 = tiempo_a_minutos(m_auto.group("b1"))
-            auto_b2 = tiempo_a_minutos(m_auto.group("b2"))
-            auto_total = tiempo_a_minutos(m_auto.group("suma"))
-            manual_b1 = tiempo_a_minutos(m_manual.group("b1"))
-            manual_b2 = tiempo_a_minutos(m_manual.group("b2"))
-            manual_total = tiempo_a_minutos(m_manual.group("suma"))
-
-            total_mov = auto_total + manual_total if auto_total is not None and manual_total is not None else None
-            total_b1 = auto_b1 + manual_b1 if auto_b1 is not None and manual_b1 is not None else None
-            total_b2 = auto_b2 + manual_b2 if auto_b2 is not None and manual_b2 is not None else None
-
-            resultado.update({
-                "Auto_Brazo1_min": auto_b1,
-                "Auto_Brazo2_min": auto_b2,
-                "Auto_Total_min": auto_total,
-                "Manual_Brazo1_min": manual_b1,
-                "Manual_Brazo2_min": manual_b2,
-                "Manual_Total_min": manual_total,
-                "Pct_Movimiento_Automatico": pct(auto_total, total_mov),
-                "Pct_Movimiento_Manual": pct(manual_total, total_mov),
-                "Pct_Automatico_Brazo1": pct(auto_b1, total_b1),
-                "Pct_Automatico_Brazo2": pct(auto_b2, total_b2),
-                "Pagina_Movimiento_Brazos": numero_pagina,
-            })
-            break
-
-    return resultado
 
 
-def leer_totales_tipos_barreno(pdf_path: Path) -> Tuple[Dict[str, int], int]:
-    totales = {tipo: 0 for tipo in ORDEN_TIPOS}
-    pagina_encontrada = None
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for numero_pagina, pagina in enumerate(pdf.pages, start=1):
-            texto_pagina = pagina.extract_text() or ""
-            if "TIPOS DE BARRENO" not in texto_pagina or "Longitud total en la roca" not in texto_pagina:
-                continue
-
-            pagina_encontrada = numero_pagina
-            tablas = pagina.extract_tables() or []
-
-            for tabla in tablas:
-                for fila in tabla:
-                    celdas = [limpiar_texto(celda) for celda in fila]
-                    primera = next((c for c in celdas if c), "")
-                    if primera not in ORDEN_TIPOS:
-                        continue
-
-                    cantidades = []
-                    for celda in celdas:
-                        m = re.search(r"(\d+)\s+barrenos?", celda, re.IGNORECASE)
-                        if m:
-                            cantidades.append(int(m.group(1)))
-                    if cantidades:
-                        totales[primera] = cantidades[-1]
-            break
-
-    if pagina_encontrada is None:
-        raise ValueError("No se encontró la página real 'TIPOS DE BARRENO'.")
-
-    return totales, pagina_encontrada
 
 
-TIPOS_REGEX = r"Bottom|Easer|Cut|Contour|Casing"
-patron_normal = re.compile(
-    rf"Torque\s+(?P<boom>\d+)\s+(?P<sec>\d+)\s+(?P<x>{NUM})\s+(?P<y>{NUM})\s+(?P<z>{NUM})\s+(?P<alpha>{NUM})\s+(?P<beta>{NUM})\s+(?P<tilt>{NUM})\s+(?P<depth>{NUM})\s+(?P<length>{NUM})\s+(?P<type>{TIPOS_REGEX})\s*$"
-)
-patron_reaming = re.compile(
-    rf"Torque\s+(?:g\s+)?Reamin\s+(?P<boom>\d+)\s+(?P<sec>\d+)\s+(?P<x>{NUM})\s+(?P<y>{NUM})\s+(?P<z>{NUM})\s+(?P<alpha>{NUM})\s+(?P<beta>{NUM})\s+(?P<tilt>{NUM})\s+(?P<depth>{NUM})\s+(?P<length>{NUM})\s+g\s*$"
-)
-patron_continuacion = re.compile(
-    rf"^(?P<boom>\d+)\s+(?P<sec>\d+)\s+(?P<x>{NUM})\s+(?P<y>{NUM})\s+(?P<z>{NUM})\s+(?P<alpha>{NUM})\s+(?P<beta>{NUM})\s+(?P<tilt>{NUM})\s+(?P<depth>{NUM})\s+(?P<length>{NUM})\s+(?P<type>{TIPOS_REGEX}|Reaming)\s*$"
-)
 
 
-def extraer_barrenos(pdf_path: Path, metadatos: Dict) -> Tuple[pd.DataFrame, List[int]]:
-    registros: List[Dict] = []
-    paginas_procesadas: List[int] = []
-    id_pendiente = None
-    tipo_pendiente = None
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for numero_pagina, pagina in enumerate(pdf.pages, start=1):
-            texto_pagina = pagina.extract_text() or ""
-
-            if "BARRENOS DE BULONAJE" in texto_pagina:
-                continue
-            if "ID de" not in texto_pagina or "barreno" not in texto_pagina:
-                continue
-
-            paginas_procesadas.append(numero_pagina)
-            tablas = pagina.extract_tables() or []
-
-            for tabla in tablas:
-                for fila in tabla:
-                    texto = limpiar_texto(" ".join(c for c in fila if c is not None))
-                    if not texto:
-                        continue
-
-                    if re.fullmatch(r"(?:E\d+|\d+)", texto):
-                        id_pendiente = texto
-                        continue
-
-                    m_plan = re.match(
-                        rf"^(?P<id>E\d+|\d+)\s+.*?\s(?P<type>Bottom|Easer|Cut|Contour|Casing|Reamin(?:\s+g)?|Reaming)(?:\s+Torque|\s+-|$)",
-                        texto,
-                        re.IGNORECASE,
-                    )
-                    if m_plan:
-                        id_pendiente = m_plan.group("id")
-                        t = m_plan.group("type")
-                        tipo_pendiente = "Reaming" if t.lower().startswith("reamin") else t.title()
-
-                    match = patron_normal.search(texto)
-                    tipo = None
-                    id_barreno = None
-                    datos = None
-
-                    if match:
-                        datos = match.groupdict()
-                        tipo = datos["type"]
-                        id_barreno = texto.split()[0]
-
-                    if match is None:
-                        match = patron_reaming.search(texto)
-                        if match:
-                            datos = match.groupdict()
-                            tipo = "Reaming"
-                            id_barreno = texto.split()[0]
-
-                    if match is None:
-                        match = patron_continuacion.fullmatch(texto)
-                        if match and id_pendiente:
-                            datos = match.groupdict()
-                            tipo_detectado = datos["type"]
-                            if tipo_detectado.lower().startswith("reamin"):
-                                tipo_detectado = "Reaming"
-                            tipo = tipo_detectado or tipo_pendiente
-                            id_barreno = id_pendiente
-                            id_pendiente = None
-                            tipo_pendiente = None
-
-                    if match is None or datos is None:
-                        continue
-
-                    longitud = float(datos["length"])
-                    beta = float(datos["beta"])
-                    extra = str(id_barreno).upper().startswith("E")
-                    longitud_axial = longitud * math.cos(math.radians(beta))
-
-                    registros.append({
-                        "Archivo_PDF": metadatos["Archivo_PDF"],
-                        "Ciclo": metadatos["Ciclo"],
-                        "Fecha_Inicio": metadatos["Fecha_Inicio"],
-                        "Hora_Inicio": metadatos["Hora_Inicio"],
-                        "Jumbo": metadatos["Jumbo"],
-                        "Numero_Serie": metadatos["Numero_Serie"],
-                        "Plan_Perforacion": metadatos["Plan_Perforacion"],
-                        "ID": str(id_barreno),
-                        "Tipo": tipo,
-                        "Longitud_roca_m": longitud,
-                        "Beta_grados": beta,
-                        "Longitud_axial_m": longitud_axial,
-                        "Extra": extra,
-                        "Pagina_PDF": numero_pagina,
-                    })
-
-    df = pd.DataFrame(registros)
-    if df.empty:
-        return df, paginas_procesadas
-
-    df = df.drop_duplicates(subset=["Archivo_PDF", "ID", "Tipo", "Longitud_roca_m"]).copy()
-    df["Tipo"] = pd.Categorical(df["Tipo"], categories=ORDEN_TIPOS, ordered=True)
-    df = df.sort_values(["Tipo", "ID"]).reset_index(drop=True)
-    return df, paginas_procesadas
 
 
-def construir_validacion(df: pd.DataFrame, esperados: Dict[str, int], metadatos: Dict) -> pd.DataFrame:
-    filas = []
-    for tipo in ORDEN_TIPOS:
-        esperado = int(esperados.get(tipo, 0))
-        encontrado = int((df["Tipo"] == tipo).sum()) if not df.empty else 0
-        filas.append({
-            "Archivo_PDF": metadatos["Archivo_PDF"],
-            "Fecha_Inicio": metadatos["Fecha_Inicio"],
-            "Ciclo": metadatos["Ciclo"],
-            "Jumbo": metadatos["Jumbo"],
-            "Numero_Serie": metadatos["Numero_Serie"],
-            "Tipo": tipo,
-            "Esperado": esperado,
-            "Encontrado": encontrado,
-            "Diferencia": encontrado - esperado,
-            "Estado": "OK" if encontrado == esperado else "REVISAR",
-        })
-    return pd.DataFrame(filas)
 
 
-def construir_resumen_ciclo(df: pd.DataFrame, esperados: Dict[str, int], metadatos: Dict) -> pd.DataFrame:
-    filas = []
-    for tipo in ORDEN_TIPOS:
-        grupo = df[df["Tipo"] == tipo]
-        if grupo.empty:
-            continue
-        esperado = int(esperados.get(tipo, 0))
-        n = len(grupo)
-        filas.append({
-            "Archivo_PDF": metadatos["Archivo_PDF"],
-            "Fecha_Inicio": metadatos["Fecha_Inicio"],
-            "Hora_Inicio": metadatos["Hora_Inicio"],
-            "Ciclo": metadatos["Ciclo"],
-            "Jumbo": metadatos["Jumbo"],
-            "Numero_Serie": metadatos["Numero_Serie"],
-            "Plan_Perforacion": metadatos["Plan_Perforacion"],
-            "Tipo": tipo,
-            "N": n,
-            "Min": grupo["Longitud_roca_m"].min(),
-            "Max": grupo["Longitud_roca_m"].max(),
-            "Promedio": grupo["Longitud_roca_m"].mean(),
-            "Mediana": grupo["Longitud_roca_m"].median(),
-            "Esperado": esperado,
-            "Estado": "OK" if n == esperado else "REVISAR",
-        })
-    return pd.DataFrame(filas)
 
 
-def construir_resumen_reporte(metadatos: Dict, esperados: Dict[str, int], df: pd.DataFrame, pagina_tipos: int, paginas_detalle: List[int], movimiento: Dict) -> Dict:
-    total_esperado = int(sum(esperados.values()))
-    total_encontrado = int(len(df))
-    return {
-        **metadatos,
-        **movimiento,
-        "Pagina_Tipos_Barreno": pagina_tipos,
-        "Paginas_Detalle": ", ".join(map(str, paginas_detalle)),
-        "Total_Tipos_Reporte": total_esperado,
-        "Total_Extraido": total_encontrado,
-        "Diferencia": total_encontrado - total_esperado,
-        "Estado": "OK" if total_encontrado == total_esperado else "REVISAR",
-    }
+
 
 
 
@@ -898,91 +483,11 @@ def generar_grafico(df: pd.DataFrame, metadatos: Dict):
 
 
 
-def extraer_plano_navegacion_png(pdf_path: Path, resolution: int = 170) -> Optional[bytes]:
-    """
-    Extrae de la primera hoja la imagen "Barrenos perforados, Plano de navegación"
-    para mostrarla como miniatura en la cabecera del reporte.
 
-    Se usa un recorte relativo porque la ubicación del plano es bastante
-    consistente en los reportes iSURE revisados.
-    """
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            if not pdf.pages:
-                return None
-
-            page = pdf.pages[0]
-
-            bbox = (
-                page.width * 0.515,
-                page.height * 0.150,
-                page.width * 0.958,
-                page.height * 0.482,
-            )
-
-            recorte = page.crop(bbox)
-            imagen = recorte.to_image(resolution=resolution)
-
-            buffer = BytesIO()
-            imagen.save(buffer, format='PNG')
-            buffer.seek(0)
-            return buffer.getvalue()
-    except Exception:
-        return None
-
-def procesar_pdf(
-    pdf_path: Path,
-    nombre_archivo: Optional[str] = None,
-    generar_visuales: bool = True,
-) -> Dict:
-    metadatos = leer_metadatos(pdf_path, nombre_archivo=nombre_archivo)
-    movimiento = leer_movimiento_brazos(pdf_path)
-    esperados, pagina_tipos = leer_totales_tipos_barreno(pdf_path)
-    df, paginas_detalle = extraer_barrenos(pdf_path, metadatos)
-
-    if df.empty:
-        raise ValueError("No se encontraron barrenos ejecutados en la tabla de detalle.")
-
-    # Fallback para clasificación del disparo:
-    # si el PDF no permite leer claramente el campo
-    # "Barrenos de perforación en frentes - Realizado",
-    # se usa la misma regla validada para ZDA:
-    # Bottom + Easer + Cut + Contour.
-    # Reaming y Casing NO forman parte de Barrenos_Realizados.
-    if metadatos.get("Barrenos_Realizados") is None:
-        tipos_frente = {"Bottom", "Easer", "Cut", "Contour"}
-        metadatos["Barrenos_Realizados"] = int(
-            df["Tipo"].astype(str).isin(tipos_frente).sum()
-        )
-
-        metadatos[
-            "Fuente_Barrenos_Realizados"
-        ] = "Detalle extraído - Bottom/Easer/Cut/Contour"
-
-    validacion = construir_validacion(df, esperados, metadatos)
-    resumen_ciclo = construir_resumen_ciclo(df, esperados, metadatos)
-    resumen_reporte = construir_resumen_reporte(metadatos, esperados, df, pagina_tipos, paginas_detalle, movimiento)
-    extras = df[df["Extra"]].copy()
-    fig = generar_grafico(df, metadatos) if generar_visuales else None
-    plano_nav_png = extraer_plano_navegacion_png(pdf_path) if generar_visuales else None
-
-    return {
-        "metadata": metadatos,
-        "movimiento": movimiento,
-        "esperados": esperados,
-        "detalle": df,
-        "validacion": validacion,
-        "resumen_ciclo": resumen_ciclo,
-        "resumen_reporte": resumen_reporte,
-        "extras": extras,
-        "fig": fig,
-        "plano_nav_png": plano_nav_png,
-        "plano_nav_origen": "PDF",
-    }
 
 
 # ==========================================================
-# EXTENSION V33: SALIDA ESTANDAR + LECTOR ZDA
+# SALIDA ESTÁNDAR + LECTOR ZDA
 # ==========================================================
 
 TIPOS_ZDA = ORDEN_TIPOS
@@ -1009,7 +514,7 @@ def clasificar_tipo_disparo_v33(barrenos_realizados):
 
 
 def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
-    """Normaliza la salida de PDF/ZDA para que app_v33 consuma el mismo esquema."""
+    """Normaliza la salida ZDA al esquema consumido por la aplicación."""
     metadata = dict(resultado.get("metadata") or {})
     movimiento = dict(resultado.get("movimiento") or {})
     resumen_reporte = dict(resultado.get("resumen_reporte") or {})
@@ -1028,7 +533,7 @@ def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
         extras = pd.DataFrame()
 
     metadata["Fuente"] = fuente
-    metadata["Archivo_Fuente"] = metadata.get("Archivo_PDF") or metadata.get("Archivo_ZDA")
+    metadata["Archivo_Fuente"] = metadata.get("Archivo_ZDA")
 
     auto_b1 = movimiento.get("Auto_Brazo1_min")
     auto_b2 = movimiento.get("Auto_Brazo2_min")
@@ -1048,8 +553,6 @@ def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
     tipo = clasificar_tipo_disparo_v33(barrenos)
     conteo_ok = str(resumen_reporte.get("Estado") or "REVISAR") == "OK"
 
-    # La versión PDF histórica no reconcilia metros por tipo. Se conserva N/A
-    # en vez de inventar una validación que el parser no soporta.
     estado_metros = resumen_reporte.get("Estado_Metros_Tipos") or "N/A"
     if estado_metros == "REVISAR":
         lectura_ok = False
@@ -1110,20 +613,6 @@ def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
     return resultado
 
 
-def procesar_pdf_v33(
-    pdf_path: Path,
-    nombre_archivo: Optional[str] = None,
-    generar_visuales: bool = True,
-) -> Dict:
-    """Usa el parser PDF Python existente y normaliza su salida al esquema V33."""
-    return _enriquecer_resultado_estandar(
-        procesar_pdf(
-            pdf_path,
-            nombre_archivo=nombre_archivo,
-            generar_visuales=generar_visuales,
-        ),
-        "PDF",
-    )
 
 
 def _zda_kv(texto: str) -> Dict[str, str]:
@@ -1301,7 +790,7 @@ def _parse_zda_boom(data: bytes, nombre_archivo: str, metadata: Dict) -> Tuple[p
                 "Fuente": "ZDA",
                 "Archivo_Fuente": nombre_archivo,
                 "Archivo_ZDA": nombre_archivo,
-                "Archivo_PDF": None,
+               
                 "Ciclo": metadata.get("Ciclo"),
                 "Fecha_Inicio": metadata.get("Fecha_Inicio"),
                 "Hora_Inicio": metadata.get("Hora_Inicio"),
@@ -1319,7 +808,6 @@ def _parse_zda_boom(data: bytes, nombre_archivo: str, metadata: Dict) -> Tuple[p
                 "Longitud_roca_m": length2,
                 "Longitud_axial_m": length2,
                 "Extra": str(ident).upper().startswith("E"),
-                "Pagina_PDF": None,
                 "Fuente_Parser": "ZDA boom.dat",
                 "Inicio_Barreno_TS": int(start_ts),
                 "Fin_Barreno_TS": int(end_ts),
@@ -1394,7 +882,7 @@ def _zda_validacion(df: pd.DataFrame, metadata: Dict) -> Tuple[pd.DataFrame, pd.
         if n:
             vals = pd.to_numeric(g["Longitud_roca_m"], errors="coerce")
             resumen.append({
-                "Archivo_PDF": None, "Archivo_ZDA": metadata.get("Archivo_ZDA"),
+                "Archivo_ZDA": metadata.get("Archivo_ZDA"),
                 "Archivo_Fuente": metadata.get("Archivo_Fuente"), "Fuente": "ZDA",
                 "Fecha_Inicio": metadata.get("Fecha_Inicio"), "Hora_Inicio": metadata.get("Hora_Inicio"),
                 "Ciclo": metadata.get("Ciclo"), "Jumbo": metadata.get("Jumbo"),
@@ -1579,7 +1067,7 @@ def generar_plano_zda_png(
     ax.set_facecolor("white")
     ax.set_axisbelow(True)
 
-    # Sin numeración visible: estilo más cercano al PDF.
+    # Sin numeración visible: estilo del plano de navegación.
     ax.tick_params(
         axis="both",
         which="both",
@@ -1595,7 +1083,7 @@ def generar_plano_zda_png(
     ax.axhline(0, color="#707070", linewidth=0.75, alpha=0.85, zorder=1)
     ax.axvline(0, color="#707070", linewidth=0.75, alpha=0.85, zorder=1)
 
-    # Flechas del sistema de referencia, parecidas al PDF.
+    # Flechas del sistema de referencia, del plano de navegación.
     ax.annotate(
         "",
         xy=(0.55, 0.0),
@@ -1618,7 +1106,7 @@ def generar_plano_zda_png(
         metadata.get("Plan_Perforacion")
     )
 
-    # Calibración visual contra los planos PDF:
+    # Calibración visual del plano reconstruido:
     # el contorno dibujado queda ligeramente dentro del ancho nominal.
     #
     # 4.5 x 4.5 -> laterales aprox. ±2.15 m
@@ -1639,7 +1127,7 @@ def generar_plano_zda_png(
     right_x = half_width_visual
     base_z = 0.0
 
-    # Calibración visual del borde superior según referencia PDF:
+    # Calibración visual del borde superior:
     # 4.5 x 4.5 -> arriba en el bloque 9, un poco antes de llegar al 10
     # 5.0 x 5.0 -> arriba en el bloque 10, un poco antes de llegar al 11
     if abs(ancho_seccion - 4.5) < 0.06 and abs(alto_seccion - 4.5) < 0.06:
@@ -1653,7 +1141,7 @@ def generar_plano_zda_png(
     # - corner_rx controla hasta dónde llega el borde superior plano.
     # - corner_rz controla la transición vertical de la esquina.
     #
-    # Con esto se ajusta mejor lo que se observa en el PDF:
+    # Con esto se ajusta mejor la geometría de referencia:
     # 4.5 x 4.5 -> borde superior más largo
     # 5.0 x 5.0 -> borde superior también más largo, sin mover laterales.
     if abs(ancho_seccion - 4.5) < 0.06 and abs(alto_seccion - 4.5) < 0.06:
@@ -1749,7 +1237,7 @@ def generar_plano_zda_png(
     ax.set_yticks(yticks)
     ax.grid(True, color="#b8cbe6", linewidth=0.6, alpha=0.9)
 
-    # Corona similar al PDF:
+    # Corona del frente:
     # tramo superior casi plano + esquinas elípticas
     # para controlar mejor hasta dónde llega el borde superior.
     theta_left = np.linspace(np.pi, np.pi / 2.0, 60)
@@ -1827,7 +1315,7 @@ def generar_plano_zda_png(
             zorder=3,
         )
 
-    # Título similar al PDF.
+    # Título del plano.
     ax.set_title(
         "Barrenos perforados, Plano de navegación",
         fontsize=10,
@@ -1887,7 +1375,7 @@ def procesar_zda(
         decl_end = _zda_parse_ts(kv.get("end"))
         cycle_start = nav_ts if nav_ts is not None else decl_start
         metadata = {
-            "Fuente": "ZDA", "Archivo_Fuente": nombre, "Archivo_ZDA": nombre, "Archivo_PDF": None,
+            "Fuente": "ZDA", "Archivo_Fuente": nombre, "Archivo_ZDA": nombre,
             "Ciclo": int(kv["round"]), "Fecha_Inicio": _zda_fmt_date(cycle_start),
             "Hora_Inicio": _zda_fmt_time(cycle_start), "Numero_Serie": serie,
             "Jumbo": identificar_jumbo(serie), "Plan_Perforacion": kv.get("drill_plan") or None,
@@ -1996,24 +1484,11 @@ def procesar_archivo(
     nombre_archivo: Optional[str] = None,
     generar_visuales: bool = True,
 ) -> Dict:
-    """
-    Despachador PDF/ZDA con una única interfaz de salida.
-
-    ``generar_visuales=False`` está pensado para procesamiento masivo:
-    extrae y valida los datos, pero difiere boxplots/planos hasta que
-    realmente se soliciten en la interfaz.
-    """
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return procesar_pdf_v33(
-            path,
-            nombre_archivo=nombre_archivo,
-            generar_visuales=generar_visuales,
-        )
-    if suffix == ".zda":
-        return procesar_zda(
-            path,
-            nombre_archivo=nombre_archivo,
-            generar_visuales=generar_visuales,
-        )
-    raise ValueError("Formato no soportado. Use archivos .PDF o .ZDA.")
+    """Procesa exclusivamente archivos ZDA."""
+    if path.suffix.lower() != ".zda":
+        raise ValueError("Formato no soportado. Use archivos .ZDA.")
+    return procesar_zda(
+        path,
+        nombre_archivo=nombre_archivo,
+        generar_visuales=generar_visuales,
+    )

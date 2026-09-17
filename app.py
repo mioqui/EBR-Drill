@@ -27,7 +27,6 @@ from procesador import (
     clasificar_tipo_disparo_v33,
     generar_grafico,
     generar_plano_zda_png,
-    extraer_plano_navegacion_png,
 )
 
 
@@ -35,17 +34,17 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V35.03-PYTHON-ROP-NUMERO-BARRENOS"
+APP_VERSION_INTERNAL = "V35.08-PYTHON-ZDA-ONLY-CARPETA-OPERADOR"
 PUBLIC_VERSION = "v1.0"
-CACHE_SCHEMA_VERSION = "v34_44_python_masivo_150_zda_20260826"
+CACHE_SCHEMA_VERSION = "v35_07_python_zda_only_20260917"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
 COLORES = qualitative.Plotly
 
 st.set_page_config(page_title=f"EBR Drill Analytics · Piloto {PUBLIC_VERSION}", page_icon="⛏️", layout="wide")
 st.title("EBR Drill Analytics")
-st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de reportes de perforación de equipos Jumbo Sandvik")
+st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de archivos ZDA de equipos Jumbo")
 st.info(
-    "Consolida y analiza información de perforación de reportes PDF y ZDA, mostrando automatización por jumbo y brazo, "
+    "Consolida y analiza información de perforación desde archivos ZDA, mostrando automatización por jumbo y brazo, "
     "longitud perforada en barrenos Cut, tasa de penetración ROP, tiempos de ciclo, clasificación de disparos y exportación de datos a Excel."
 )
 
@@ -75,6 +74,86 @@ st.markdown(
     [data-testid="stDataFrame"] div[role="grid"] { font-size: 0.76rem !important; }
     [data-testid="stExpander"] summary { font-size: 0.88rem !important; font-weight: 600 !important; }
     .stDownloadButton button, .stButton button { min-height: 2.15rem !important; font-size: 0.80rem !important; }
+
+    /* Panel de filtros inspirado en la versión web: solo estética, sin logos. */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(155deg, #194D48 0%, #153F3C 66%, #103936 100%) !important;
+        border-right: 1px solid rgba(255,255,255,.10);
+    }
+    [data-testid="stSidebar"] > div:first-child { background: transparent !important; }
+    [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        padding-top: 1.45rem !important;
+    }
+    [data-testid="stSidebar"] h2 {
+        color: #fff !important;
+        font-size: 1.25rem !important;
+        letter-spacing: -.02em;
+        padding-bottom: .9rem !important;
+        border-bottom: 1px solid rgba(255,255,255,.18);
+        margin-bottom: 1.1rem !important;
+    }
+    [data-testid="stSidebar"] h4,
+    [data-testid="stSidebar"] h5 {
+        color: #D8E7E4 !important;
+        font-size: .78rem !important;
+        font-weight: 800 !important;
+        letter-spacing: .105em !important;
+        text-transform: uppercase;
+        margin-top: .85rem !important;
+        margin-bottom: .55rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] label p {
+        color: #F4F8F7 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+        color: #BDD0CD !important;
+        line-height: 1.5;
+    }
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] {
+        margin: 0 !important;
+        padding: .02rem 0 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] label p {
+        font-size: .88rem !important;
+        font-weight: 500 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] input[type="checkbox"] { accent-color: #95C123 !important; }
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] label[data-checked="true"] > div:first-child,
+    [data-testid="stSidebar"] [data-testid="stCheckbox"] label > span:first-child {
+        accent-color: #95C123 !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="checkbox"] [aria-checked="true"] {
+        background-color: #95C123 !important;
+        border-color: #95C123 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stDateInput"] input {
+        background: #fff !important;
+        color: #203342 !important;
+        border-radius: .7rem !important;
+        font-size: .81rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stDateInput"] > label p {
+        font-size: .74rem !important;
+        color: #DCEAE7 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stDateInput"] [data-baseweb="input"] {
+        border-radius: .7rem !important;
+        background-color: #fff !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255,255,255,.16) !important;
+        margin: 1.15rem 0 !important;
+    }
+    [data-testid="stSidebar"] button[kind="secondary"] {
+        border-color: rgba(255,255,255,.35) !important;
+        color: #fff !important;
+    }
+    @media (min-width: 900px) {
+        [data-testid="stSidebar"] { min-width: 340px !important; max-width: 370px !important; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -151,6 +230,7 @@ def limpiar_analisis():
             "lbl_",
             "desglosar_",
             "detalle_ciclo_",
+            "sidebar_check_",
         )):
             del st.session_state[key]
 
@@ -207,6 +287,11 @@ def _valores_detectados_desde_cache():
             or rep.get("Operador")
             or None
         )
+        # Conservar explícitamente los ciclos sin operador como opción de filtro.
+        if operador is None or str(operador).strip().upper() in (
+            "", "SIN DATO", "NONE", "NAN", "NULL"
+        ):
+            operador = "SIN DATO"
 
         if jumbo and str(jumbo).strip():
             jumbos.append(str(jumbo).strip())
@@ -238,7 +323,10 @@ def _valores_detectados_desde_cache():
     if "SIN DATO" in rocas_presentes:
         rocas.append("SIN DATO")
 
-    operadores = sorted(set(operadores))
+    operadores_presentes = set(operadores)
+    operadores = sorted(o for o in operadores_presentes if o != "SIN DATO")
+    if "SIN DATO" in operadores_presentes:
+        operadores.append("SIN DATO")
 
     return jumbos, tipos, rocas, operadores
 
@@ -291,7 +379,7 @@ with st.sidebar:
     if not jumbos_detectados:
         st.info(
             "Los filtros se habilitarán automáticamente después de procesar "
-            "los primeros archivos PDF/ZDA."
+            "los primeros archivos ZDA."
         )
     else:
         _sincronizar_multiselect_dinamico(
@@ -315,48 +403,32 @@ with st.sidebar:
             "_global_operadores_options_prev",
         )
 
-        global_jumbos = st.multiselect(
-            "Jumbos",
-            jumbos_detectados,
-            key="global_jumbos",
-        )
+        # Igual que la interfaz HTML: opciones visibles sin desplegables.
+        # El estado global_* sigue siendo una lista y mantiene los filtros originales.
+        def _grupo_checks(titulo, clave, opciones):
+            st.divider()
+            st.markdown(f"#### {titulo}")
+            seleccion_previa = set(st.session_state.get(clave, opciones))
+            elegidos = []
+            for opcion in opciones:
+                check_key = ("sidebar_check_" + clave + "_" +
+                             hashlib.md5(str(opcion).encode("utf-8")).hexdigest()[:12])
+                if check_key not in st.session_state:
+                    st.session_state[check_key] = opcion in seleccion_previa
+                # Las opciones descubiertas en una carga nueva quedan activadas
+                # sin sobrescribir selecciones que el usuario haya desmarcado.
+                if st.checkbox(str(opcion), key=check_key):
+                    elegidos.append(opcion)
+            st.session_state[clave] = elegidos
+            return elegidos
 
-        global_tipos = st.multiselect(
-            "Tipo de disparo",
-            tipos_detectados,
-            key="global_tipos",
-        )
-
-        global_rocas = st.multiselect(
-            "Tipo de roca",
-            rocas_detectadas,
-            key="global_rocas",
-        )
-
-        global_operadores = st.multiselect(
-            "Operadores",
-            operadores_detectados,
-            key="global_operadores",
-            help=(
-                "Se muestran únicamente los operadores detectados "
-                "en los archivos ZDA procesados."
-            ),
-        )
-
-        st.caption(
-            "Los equipos se detectan automáticamente a partir de los archivos procesados."
-        )
-        st.caption(
-            "Estos filtros se aplican a los gráficos y resúmenes consolidados."
-        )
-        st.caption(
-            "**Clasificación:** FRENTE > 45 barrenos · SELLADA 25–45 barrenos · "
-            "ESTOCADA Y/O CORRECCIONES < 25 barrenos. Conteo sobre barrenos de frente "
-            "(Bottom + Easer + Cut + Contour); Reaming y Casing no se consideran."
-        )
+        global_jumbos = _grupo_checks("Jumbos", "global_jumbos", jumbos_detectados)
+        global_tipos = _grupo_checks("Tipo de disparo", "global_tipos", tipos_detectados)
+        global_rocas = _grupo_checks("Tipo de roca", "global_rocas", rocas_detectadas)
+        global_operadores = _grupo_checks("Operadores", "global_operadores", operadores_detectados)
 
         st.divider()
-        st.subheader("Opciones de gráficos")
+        st.markdown("#### Opciones de gráficos")
 
         global_lbl_auto = st.checkbox(
             "Etiquetas · movimiento automático",
@@ -383,7 +455,7 @@ with st.sidebar:
             key="opt_lbl_cut",
         )
         global_lbl_zda = st.checkbox(
-            "Etiquetas · tiempos de ciclo",
+            "Etiquetas · primer golpe",
             value=False,
             key="opt_lbl_zda",
         )
@@ -420,7 +492,7 @@ def seccion_desde_plan_texto(plan_perforacion):
 
 def hash_archivo(uploaded_file) -> str:
     # Evita uploaded_file.getvalue(), que crea una copia completa del archivo
-    # en RAM. getbuffer() entrega una vista de memoria sin duplicar el ZDA/PDF.
+    # en RAM. getbuffer() entrega una vista de memoria sin duplicar el ZDA.
     h = hashlib.sha256()
     h.update(uploaded_file.getbuffer())
     h.update(CACHE_SCHEMA_VERSION.encode("utf-8"))
@@ -476,6 +548,38 @@ def preparar_archivos_en_disco(uploaded_files):
         nuevos.append(item)
 
     return nuevos
+
+
+def preparar_carpeta_local(ruta_carpeta: str):
+    """Carga todos los .ZDA de una carpeta LOCAL, sin depender del diálogo
+    del navegador. Se copia al temporal de la sesión para permitir ROP diferido;
+    nunca se elimina el archivo original del usuario.
+    """
+    carpeta = Path(ruta_carpeta.strip().strip('"').strip("'")).expanduser()
+    if not carpeta.is_dir():
+        raise ValueError("La ruta indicada no existe o no es una carpeta accesible en el equipo que ejecuta Python.")
+    archivos = sorted(p for p in carpeta.rglob("*")
+                      if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".zda")
+    if not archivos:
+        raise ValueError("La carpeta no contiene archivos .ZDA (tampoco en sus subcarpetas).")
+    if len(archivos) > 2000:
+        raise ValueError("La carpeta contiene más de 2000 ZDA. Selecciona una subcarpeta para esta carga.")
+    uploads_dir = _session_work_dir() / "uploads"
+    nuevos = []
+    vistos = set(st.session_state.procesados)
+    vistos.update(x.get("clave") for x in st.session_state.staged_queue)
+    for archivo in archivos:
+        clave = hash_archivo_en_disco(archivo)
+        if clave in vistos:
+            continue
+        destino = uploads_dir / f"{uuid.uuid4().hex[:10]}_{re.sub(r'[^A-Za-z0-9._-]+', '_', archivo.name)}"
+        shutil.copyfile(archivo, destino)
+        item = {"clave": clave, "nombre": archivo.name,
+                "path": str(destino), "size": destino.stat().st_size}
+        st.session_state.staged_queue.append(item)
+        nuevos.append(item)
+        vistos.add(clave)
+    return len(archivos), len(nuevos)
 
 
 def fmt(valor, dec=1, sufijo=""):
@@ -711,75 +815,19 @@ def _bd_labor_fields(row):
     return nivel, block, labor
 
 
-def _bd_operator_map(df_reportes):
-    out = {}
-    if df_reportes.empty or "Fuente" not in df_reportes.columns:
-        return out
-
-    pdfs = df_reportes[
-        df_reportes["Fuente"].astype(str).str.upper().eq("PDF")
-    ].copy()
-
-    for _, r in pdfs.iterrows():
-        op = r.get("Operario")
-        if op is None or pd.isna(op) or str(op).strip() == "":
-            continue
-        op = str(op).strip()
-        serie_base = re.sub(
-            r"-(?:\d+|L)$",
-            "",
-            str(r.get("Numero_Serie") or ""),
-            flags=re.IGNORECASE,
-        )
-        keys = [
-            f"{r.get('Jumbo','')}|{r.get('Ciclo','')}",
-            f"{serie_base}|{r.get('Ciclo','')}",
-        ]
-        for key in keys:
-            if key.startswith("|") or key.endswith("|"):
-                continue
-            out.setdefault(key, [])
-            if op not in out[key]:
-                out[key].append(op)
-
-    return {k: " / ".join(v) for k, v in out.items()}
 
 
-def _bd_operador_para_zda(row, op_map):
-    serie_base = re.sub(
-        r"-(?:\d+|L)$",
-        "",
-        str(row.get("Numero_Serie") or ""),
-        flags=re.IGNORECASE,
-    )
-    keys = [
-        f"{row.get('Jumbo','')}|{row.get('Ciclo','')}",
-        f"{serie_base}|{row.get('Ciclo','')}",
-    ]
-    for key in keys:
-        if key in op_map:
-            return op_map[key]
-    return None
 
 
-def _bd_operador_exportado(row, op_map):
-    """
-    Operador para BD-PERFO.
-
-    Prioridad:
-    1) Operador_ZDA leído directamente de round.txt (OP:...)
-    2) Operador normalizado disponible en el registro
-    3) Cruce histórico con PDF por Jumbo/Serie + Ciclo
-    4) Vacío
-    """
+def _bd_operador_exportado(row):
+    """Operador leído directamente desde el ZDA."""
     for campo in ("Operador_ZDA", "Operador"):
         valor = row.get(campo)
         if valor is not None and not pd.isna(valor):
             texto = str(valor).strip()
             if texto:
                 return texto
-
-    return _bd_operador_para_zda(row, op_map)
+    return None
 
 
 def _bd_cut_stats(df_detalle, jumbo, ciclo):
@@ -831,7 +879,6 @@ def construir_bd_perfo(df_reportes, df_detalle):
     if df_reportes.empty or "Fuente" not in df_reportes.columns:
         return pd.DataFrame(columns=BD_PERFO_COLUMNS)
 
-    op_map = _bd_operator_map(df_reportes)
     zda = df_reportes[
         df_reportes["Fuente"].astype(str).str.upper().eq("ZDA")
     ].copy()
@@ -918,7 +965,7 @@ def construir_bd_perfo(df_reportes, df_detalle):
             "FECHA": datetime(dt.year, dt.month, dt.day) if dt else None,
             "TURNO": _bd_turno(dt),
             "JEFE DE TURNO": None,
-            "OPERADOR": _bd_operador_exportado(r, op_map),
+            "OPERADOR": _bd_operador_exportado(r),
             "JUMBO": BD_JUMBO_ALIAS.get(r.get("Jumbo"), r.get("Jumbo")),
             "NIVEL": nivel,
             "BLOCK": block,
@@ -1589,15 +1636,12 @@ def grafico_horas_auto_acumuladas_operador(
     df["_Operador_Agrupado"] = operador_raw
     df.loc[es_sin_registro, "_Operador_Agrupado"] = "Sin registrar"
 
-    # Respetar el filtro lateral de operadores para los operadores conocidos.
-    # "Sin registrar" permanece visible como indicador de control.
+    # "SIN DATO" en el filtro lateral controla también la barra negra.
     if operadores_visibles is not None:
         operadores_sel = {str(x).strip() for x in operadores_visibles}
-        mask = (
-            df["_Operador_Agrupado"].eq("Sin registrar")
-            | df["_Operador_Agrupado"].isin(operadores_sel)
-        )
-        df = df[mask].copy()
+        if "SIN DATO" in operadores_sel:
+            operadores_sel.add("Sin registrar")
+        df = df[df["_Operador_Agrupado"].isin(operadores_sel)].copy()
 
     df["_Auto_min"] = pd.to_numeric(
         df["Auto_Total_Brazos_min"],
@@ -4125,7 +4169,7 @@ def _visual_paths(cache_key):
 
 
 def asegurar_visuales_resultado(r):
-    """Genera boxplot/plano solo cuando el usuario solicita ese ciclo."""
+    """Genera boxplot y plano ZDA solo cuando el usuario solicita ese ciclo."""
     cache_key = r.get("_cache_key") or hashlib.sha1(
         str(r.get("nombre_archivo", "")).encode("utf-8")
     ).hexdigest()
@@ -4134,8 +4178,6 @@ def asegurar_visuales_resultado(r):
     detalle = r.get("detalle")
     rep = r.get("resumen_reporte") or {}
     metadata = r.get("metadata") or rep
-    fuente = str(rep.get("Fuente") or r.get("fuente") or "PDF").upper()
-    source_path = Path(r.get("_source_path") or "")
 
     if not box_path.exists() and isinstance(detalle, pd.DataFrame) and not detalle.empty:
         fig = generar_grafico(detalle, metadata)
@@ -4144,13 +4186,8 @@ def asegurar_visuales_resultado(r):
         del fig
         gc.collect()
 
-    if not nav_path.exists():
-        nav_bytes = None
-        if fuente == "ZDA" and isinstance(detalle, pd.DataFrame) and not detalle.empty:
-            nav_bytes = generar_plano_zda_png(detalle, metadata, resolution=150)
-        elif fuente == "PDF" and source_path.exists():
-            nav_bytes = extraer_plano_navegacion_png(source_path, resolution=150)
-
+    if not nav_path.exists() and isinstance(detalle, pd.DataFrame) and not detalle.empty:
+        nav_bytes = generar_plano_zda_png(detalle, metadata, resolution=150)
         if nav_bytes:
             nav_path.write_bytes(nav_bytes)
             del nav_bytes
@@ -4174,7 +4211,7 @@ def _streamlit_version_tuple():
 
 
 with st.container(border=True):
-    st.subheader("Cargar ciclos (.ZDA / PDF)")
+    st.subheader("Cargar ciclos (.ZDA)")
     st.caption(
         "Puedes agregar archivos individuales o seleccionar una carpeta completa. "
         "Los ciclos ya procesados permanecen cargados y puedes seguir incorporando "
@@ -4187,11 +4224,11 @@ with st.container(border=True):
         with st.popover(
             "📄 Elegir archivos",
             use_container_width=True,
-            help="Selecciona uno o varios archivos PDF/ZDA.",
+            help="Selecciona uno o varios archivos ZDA.",
         ):
             archivos_individuales = st.file_uploader(
-                "Archivos PDF / ZDA",
-                type=["pdf", "zda"],
+                "Archivos ZDA",
+                type=["zda"],
                 accept_multiple_files=True,
                 key=f"uploader_archivos_{st.session_state.uploader_version}",
                 label_visibility="collapsed",
@@ -4206,16 +4243,16 @@ with st.container(border=True):
             with st.popover(
                 "📁 Elegir carpeta",
                 use_container_width=True,
-                help="Carga todos los PDF/ZDA contenidos en una carpeta y sus subcarpetas.",
+                help="Selector de directorio del navegador. Si solo permite seleccionar archivos, usa la opción de ruta local que aparece debajo.",
             ):
                 archivos_carpeta = st.file_uploader(
-                    "Carpeta con archivos PDF / ZDA",
-                    type=["pdf", "zda"],
+                    "Carpeta con archivos ZDA",
+                    type=["zda"],
                     accept_multiple_files="directory",
                     key=f"uploader_carpeta_{st.session_state.uploader_version}",
                     label_visibility="collapsed",
                     help=(
-                        "Selecciona una carpeta. Solo se cargarán archivos PDF/ZDA; "
+                        "Selecciona una carpeta. Solo se cargarán archivos ZDA; "
                         "también se consideran sus subcarpetas."
                     ),
                 )
@@ -4239,6 +4276,31 @@ with st.container(border=True):
                 "archivos temporales y filtros asociados."
             ),
         )
+
+    # Alternativa fiable para uso local: el navegador (sobre todo Safari)
+    # puede abrir una carpeta mostrando su contenido y obligar a seleccionar
+    # archivos. Esta ruta lee la carpeta completa directamente desde Python.
+    with st.expander("📂 Cargar carpeta completa desde esta computadora", expanded=False):
+        st.caption(
+            "Pega la ruta de una carpeta del equipo donde se ejecuta Streamlit. "
+            "Se incluyen sus subcarpetas y solo archivos .ZDA. En Finder (Mac): "
+            "selecciona la carpeta y pulsa ⌥⌘C para copiar su ruta. "
+            "Si Streamlit está publicado en la nube, esta opción NO puede leer carpetas de tu Mac."
+        )
+        ruta_zda_local = st.text_input(
+            "Ruta de la carpeta local", key="ruta_carpeta_zda_local",
+            placeholder="/Users/usuario/Documentos/ZDA",
+        )
+        if st.button("Cargar todos los ZDA de esta carpeta", key="btn_cargar_ruta_zda"):
+            try:
+                total_local, nuevos_local = preparar_carpeta_local(ruta_zda_local)
+                if nuevos_local:
+                    st.session_state.auto_process_staged = True
+                    st.success(f"Detectados {total_local} ZDA; {nuevos_local} nuevos en cola de procesamiento.")
+                else:
+                    st.info(f"Se detectaron {total_local} ZDA; todos estaban cargados anteriormente.")
+            except (ValueError, OSError, PermissionError) as exc:
+                st.error(str(exc))
 
     archivos_individuales = archivos_individuales or []
     archivos_carpeta = archivos_carpeta or []
@@ -4364,7 +4426,7 @@ if not resultados_validos:
 report_rows = [dict(r["resumen_reporte"]) for r in resultados_validos]
 df_reportes = pd.DataFrame(report_rows)
 
-# Fuerza la clasificación V33 para PDF y ZDA con el mismo criterio.
+# Clasificación uniforme para archivos ZDA.
 df_reportes["Tipo_Disparo"] = df_reportes["Barrenos_Realizados"].apply(clasificar_tipo_disparo_v33)
 df_reportes["Tipo_Roca"] = df_reportes["Plan_Perforacion"].apply(tipo_roca_desde_plan_texto)
 
@@ -4373,7 +4435,7 @@ def _operador_filtro_row(r):
         valor = r.get(campo)
         if valor is not None and not pd.isna(valor):
             texto = str(valor).strip()
-            if texto:
+            if texto and texto.upper() not in ("SIN DATO", "NONE", "NAN", "NULL"):
                 return texto
     return "SIN DATO"
 
@@ -4383,12 +4445,7 @@ for r in resultados_validos:
     rr = r["resumen_reporte"]
     rr["Tipo_Disparo"] = clasificar_tipo_disparo_v33(rr.get("Barrenos_Realizados"))
     rr["Tipo_Roca"] = tipo_roca_desde_plan_texto(rr.get("Plan_Perforacion"))
-    rr["Operador_Filtro"] = (
-        rr.get("Operador_ZDA")
-        or rr.get("Operador")
-        or rr.get("Operario")
-        or "SIN DATO"
-    )
+    rr["Operador_Filtro"] = _operador_filtro_row(rr)
     rr["Considerado_KPI_Automatizacion"] = rr["Tipo_Disparo"] == "FRENTE"
 
 # HTML V33 solo agrega Resumen_Ciclos de reportes cuyo conteo está OK.
@@ -4412,8 +4469,8 @@ global_fecha_fin_zda = None
 
 if sidebar_fecha_container is not None:
     with sidebar_fecha_container:
-        st.markdown("##### Rango de fechas")
-        st.caption("Aplica a Uso Automático y Tiempos de Ciclo.")
+        st.markdown("#### Rango de fechas")
+        st.caption("Aplica a Uso Automático y Primer Golpe.")
 
         if (
             not df_zda.empty
@@ -4469,23 +4526,25 @@ if sidebar_fecha_container is not None:
                     fecha_inicio_previa = fecha_min_sidebar
                     fecha_fin_previa = fecha_max_sidebar
 
-                global_fecha_inicio_zda = st.date_input(
-                    "Fecha inicio",
-                    value=fecha_inicio_previa,
-                    min_value=fecha_min_sidebar,
-                    max_value=fecha_max_sidebar,
-                    key="fecha_inicio_zda_global",
-                    format="DD/MM/YYYY",
-                )
-
-                global_fecha_fin_zda = st.date_input(
-                    "Fecha fin",
-                    value=fecha_fin_previa,
-                    min_value=fecha_min_sidebar,
-                    max_value=fecha_max_sidebar,
-                    key="fecha_fin_zda_global",
-                    format="DD/MM/YYYY",
-                )
+                col_fecha_desde, col_fecha_hasta = st.columns(2, gap="small")
+                with col_fecha_desde:
+                    global_fecha_inicio_zda = st.date_input(
+                        "Desde",
+                        value=fecha_inicio_previa,
+                        min_value=fecha_min_sidebar,
+                        max_value=fecha_max_sidebar,
+                        key="fecha_inicio_zda_global",
+                        format="DD/MM/YYYY",
+                    )
+                with col_fecha_hasta:
+                    global_fecha_fin_zda = st.date_input(
+                        "Hasta",
+                        value=fecha_fin_previa,
+                        min_value=fecha_min_sidebar,
+                        max_value=fecha_max_sidebar,
+                        key="fecha_fin_zda_global",
+                        format="DD/MM/YYYY",
+                    )
 
                 st.caption(
                     f"Rango mostrado: "
@@ -4523,8 +4582,6 @@ def preparar_barrenos_por_brazo(
     """
     Cuenta los barrenos realizados por Brazo 1 y Brazo 2 en cada ciclo.
 
-    Si para un mismo Jumbo+Ciclo existen registros PDF y ZDA, se prioriza
-    ZDA para evitar duplicar el mismo round.
     El conteo incluye todos los tipos de barreno disponibles en el detalle.
     """
     if df_detalle.empty:
@@ -4546,25 +4603,6 @@ def preparar_barrenos_por_brazo(
     if "Fecha_Inicio" in det.columns:
         keys.append("Fecha_Inicio")
 
-    # Priorizar ZDA sobre PDF si el mismo ciclo está presente en ambos.
-    if "Fuente" in det.columns:
-        det["_fuente_norm"] = det["Fuente"].fillna("").astype(str).str.upper()
-        zda_keys = set(
-            map(
-                tuple,
-                det.loc[det["_fuente_norm"].eq("ZDA"), keys]
-                .astype(str)
-                .to_numpy(),
-            )
-        )
-
-        if zda_keys:
-            tuples = list(map(tuple, det[keys].astype(str).to_numpy()))
-            keep = [
-                (t not in zda_keys) or (fuente == "ZDA")
-                for t, fuente in zip(tuples, det["_fuente_norm"])
-            ]
-            det = det.loc[keep].copy()
 
     counts = (
         det.groupby(keys + ["Boom"], dropna=False)
@@ -4620,7 +4658,7 @@ def preparar_barrenos_por_brazo(
         ]
         meta = df_reportes[meta_cols].copy()
 
-        # Prioridad ZDA en el metadata si hay PDF y ZDA del mismo ciclo.
+        # Prioridad ZDA en el metadata si hay ZDA del mismo ciclo.
         if "Fuente" in meta.columns:
             meta["_prioridad"] = (
                 meta["Fuente"]
@@ -5891,13 +5929,6 @@ def render_classification_section(
     with col_read:
         st.markdown("#### Resumen de lectura")
 
-        pdf_rows = (
-            filtrados[
-                filtrados["Fuente"].eq("PDF")
-            ]
-            if "Fuente" in filtrados.columns
-            else pd.DataFrame()
-        )
 
         zda_rows_all = (
             filtrados[
@@ -5914,16 +5945,6 @@ def render_classification_section(
             ).eq("OK").sum()
         )
 
-        pdf_ok = (
-            int(
-                pdf_rows.get(
-                    "Lectura_Confiable",
-                    pd.Series(dtype=object),
-                ).eq("OK").sum()
-            )
-            if not pdf_rows.empty
-            else 0
-        )
 
         zda_ok = (
             int(
@@ -5973,28 +5994,11 @@ def render_classification_section(
                 )
             )
 
-        r1, r2, r3, r4, r5 = st.columns(5)
+        r1, r2, r3 = st.columns(3)
 
-        r1.metric(
-            "Archivos",
-            len(filtrados),
-        )
-        r2.metric(
-            "PDF",
-            len(pdf_rows),
-        )
-        r3.metric(
-            "ZDA",
-            len(zda_rows_all),
-        )
-        r4.metric(
-            "Lectura PDF OK",
-            f"{pdf_ok}/{len(pdf_rows)}",
-        )
-        r5.metric(
-            "Lectura ZDA OK",
-            f"{zda_ok}/{len(zda_rows_all)}",
-        )
+        r1.metric("Archivos ZDA", len(filtrados))
+        r2.metric("Lectura ZDA OK", f"{zda_ok}/{len(zda_rows_all)}")
+        r3.metric("Revisar lectura", f"{len(zda_rows_all) - zda_ok}")
 
         s1, s2, s3, s4 = st.columns(4)
 
@@ -6571,6 +6575,96 @@ def render_rop_section(
     r = item_sel["resultado"]
     mwd = r.get("mwd_barrenos").copy()
 
+    # ------------------------------------------------------
+    # Identificador de barreno del plan ZDA
+    # ------------------------------------------------------
+    # El MWD se identifica técnicamente por Brazo + Secuencia.
+    # En el detalle del ZDA (boom.dat), el campo ID corresponde
+    # al número/identificador de barreno reconstruido desde el ZDA.
+    #
+    # Cruce:
+    #   detalle.ID + detalle.Boom + detalle.Secuencia
+    #                      ↕
+    #          MWD.Brazo + MWD.Secuencia
+    detalle_round_rop = r.get("detalle")
+
+    mapa_barreno_id = {}
+
+    if (
+        isinstance(detalle_round_rop, pd.DataFrame)
+        and not detalle_round_rop.empty
+        and {
+            "ID",
+            "Boom",
+            "Secuencia",
+        }.issubset(detalle_round_rop.columns)
+    ):
+        det_map = detalle_round_rop[
+            [
+                "ID",
+                "Boom",
+                "Secuencia",
+            ]
+        ].copy()
+
+        det_map["Boom"] = pd.to_numeric(
+            det_map["Boom"],
+            errors="coerce",
+        )
+        det_map["Secuencia"] = pd.to_numeric(
+            det_map["Secuencia"],
+            errors="coerce",
+        )
+
+        det_map = det_map.dropna(
+            subset=[
+                "Boom",
+                "Secuencia",
+            ]
+        )
+
+        for _, det_row in det_map.iterrows():
+            key_bs = (
+                int(det_row["Boom"]),
+                int(det_row["Secuencia"]),
+            )
+            barreno_id = det_row.get("ID")
+
+            if (
+                barreno_id is not None
+                and not pd.isna(barreno_id)
+                and str(barreno_id).strip()
+            ):
+                mapa_barreno_id[key_bs] = str(
+                    barreno_id
+                ).strip()
+
+    def _barreno_id_mwd(row):
+        brazo = pd.to_numeric(
+            pd.Series([row.get("Brazo")]),
+            errors="coerce",
+        ).iloc[0]
+        secuencia = pd.to_numeric(
+            pd.Series([row.get("Secuencia")]),
+            errors="coerce",
+        ).iloc[0]
+
+        if pd.isna(brazo) or pd.isna(secuencia):
+            return "-"
+
+        return mapa_barreno_id.get(
+            (
+                int(brazo),
+                int(secuencia),
+            ),
+            "-",
+        )
+
+    mwd["Barreno_ID"] = mwd.apply(
+        _barreno_id_mwd,
+        axis=1,
+    )
+
     # Preferir barrenos con profundidad útil.
     if "Profundidad_Max_MWD_m" in mwd.columns:
         mwd["_Prof"] = pd.to_numeric(
@@ -6604,22 +6698,36 @@ def render_rop_section(
 
     def _label_barreno(i):
         row = mwd.loc[i]
+
+        barreno_id = (
+            str(row.get("Barreno_ID", "-")).strip()
+            or "-"
+        )
         brazo = row.get("Brazo", "-")
         seq = row.get("Secuencia", "-")
+
         prof = pd.to_numeric(
             pd.Series(
                 [row.get("Profundidad_Max_MWD_m")]
             ),
             errors="coerce",
         ).iloc[0]
+
         prof_txt = (
             f"{prof:.2f} m"
             if pd.notna(prof)
             else "-"
         )
-        estado = row.get("Estado_MWD", "")
+
+        estado = str(
+            row.get("Estado_MWD", "")
+            or ""
+        ).strip()
+
         return (
-            f"Brazo {brazo} · Secuencia {seq} · "
+            f"Brazo {brazo} · "
+            f"Secuencia {seq} · "
+            f"Barreno {barreno_id} · "
             f"{prof_txt}"
             + (
                 f" · {estado}"
@@ -6637,6 +6745,12 @@ def render_rop_section(
         )
 
     row = mwd.loc[barreno_idx]
+
+    barreno_id_sel = (
+        str(row.get("Barreno_ID", "-")).strip()
+        or "-"
+    )
+
     source_path = Path(
         r.get("_source_path")
         or ""
@@ -6816,15 +6930,19 @@ def render_rop_section(
                 </div>
                 <div>
                     <div class="rop-info-label">Barreno</div>
-                    <div class="rop-info-value">
-                        Brazo {row.get('Brazo','-')} · Secuencia {row.get('Secuencia','-')}
-                    </div>
+                    <div class="rop-info-value">{barreno_id_sel}</div>
                 </div>
                 <div>
                     <div class="rop-info-label">Tipo de roca</div>
                     <div class="rop-info-value">{tipo_roca}</div>
                 </div>
-                <div class="rop-info-wide">
+                <div>
+                    <div class="rop-info-label">Brazo / Secuencia</div>
+                    <div class="rop-info-value">
+                        Brazo {row.get('Brazo','-')} · Secuencia {row.get('Secuencia','-')}
+                    </div>
+                </div>
+                <div>
                     <div class="rop-info-label">Operador</div>
                     <div class="rop-info-value">{operador}</div>
                 </div>
@@ -6864,7 +6982,9 @@ def render_rop_section(
             )
 
     st.caption(
-        "ROP = Rate of Penetration · unidad mostrada: metros por minuto (m/min)."
+        "ROP = Rate of Penetration · unidad mostrada: metros por minuto (m/min). "
+        "Barreno corresponde al ID del plan ZDA; Brazo + Secuencia identifica "
+        "el registro MWD asociado dentro del ZDA."
     )
 
 
@@ -6967,7 +7087,7 @@ def render_resultados_section(resultados_validos):
         fuente = (
             rep.get("Fuente")
             or r.get("fuente")
-            or "PDF"
+            or "ZDA"
         )
         titulo = (
             f"{rep.get('Jumbo','-')} · "
@@ -6997,7 +7117,6 @@ def render_resultados_section(resultados_validos):
                     or "-",
                     help=(
                         rep.get("Fuente_Operador")
-                        or ("PDF · campo Operario" if rep.get("Operario") else None)
                     ),
                 )
                 m3.metric(
@@ -7096,20 +7215,19 @@ def render_resultados_section(resultados_validos):
                 b2m.metric("Barrenos Brazo 2", b2_count)
                 btm.metric("Total por brazos", b1_count + b2_count)
 
-                if fuente == "ZDA":
-                    z1, z2, z3 = st.columns(3)
-                    z1.metric(
-                        "Inicio perforación real",
-                        rep.get("Inicio_Perforacion") or "-",
-                    )
-                    z2.metric(
-                        "Fin perforación real",
-                        rep.get("Fin_Perforacion") or "-",
-                    )
-                    z3.metric(
-                        "Tiempo de perforación",
-                        rep.get("Tiempo_Perforacion_hms") or "-",
-                    )
+                z1, z2, z3 = st.columns(3)
+                z1.metric(
+                    "Inicio perforación real",
+                    rep.get("Inicio_Perforacion") or "-",
+                )
+                z2.metric(
+                    "Fin perforación real",
+                    rep.get("Fin_Perforacion") or "-",
+                )
+                z3.metric(
+                    "Tiempo de perforación",
+                    rep.get("Tiempo_Perforacion_hms") or "-",
+                )
 
             detalle_key = f"detalle_ciclo_{r.get('_cache_key', idx)}"
             mostrar_detalle = st.toggle(
@@ -7126,13 +7244,10 @@ def render_resultados_section(resultados_validos):
 
             with col_nav:
                 if nav_path:
-                    if fuente == "ZDA":
-                        st.caption(
-                            "Plano reconstruido desde ZDA · "
-                            f"sección {seccion_desde_plan_texto(rep.get('Plan_Perforacion'))}"
-                        )
-                    else:
-                        st.caption("Plano de navegación del PDF")
+                    st.caption(
+                        "Plano reconstruido desde ZDA · "
+                        f"sección {seccion_desde_plan_texto(rep.get('Plan_Perforacion'))}"
+                    )
                     st.image(str(nav_path), width="stretch")
                 elif not mostrar_detalle:
                     st.caption("Plano disponible bajo demanda")
@@ -7264,17 +7379,6 @@ def render_resultados_section(resultados_validos):
                     )
 
 
-# Si ningún operador quedó seleccionado/detectado, no bloquear los gráficos.
-if not global_operadores and "Operador_Filtro" in df_reportes.columns:
-    global_operadores = sorted(
-        df_reportes["Operador_Filtro"]
-        .fillna("SIN DATO")
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-
 # ==========================================================
 # PRESENTACIÓN POR SECCIONES
 # ==========================================================
@@ -7301,11 +7405,11 @@ st.caption(
 
 SECCIONES_ANALISIS = [
     "Uso Automático",
-    "Perforación",
-    "Tiempos de Ciclo",
+    "Longitud de Perforación",
+    "Primer Golpe",
     "Clasificación",
-    "ROP",
     "Resultados por archivo",
+    "ROP por barreno",
 ]
 
 if "seccion_analisis_principal" not in st.session_state:
@@ -7326,22 +7430,61 @@ def _cambiar_seccion_analisis(seccion):
 st.markdown(
     """
     <style>
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
-        min-height: 68px;
-        font-size: 1.02rem;
-        font-weight: 700;
+    .secciones-tabs-wrap {
+        margin-top: 0.35rem;
+        margin-bottom: 0.85rem;
+        padding: 0.18rem;
+        background: #f8fbff;
+        border: 1px solid #dbe7f5;
         border-radius: 14px;
-        border: 1.5px solid #d1d5db;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
+        width: 100%;
+        min-height: 68px;
+        font-size: 1.00rem;
+        font-weight: 600;
         white-space: normal;
-        line-height: 1.15;
-        padding: 0.70rem 0.75rem;
+        line-height: 1.12;
+        padding: 0.80rem 0.80rem;
+        border-radius: 10px;
+        box-shadow: none !important;
+        transition: all 0.15s ease;
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="secondary"] {
+        background: #ffffff !important;
+        color: #334155 !important;
+        border: 1px solid #e2e8f0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="secondary"]:hover {
+        background: #f8fafc !important;
+        color: #0f172a !important;
+        border: 1px solid #cbd5e1 !important;
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="primary"] {
+        background: #eaf3ff !important;
+        color: #1663d6 !important;
+        border: 1px solid #cfe0fb !important;
+        box-shadow: inset 0 -4px 0 #2f7ef7 !important;
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="primary"]:hover {
+        background: #e6f0ff !important;
+        color: #1257c1 !important;
+        border: 1px solid #bfd5fb !important;
+    }
+    @media (max-width: 1100px) {
+        div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
+            min-height: 62px;
+            font-size: 0.96rem;
+            padding: 0.65rem 0.55rem;
+        }
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown('<div class="secciones-tabs-wrap">', unsafe_allow_html=True)
 cols_sec = st.columns(len(SECCIONES_ANALISIS))
 for i, seccion in enumerate(SECCIONES_ANALISIS):
     activa = st.session_state.get("seccion_analisis_principal") == seccion
@@ -7354,6 +7497,7 @@ for i, seccion in enumerate(SECCIONES_ANALISIS):
         on_click=_cambiar_seccion_analisis,
         args=(seccion,),
     )
+st.markdown('</div>', unsafe_allow_html=True)
 
 seccion_activa = st.session_state.get(
     "seccion_analisis_principal",
@@ -7369,10 +7513,10 @@ st.markdown(
         const txt = (btn.innerText || "").trim();
         if (
           txt.includes("Uso Automático") ||
-          txt.includes("Perforación") ||
-          txt.includes("Tiempos de Ciclo") ||
+          txt.includes("Longitud de Perforación") ||
+          txt.includes("Primer Golpe") ||
           txt.includes("Clasificación") ||
-          txt === "ROP" ||
+          txt.includes("ROP por barreno") ||
           txt.includes("Resultados por archivo")
         ) {
           btn.classList.add("seccion-nav");
@@ -7399,7 +7543,7 @@ if seccion_activa == "Uso Automático":
             global_lbl_arm,
         )
 
-elif seccion_activa == "Perforación":
+elif seccion_activa == "Longitud de Perforación":
     with st.container(border=True):
         render_cut_section(
             df_resumen,
@@ -7411,7 +7555,7 @@ elif seccion_activa == "Perforación":
             global_lbl_cut,
         )
 
-elif seccion_activa == "Tiempos de Ciclo":
+elif seccion_activa == "Primer Golpe":
     with st.container(border=True):
         render_zda_section(
             df_zda,
@@ -7435,7 +7579,7 @@ elif seccion_activa == "Clasificación":
             global_operadores,
         )
 
-elif seccion_activa == "ROP":
+elif seccion_activa == "ROP por barreno":
     with st.container(border=True):
         render_rop_section(
             resultados_validos,
