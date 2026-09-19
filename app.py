@@ -23,6 +23,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
 from reporte_perforacion import generar_reporte_pdf
+import asignaciones_operador as asig
 
 from procesador import (
     procesar_archivo,
@@ -33,6 +34,7 @@ from procesador import (
     volumen_unico_ciclo,
     resumenes_eficiencia_lote,
     VERSION as PROCESADOR_EFICIENCIA_VERSION,
+    CATALOGO_OPERADORES_ZDA,
 )
 
 
@@ -281,6 +283,18 @@ def tipo_roca_desde_plan_texto(plan_perforacion):
 # FILTROS Y PARÁMETROS GLOBALES
 # ==========================================================
 
+def _asignaciones_operador() -> dict:
+    """Asignaciones manuales de operador. Se leen del disco una vez por sesión."""
+    if "_asig_operadores" not in st.session_state:
+        st.session_state["_asig_operadores"] = asig.cargar()
+    return st.session_state["_asig_operadores"]
+
+
+def _guardar_asignaciones_operador() -> None:
+    """Persiste las asignaciones y recuerda la ruta realmente usada."""
+    st.session_state["_asig_ruta"] = str(asig.guardar(_asignaciones_operador()))
+
+
 def _valores_detectados_desde_cache():
     """
     Obtiene jumbos, tipos de disparo y tipos de roca desde los
@@ -377,6 +391,10 @@ def _sincronizar_multiselect_dinamico(key, options, previous_options_key):
 
     st.session_state[previous_options_key] = options.copy()
 
+
+# Las asignaciones manuales se aplican ANTES de detectar filtros: así el panel lateral, los
+# gráficos, el Excel y "Resultados por archivo" ven el operador ya asignado.
+asig.aplicar_a_resultados(st.session_state.procesados.values(), _asignaciones_operador())
 
 jumbos_detectados, tipos_detectados, rocas_detectadas, operadores_detectados = _valores_detectados_desde_cache()
 
@@ -4832,6 +4850,10 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
         else:
             sin_operador = total_ciclos
 
+    n_manuales = (
+        int(base["Operador_Asignado_Manual"].fillna(False).astype(bool).sum())
+        if "Operador_Asignado_Manual" in base.columns else 0
+    )
     pct_sin_operador = (
         sin_operador / total_ciclos * 100
         if total_ciclos > 0
@@ -4925,7 +4947,7 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
         (
             "Sin operador registrado",
             f"{sin_operador}",
-            f"{pct_sin_operador:.0f}% de los ciclos",
+            f"{pct_sin_operador:.0f}% de los ciclos" + (f" · {n_manuales} {'asignado' if n_manuales == 1 else 'asignados'} a mano" if n_manuales else ""),
         ),
     ]
 
@@ -4939,6 +4961,235 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
         for label, value, sub in cards
     )
     st.markdown(f'<div class="ebr-kpi-grid">{tarjetas_html}</div>', unsafe_allow_html=True)
+
+    # Acceso directo al módulo donde se asigna el operador a los ciclos que no lo traen.
+    # El módulo lista TODOS los ciclos cargados (sin el filtro de fechas), por eso el botón
+    # cuenta los pendientes totales y no solo los del rango de la tarjeta.
+    pendientes_total = int(
+        df_auto["Operador_Filtro"].map(asig.es_sin_operador).sum()
+        if "Operador_Filtro" in df_auto.columns else sin_operador
+    )
+    if pendientes_total > 0:
+        col_boton = st.columns(4)[3]
+        if col_boton.button(
+            f"Asignar operadores ({pendientes_total} {'pendiente' if pendientes_total == 1 else 'pendientes'}) →", key="kpi_ir_asignar_operadores",
+            width="stretch", help="Abre el módulo para escribir el operador de los ciclos sin registro "
+                                  "(todos los ciclos cargados, sin el filtro de fechas).",
+        ):
+            st.session_state["seccion_analisis_principal"] = "Asignar operadores"
+            st.rerun(scope="app")
+
+
+# ==========================================================
+# ASIGNAR OPERADORES (ciclos cuyo ZDA no trae el operador)
+# ==========================================================
+
+def _tabla_operadores(df_reportes: pd.DataFrame) -> pd.DataFrame:
+    """Un renglón por ciclo con el operador vigente, su origen (ZDA / Manual / Pendiente),
+    una sugerencia y la clave que identifica el ciclo."""
+    base = asegurar_fechahora(df_reportes.copy()).reset_index(drop=True)
+    if base.empty:
+        return base
+    efectivo = base["Operador_Filtro"].map(
+        lambda v: None if asig.es_sin_operador(v) else str(v).strip()
+    )
+    manual = (
+        base["Operador_Asignado_Manual"].fillna(False).astype(bool)
+        if "Operador_Asignado_Manual" in base.columns else pd.Series(False, index=base.index)
+    )
+    base["_operador"] = efectivo
+    base["_origen"] = np.where(manual, "Manual", np.where(efectivo.notna(), "ZDA", "Pendiente"))
+    base["_sugerencia"] = asig.sugerir(base.assign(operador=efectivo), col_operador="operador")
+    base["_clave"] = [asig.clave_ciclo(r) for r in base.to_dict("records")]
+    return base
+
+
+def _aplicar_cambios_operador(cambios: dict, filas: dict) -> int:
+    """Aplica {clave: operador | None} a las asignaciones y guarda. Devuelve cuántas cambiaron."""
+    data = _asignaciones_operador()
+    n = 0
+    for clave, nombre in cambios.items():
+        rep = filas.get(clave)
+        if rep is None:
+            continue
+        n += bool(asig.quitar(data, clave) if nombre is None else asig.poner(data, rep, nombre))
+    if n:
+        _guardar_asignaciones_operador()
+    return n
+
+
+def _terminar_cambios_operador(n: int) -> None:
+    """Mensaje, reinicio del editor y recarga completa para que todo el app vea el cambio."""
+    st.session_state["_msg_operadores"] = (
+        f"Se guardaron {n} asignación(es). Ya se reflejan en filtros, gráficos y Excel."
+        if n else "No había cambios que guardar."
+    )
+    st.session_state["_op_editor_version"] = st.session_state.get("_op_editor_version", 0) + 1
+    st.rerun(scope="app")
+
+
+@fragment
+def render_asignar_operadores_section(df_reportes: pd.DataFrame):
+    st.subheader("Asignar operadores")
+    st.caption(
+        "El ZDA guarda el operador como texto libre (campo tunnel_id). Cuando el equipo no lo "
+        "trae, el ciclo queda \"SIN DATO\". Aquí puedes asignarlo a mano: se guarda en este equipo "
+        "y se aplica a filtros, gráficos, Excel y Resultados por archivo, sin modificar los ZDA."
+    )
+    if df_reportes is None or df_reportes.empty:
+        st.info("No hay ciclos cargados.")
+        return
+
+    base = _tabla_operadores(df_reportes)
+    if base.empty:
+        st.info("Ningún ciclo tiene fecha de inicio válida.")
+        return
+    data = _asignaciones_operador()
+
+    aviso = st.session_state.pop("_msg_operadores", None)
+    if aviso:
+        st.success(aviso)
+
+    n_pend = int((base["_origen"] == "Pendiente").sum())
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Ciclos cargados", len(base))
+    m2.metric("Operador del ZDA", int((base["_origen"] == "ZDA").sum()))
+    m3.metric("Asignados a mano", int((base["_origen"] == "Manual").sum()))
+    m4.metric("Pendientes", n_pend)
+    if n_pend == 0:
+        st.success("Todos los ciclos tienen operador.")
+
+    # ---- Filtros ----------------------------------------------------------------------
+    f1, f2, f3 = st.columns([2, 3.2, 2.4], vertical_alignment="bottom")
+    jumbos = sorted(base["Jumbo"].dropna().astype(str).unique())
+    sel_jumbos = f1.multiselect("Jumbo", jumbos, default=jumbos, key="op_filtro_jumbo")
+    estado = f2.radio(
+        "Mostrar", ["Pendientes", "Asignados a mano", "Todos"],
+        index=0, horizontal=True, key="op_filtro_estado",
+    )
+    marcar_todas = f3.toggle("Marcar todas las filas visibles", key="op_marcar_todas")
+
+    mask = base["Jumbo"].astype(str).isin(sel_jumbos)
+    if estado == "Pendientes":
+        mask &= base["_origen"].eq("Pendiente")
+    elif estado == "Asignados a mano":
+        mask &= base["_origen"].eq("Manual")
+    visibles = base[mask].reset_index(drop=True)
+
+    conocidos = asig.lista_operadores(
+        data,
+        extras=list(CATALOGO_OPERADORES_ZDA.values()) + [o for o in base["_operador"].dropna().unique()],
+    )
+    filas = {
+        r["_clave"]: {k: r.get(k) for k in ("Jumbo", "Ciclo", "Fecha_Inicio", "Hora_Inicio")}
+        for r in base.to_dict("records")
+    }
+
+    # ---- Tabla editable ---------------------------------------------------------------
+    if visibles.empty:
+        if not (estado == "Pendientes" and n_pend == 0):      # si no hay pendientes, ya se avisó arriba
+            st.info("No hay ciclos con estos filtros.")
+        vista = editado = None
+    else:
+        st.caption(
+            "Elige el operador en la columna **Operador** (o marca varias filas y usa "
+            "\"Asignar a varias filas\" más abajo). **Texto del ZDA** es lo que el operador "
+            "escribió en el equipo: úsalo como pista. **Sugerencia** es el operador del ciclo más "
+            "cercano (hasta 6 h) del mismo jumbo; solo se aplica si tú lo confirmas."
+        )
+        vista = pd.DataFrame({
+            "Sel": bool(marcar_todas),
+            "Jumbo": visibles["Jumbo"].astype(str),
+            "Ciclo": visibles["Ciclo"],
+            "Fecha": visibles["Fecha_Inicio"],
+            "Hora": visibles["Hora_Inicio"],
+            "Barrenos": visibles["Barrenos_Realizados"] if "Barrenos_Realizados" in visibles.columns else None,
+            "Texto del ZDA": (visibles["Operador_ZDA_Raw"].fillna("") if "Operador_ZDA_Raw" in visibles.columns else ""),
+            "Origen": visibles["_origen"],
+            "Sugerencia": visibles["_sugerencia"],
+            "Operador": visibles["_operador"],
+            "clave": visibles["_clave"],
+        })
+        version = st.session_state.get("_op_editor_version", 0)
+        editado = st.data_editor(
+            vista,
+            key=f"op_editor_{version}_{int(marcar_todas)}_{estado}_{'-'.join(sel_jumbos)}",
+            hide_index=True, width="stretch", num_rows="fixed",
+            height=int(min(38 * (len(vista) + 1) + 3, 560)),
+            disabled=[c for c in vista.columns if c not in ("Sel", "Operador")],
+            column_config={
+                "Sel": st.column_config.CheckboxColumn("Sel.", width="small"),
+                "Ciclo": st.column_config.NumberColumn("Ciclo", format="%d", width="small"),
+                "Barrenos": st.column_config.NumberColumn("Barrenos", format="%d", width="small"),
+                "Operador": st.column_config.SelectboxColumn(
+                    "Operador", options=conocidos, required=False, width="medium",
+                    help="Elige un operador de la lista. Vacío = sin operador.",
+                ),
+                "clave": None,
+            },
+        )
+        if st.button("Guardar asignaciones", type="primary", key="op_guardar"):
+            cambios = asig.cambios_desde_editor(vista, editado)
+            _terminar_cambios_operador(_aplicar_cambios_operador(cambios, filas))
+
+        with st.expander("Asignar a varias filas (marca las filas en la columna Sel.)"):
+            marcadas = editado.loc[editado["Sel"].fillna(False).astype(bool)]
+            st.caption(f"{len(marcadas)} fila(s) marcada(s). Las ediciones sueltas de la tabla también se guardan.")
+            nombre_bulk = st.selectbox(
+                "Operador para las filas marcadas", conocidos, index=None,
+                placeholder="Elegir operador…", key="op_bulk_nombre",
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("Aplicar a las filas marcadas", key="op_bulk_aplicar", disabled=nombre_bulk is None or marcadas.empty):
+                cambios = asig.cambios_desde_editor(vista, editado)
+                cambios.update({c: nombre_bulk for c in marcadas["clave"]})
+                _terminar_cambios_operador(_aplicar_cambios_operador(cambios, filas))
+            con_sug = marcadas[marcadas["Sugerencia"].astype(str).str.strip().ne("")]
+            if c2.button(
+                f"Aplicar la sugerencia a las marcadas ({len(con_sug)})", key="op_bulk_sugerencia",
+                disabled=con_sug.empty,
+            ):
+                cambios = asig.cambios_desde_editor(vista, editado)
+                cambios.update(dict(zip(con_sug["clave"], con_sug["Sugerencia"])))
+                _terminar_cambios_operador(_aplicar_cambios_operador(cambios, filas))
+
+    # ---- Lista de operadores ---------------------------------------------------------
+    with st.expander("Lista de operadores"):
+        st.caption("Disponibles para elegir: " + ", ".join(conocidos))
+        with st.form("op_form_nuevo", clear_on_submit=True):
+            nuevo = st.text_input("Agregar un operador nuevo a la lista", placeholder="Nombre y apellido")
+            if st.form_submit_button("Agregar"):
+                if not asig.normalizar_nombre(nuevo):
+                    st.warning("Escribe un nombre.")
+                elif asig.agregar_operador(data, nuevo):
+                    _guardar_asignaciones_operador()
+                    st.rerun(scope="fragment")
+                else:
+                    st.warning("Ese nombre ya está en la lista.")
+
+    # ---- Copia de seguridad ----------------------------------------------------------
+    with st.expander("Copia de seguridad y compartir"):
+        ruta = st.session_state.get("_asig_ruta") or str(asig.ruta_asignaciones())
+        st.caption(
+            f"Las asignaciones se guardan en: `{ruta}`. Si publicas la app en la nube ese archivo "
+            "puede borrarse al reiniciar: descarga una copia y reimpórtala cuando la necesites."
+        )
+        st.download_button(
+            "Descargar asignaciones (CSV)", data=asig.a_csv(data),
+            file_name="operadores_asignados.csv", mime="text/csv",
+            disabled=not data.get("asignaciones"), key="op_descargar",
+        )
+        subido = st.file_uploader("Importar asignaciones (CSV)", type=["csv"], key="op_importar_archivo")
+        if subido is not None and st.button("Importar", key="op_importar_boton"):
+            n_ok, avisos = asig.importar_csv(data, subido.getvalue())
+            if n_ok:
+                _guardar_asignaciones_operador()
+            for texto in avisos[:5]:
+                st.warning(texto)
+            if n_ok:
+                _terminar_cambios_operador(n_ok)
+            elif not avisos:
+                st.info("El archivo no tenía filas para importar.")
 
 
 # ==========================================================
@@ -7721,6 +7972,13 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         "mediante la reconstrucción de secciones transversales y modelos volumétricos, "
         "cuantificando las desviaciones respecto al diseño mediante integración numérica."
     )
+    st.markdown(
+        "- **DGT (Desviación Geométrica Total):** (volumen fuera del programado + volumen no cubierto) "
+        "÷ volumen programado × 100. Compara geometrías de perforación; no mide la sobrerotura después "
+        "de la voladura. Su detalle está en el cuadro resumen, en **Diferencias espaciales (m³)**.\n"
+        "- **Variación de volumen:** (volumen ejecutado − volumen programado) ÷ volumen programado × 100. "
+        "Se calcula más abajo integrando las secciones y aparece en el cuadro resumen, en **Volumen integrado (m³)**."
+    )
     st.caption(
         "Estas desviaciones podrían contribuir a la sobrerotura o subexcavación; "
         "los resultados no constituyen una medición directa del perfil excavado después de la voladura."
@@ -7792,35 +8050,41 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         st.info("No hay ciclos ZDA que cumplan los filtros seleccionados.")
         return
 
-    st.markdown("**Ciclo a analizar**")
-    # Resaltar únicamente el selector de ciclos.
-    st.markdown("""
-    <style>
-    .st-key-eficiencia_selector_destacado {
-        background: #E6F4EC;
-        border: 1px solid #008F49;
-        border-left: 5px solid #008F49;
-        border-radius: 10px;
-        padding: 12px 16px 14px;
-        margin: 8px 0 16px;
-    }
-    .st-key-eficiencia_selector_destacado [data-testid="stSelectbox"] label p {
-        color: #125B37;
-        font-weight: 700;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown(
-        _css_selectbox_marca(".st-key-eficiencia_selector_destacado"),
-        unsafe_allow_html=True,
-    )
-    orden = st.radio(
-        "Ordenar ciclos por",
-        ["Mayor desviación geométrica total", "Mayor fuera del programado",
-         "Mayor no cubierto", "Fecha / ciclo"],
-        index=0,
-        key="eficiencia_orden_ciclos_dgt",
-    )
+    # Encabezado del selector. Los <style> son elementos vacíos que Streamlit separa con su hueco
+    # de 16 px: se ocultan solo aquí (:has) para que "Ciclo a analizar" y "Ordenar ciclos por"
+    # queden juntos.
+    with st.container(key="eficiencia_cabecera"):
+        st.markdown("**Ciclo a analizar**")
+        # Resaltar únicamente el selector de ciclos.
+        st.markdown("""
+        <style>
+        .st-key-eficiencia_cabecera [data-testid="stElementContainer"]:has(style) { display: none; }
+        .st-key-eficiencia_cabecera { gap: 0.5rem; }
+        .st-key-eficiencia_selector_destacado {
+            background: #E6F4EC;
+            border: 1px solid #008F49;
+            border-left: 5px solid #008F49;
+            border-radius: 10px;
+            padding: 12px 16px 14px;
+            margin: 8px 0 16px;
+        }
+        .st-key-eficiencia_selector_destacado [data-testid="stSelectbox"] label p {
+            color: #125B37;
+            font-weight: 700;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown(
+            _css_selectbox_marca(".st-key-eficiencia_selector_destacado"),
+            unsafe_allow_html=True,
+        )
+        orden = st.radio(
+            "Ordenar ciclos por",
+            ["Mayor desviación geométrica total", "Mayor fuera del programado",
+             "Mayor no cubierto", "Fecha / ciclo"],
+            index=0,
+            key="eficiencia_orden_ciclos_dgt",
+        )
     def clave_fecha(item):
         try:
             fecha = datetime.strptime(item["fecha"], "%d/%m/%Y")
@@ -7857,8 +8121,6 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
             format_func=lambda identificador: por_id[identificador]["etiqueta"],
             key="eficiencia_ciclo_id",
         )
-    st.caption("DGT = (volumen fuera del plan + volumen no cubierto) / volumen programado × 100. "
-               "La DGT compara geometrías de perforación; no mide la sobrerotura después de la voladura.")
     rsel = por_id[seleccion_id]["resultado"]
     path = Path(rsel["_source_path"])
 
@@ -7929,6 +8191,20 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         st.error("Volumetría única no disponible: faltan secciones válidas o falla la identidad "
                  "volumen ejecutado − programado = fuera − no cubierto. "
                  "No se mostrarán volúmenes obtenidos con otro método.")
+
+    # --------------------------------------------------------------
+    # Datos del ciclo seleccionado
+    # --------------------------------------------------------------
+    rep_sel = rsel.get("resumen_reporte") or {}
+    operador_sel = rep_sel.get("Operador_ZDA") or rep_sel.get("Operador") or rep_sel.get("Operario")
+    seccion_sel = seccion_desde_plan_texto(rep_sel.get("Plan_Perforacion") or meta.get("drill_plan")).replace(" ", "")
+    datos_ciclo = [
+        ("Fecha", rep_sel.get("Fecha_Inicio") or meta.get("Fecha_Inicio")),
+        ("Equipo", rep_sel.get("Jumbo") or meta.get("Jumbo")),
+        ("Operador", operador_sel if not asig.es_sin_operador(operador_sel) else "Sin registrar"),
+        ("Sección", seccion_sel if seccion_sel not in ("", "-") else None),     # solo si existe
+    ]
+    st.markdown(" | ".join(f"**{k}:** {v}" for k, v in datos_ciclo if v))
 
     # --------------------------------------------------------------
     # Tarjetas
@@ -8043,8 +8319,7 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
                     st.plotly_chart(mesh_fig, width="stretch", key=f"mascara_{mask_key}_{meta.get('round', 'x')}")
                     st.caption(
                         f"{entry.get('n_barrenos', len(coords))} barrenos · "
-                        f"{len(coords)} posiciones de collar únicas · "
-                        f"{len(entry.get('triangles', []))} triángulos. "
+                        f"{len(coords)} posiciones de collar únicas. "
                         "IDs superpuestos visibles juntos al pasar el cursor."
                     )
                     if entry.get("warning"):
@@ -8098,6 +8373,7 @@ SECCIONES_ANALISIS = [
     "Clasificación",
     "Resultados por archivo",
     "ROP por barreno",
+    "Asignar operadores",
 ]
 
 if "seccion_analisis_principal" not in st.session_state:
@@ -8223,6 +8499,10 @@ elif seccion_activa == "ROP por barreno":
             global_rocas,
             global_operadores,
         )
+
+elif seccion_activa == "Asignar operadores":
+    with st.container(border=True):
+        render_asignar_operadores_section(df_reportes)
 
 elif seccion_activa == "Resultados por archivo":
     with st.container(border=True):
