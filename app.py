@@ -22,12 +22,17 @@ from plotly.colors import qualitative
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
+from reporte_perforacion import generar_reporte_pdf
+
 from procesador import (
     procesar_archivo,
     clasificar_tipo_disparo_v33,
     generar_grafico,
     generar_plano_zda_png,
     process_zda_bytes as procesar_eficiencia_zda,
+    volumen_unico_ciclo,
+    resumenes_eficiencia_lote,
+    VERSION as PROCESADOR_EFICIENCIA_VERSION,
 )
 
 
@@ -35,9 +40,9 @@ from procesador import (
 # CONFIGURACIÓN
 # ==========================================================
 
-APP_VERSION_INTERNAL = "V35.18-ZDA-CONTORNOS-GRUPOS"
+APP_VERSION_INTERNAL = "V35.22-ORDEN-BALANCE"
 PUBLIC_VERSION = "v1.0"
-CACHE_SCHEMA_VERSION = "v35_17_contornos_real_programado_20260917"
+CACHE_SCHEMA_VERSION = "v35_22_orden_balance_20260917"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
 COLORES = qualitative.Plotly
 
@@ -366,11 +371,6 @@ global_jumbos = []
 global_tipos = []
 global_rocas = []
 global_operadores = []
-global_lbl_auto = False
-global_line_auto = False
-global_lbl_arm = False
-global_lbl_cut = False
-global_lbl_zda = False
 sidebar_fecha_container = None
 
 with st.sidebar:
@@ -448,37 +448,8 @@ with st.sidebar:
         global_operadores = _grupo_checks("Operadores", "global_operadores", operadores_detectados)
 
         st.divider()
-        st.markdown("#### Opciones de gráficos")
-
-        global_lbl_auto = st.checkbox(
-            "Etiquetas · movimiento automático",
-            value=False,
-            key="opt_lbl_auto",
-        )
-        global_line_auto = st.checkbox(
-            "Línea curva · movimiento automático",
-            value=True,
-            key="opt_line_auto",
-            help=(
-                "Desmarcado: muestra solo los puntos. "
-                "Marcado: agrega una curva suavizada que conecta los ciclos sin modificar los valores reales de los puntos."
-            ),
-        )
-        global_lbl_arm = st.checkbox(
-            "Etiquetas · uso por brazo",
-            value=False,
-            key="opt_lbl_arm",
-        )
-        global_lbl_cut = st.checkbox(
-            "Etiquetas · barrenos Cut",
-            value=False,
-            key="opt_lbl_cut",
-        )
-        global_lbl_zda = st.checkbox(
-            "Etiquetas · primer golpe",
-            value=False,
-            key="opt_lbl_zda",
-        )
+        # Las opciones de etiquetas, tipo de gráfico y línea curva ahora están sobre
+        # cada gráfico (ver `_controles_grafico`).
 
         st.caption(
             "Los filtros no eliminan datos del Excel exportado; la exportación conserva "
@@ -508,17 +479,6 @@ def seccion_desde_plan_texto(plan_perforacion):
     return f"{a:.1f} x {b:.1f}"
 
 
-
-
-def hash_archivo(uploaded_file) -> str:
-    # Evita uploaded_file.getvalue(), que crea una copia completa del archivo
-    # en RAM. getbuffer() entrega una vista de memoria sin duplicar el ZDA.
-    h = hashlib.sha256()
-    h.update(uploaded_file.getbuffer())
-    h.update(CACHE_SCHEMA_VERSION.encode("utf-8"))
-    return h.hexdigest()
-
-
 def hash_archivo_en_disco(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -540,7 +500,6 @@ def preparar_archivos_en_disco(uploaded_files):
     nuevos = []
 
     for n, archivo in enumerate(uploaded_files, start=1):
-        suffix = Path(archivo.name).suffix.lower()
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(archivo.name).name)
         disk_path = uploads_dir / f"{uuid.uuid4().hex[:10]}_{safe_name}"
 
@@ -608,13 +567,6 @@ def fmt(valor, dec=1, sufijo=""):
     return f"{float(valor):.{dec}f}{sufijo}"
 
 
-def figura_a_png(fig) -> bytes:
-    buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=250, bbox_inches="tight")
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
 def concatenar_dataframes(resultados, key, solo_ok=False):
     dfs = []
     for r in resultados:
@@ -676,6 +628,110 @@ def smart_annotations(points, x_window_hours=18, y_window=3.0, font_size=11):
     return out
 
 
+def _pct_entero_txt(v):
+    """Porcentaje entero sin decimales (redondeo comercial: 44.5 -> 45%)."""
+    try:
+        return f"{int(np.floor(float(v) + 0.5))}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def eje_fechas_dias(fechas, max_etiquetas=31):
+    """Eje X de fechas que muestra TODOS los días del rango cuando caben.
+
+    - Hasta `max_etiquetas` días: una marca por día (incluye días sin ciclos).
+    - Rangos mayores: paso automático de 2, 3, 7, 14 o 30 días para no saturar.
+    Con paso de 1 día la etiqueta se centra en el día ("period") y las líneas de la
+    cuadrícula separan un día del siguiente.
+    """
+    base = dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7", showgrid=True)
+    f = pd.to_datetime(pd.Series(fechas), errors="coerce").dropna()
+    if f.empty:
+        return base
+    d0, d1 = f.min().normalize(), f.max().normalize()
+    n_dias = (d1 - d0).days + 1
+    paso = next((p for p in (1, 2, 3, 7, 14, 30) if n_dias / p <= max_etiquetas), 30)
+    base.update(
+        dtick=paso * 86_400_000,                         # milisegundos
+        tick0=d0.strftime("%Y-%m-%d"),
+        range=[d0.strftime("%Y-%m-%d"), (d1 + pd.Timedelta(days=1)).strftime("%Y-%m-%d")],
+    )
+    if paso == 1:
+        base["ticklabelmode"] = "period"
+    if n_dias / paso > 16:
+        base["tickangle"] = -45
+    return base
+
+
+def _eje_barras_por_dia(fechas, max_etiquetas=31, hueco=0.6):
+    """Posiciones X uniformes para barras "una por ciclo", agrupadas por día.
+
+    Sobre un eje de tiempo continuo los ciclos caen a horas irregulares y las barras salen
+    de anchos distintos, pegadas o muy finas. Aquí cada ciclo ocupa una posición de igual
+    ancho, en orden cronológico; los ciclos de un mismo día quedan juntos, los días sin
+    ciclos dejan un espacio vacío y la etiqueta (dd/mm) va centrada bajo cada día.
+
+    Devuelve (posiciones alineadas con `fechas`, dict con la configuración del eje X y los
+    separadores entre días). Requiere un índice posicional (0..n-1).
+    """
+    f = pd.to_datetime(pd.Series(list(fechas)), errors="coerce")
+    dia = f.dt.normalize()
+    ok = f.notna().to_numpy()
+    d0, d1 = dia[ok].min(), dia[ok].max()
+    dias = pd.date_range(d0, d1, freq="D")
+    n_dias = len(dias)
+    paso = next((p for p in (1, 2, 3, 7, 14, 30) if n_dias / p <= max_etiquetas), 30)
+
+    por_dia = {d: [] for d in dias}
+    for i in np.argsort(f.to_numpy(), kind="stable"):
+        if ok[i]:
+            por_dia[dia.iloc[i]].append(i)
+
+    pos = np.full(len(f), np.nan)
+    tickvals, ticktext, separadores = [], [], []
+    cursor = 0.0
+    for k, d in enumerate(dias):
+        idxs = por_dia[d]
+        n = max(len(idxs), 1)
+        for j, i in enumerate(idxs):
+            pos[i] = cursor + j
+        if k % paso == 0:
+            tickvals.append(cursor + (n - 1) / 2)
+            ticktext.append(d.strftime("%d/%m"))
+        fin = cursor + n - 1
+        if k < n_dias - 1 and n_dias <= max_etiquetas:
+            separadores.append(fin + 0.5 + hueco / 2)
+        cursor = fin + 1 + hueco
+    ultimo = cursor - hueco - 1
+    eje = dict(
+        title="Fecha", type="linear", tickmode="array", tickvals=tickvals, ticktext=ticktext,
+        range=[-0.7, ultimo + 0.7], showgrid=False, zeroline=False,
+    )
+    if len(tickvals) > 16:
+        eje["tickangle"] = -45
+    shapes = [
+        dict(type="line", xref="x", yref="paper", x0=s, x1=s, y0=0, y1=1,
+             line=dict(color="#e2e8f0", width=1, dash="dot"), layer="below")
+        for s in separadores
+    ]
+    return pos, dict(xaxis=eje, shapes=shapes)
+
+
+def _font_etiqueta_barras(n_barras):
+    """Tamaño de la etiqueta de las barras según la cantidad de barras del gráfico."""
+    if n_barras <= 50:
+        return 11
+    if n_barras <= 70:
+        return 10
+    if n_barras <= 95:
+        return 9
+    return 8
+
+
+def _es_barras(tipo_grafico):
+    return str(tipo_grafico).strip().lower().startswith("barra")
+
+
 def base_layout(height=450, **kwargs):
     layout = dict(
         height=height,
@@ -690,7 +746,6 @@ def base_layout(height=450, **kwargs):
     )
     layout.update(kwargs)
     return layout
-
 
 
 # ==========================================================
@@ -833,10 +888,6 @@ def _bd_labor_fields(row):
                     break
 
     return nivel, block, labor
-
-
-
-
 
 
 def _bd_operador_exportado(row):
@@ -1126,7 +1177,8 @@ def crear_excel_publicacion(df_bd_perfo, df_reportes, df_resumen):
 # ==========================================================
 
 
-def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: bool):
+def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: bool,
+                 tipo_grafico: str = "Líneas"):
     if df_auto.empty:
         return None
     df = df_auto.copy()
@@ -1138,32 +1190,56 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
     if df.empty:
         return None
 
+    barras = _es_barras(tipo_grafico)
     fig = go.Figure()
     annotations = []
     points = []
     jumbos = list(df["Jumbo"].dropna().astype(str).unique())
+    if barras:
+        df = df.reset_index(drop=True)
+        df["_x"], cfg_barras = _eje_barras_por_dia(df["FechaHora"])
+        df["_fecha_txt"] = df["FechaHora"].dt.strftime("%d/%m/%Y %H:%M")
     for idx, jumbo in enumerate(jumbos):
         g = df[df["Jumbo"].astype(str) == jumbo].sort_values("FechaHora")
-        fig.add_trace(go.Scatter(
-            x=g["FechaHora"], y=g["Pct_Movimiento_Automatico_Brazos"],
-            mode="lines+markers" if mostrar_linea else "markers",
-            name=jumbo,
-            line=dict(
-                width=3,
-                color=COLORES[idx % len(COLORES)],
-                shape="spline",
-                smoothing=1.0,
-            ) if mostrar_linea else None,
-            marker=dict(
-                size=9,
-                color=COLORES[idx % len(COLORES)],
-                line=dict(color="#ffffff", width=1.2),
-            ),
-            customdata=g[["Barrenos_Realizados", "Tipo_Roca"]].to_numpy(),
-            hovertemplate=(f"{jumbo}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%"
-                           "<br>Barrenos: %{customdata[0]} tal."
-                           "<br>Tipo de roca: %{customdata[1]}<extra></extra>"),
-        ))
+        color = COLORES[idx % len(COLORES)]
+        custom = g[["Barrenos_Realizados", "Tipo_Roca"]].to_numpy()
+        hover = (f"{jumbo}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%"
+                 "<br>Barrenos: %{customdata[0]} tal."
+                 "<br>Tipo de roca: %{customdata[1]}<extra></extra>")
+        if barras:
+            # Una barra por ciclo, en orden cronológico y con el mismo ancho.
+            fig.add_trace(go.Bar(
+                x=g["_x"], y=g["Pct_Movimiento_Automatico_Brazos"], name=jumbo, width=0.8,
+                marker=dict(color=color, line=dict(color="#ffffff", width=0.6)),
+                text=[_pct_entero_txt(v) for v in g["Pct_Movimiento_Automatico_Brazos"]] if mostrar_etiquetas else None,
+                # constraintext="none": la etiqueta conserva su tamaño aunque la barra sea angosta
+                # (por defecto Plotly la encoge u oculta cuando no cabe en el ancho de la barra).
+                textposition="outside", cliponaxis=False, constraintext="none",
+                textfont=dict(size=_font_etiqueta_barras(len(df)), color="#334155"),
+                customdata=g[["Barrenos_Realizados", "Tipo_Roca", "_fecha_txt"]].to_numpy(),
+                hovertemplate=(f"{jumbo}<br>%{{customdata[2]}}<br>Automático: %{{y:.1f}}%"
+                               "<br>Barrenos: %{customdata[0]} tal."
+                               "<br>Tipo de roca: %{customdata[1]}<extra></extra>"),
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=g["FechaHora"], y=g["Pct_Movimiento_Automatico_Brazos"],
+                mode="lines+markers" if mostrar_linea else "markers",
+                name=jumbo,
+                line=dict(
+                    width=3,
+                    color=color,
+                    shape="spline",
+                    smoothing=1.0,
+                ) if mostrar_linea else None,
+                marker=dict(
+                    size=9,
+                    color=color,
+                    line=dict(color="#ffffff", width=1.2),
+                ),
+                customdata=custom,
+                hovertemplate=hover,
+            ))
         auto = pd.to_numeric(g["Auto_Total_Brazos_min"], errors="coerce").sum(min_count=1)
         manual = pd.to_numeric(g["Manual_Total_Brazos_min"], errors="coerce").sum(min_count=1)
         kpi = auto / (auto + manual) * 100 if pd.notna(auto) and pd.notna(manual) and (auto + manual) > 0 else None
@@ -1172,23 +1248,29 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
             text=f"<b>{jumbo}</b> · Automático global: <b>{fmt(kpi,1,'%')}</b>",
             showarrow=False, bgcolor="rgba(255,255,255,0.92)", bordercolor="#dbe3ea", borderpad=5,
         ))
-        if mostrar_etiquetas:
+        if mostrar_etiquetas and not barras:
+            # Etiqueta: solo el porcentaje, entero (el detalle con decimales queda en el hover).
             for i, (_, r) in enumerate(g.iterrows()):
                 points.append(dict(
                     x=r["FechaHora"], y=r["Pct_Movimiento_Automatico_Brazos"],
-                    text=f"{r['Pct_Movimiento_Automatico_Brazos']:.1f}%<br>{int(r['Barrenos_Realizados']) if pd.notna(r.get('Barrenos_Realizados')) else '-'} tal.",
+                    text=_pct_entero_txt(r["Pct_Movimiento_Automatico_Brazos"]),
                     rank=i+idx,
                 ))
-    if mostrar_etiquetas:
+    if mostrar_etiquetas and not barras:
         annotations.extend(smart_annotations(points, x_window_hours=18, y_window=4, font_size=11))
+    yaxis = dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7")
+    extra = {}
+    if barras:
+        ymax = float(df["Pct_Movimiento_Automatico_Brazos"].max())
+        yaxis["range"] = [0, max(ymax * (1.18 if mostrar_etiquetas else 1.08), 10)]
+        extra.update(barmode="overlay", shapes=cfg_barras["shapes"])
     fig.update_layout(**base_layout(
         470, annotations=annotations, margin=dict(l=78,r=35,t=120,b=72),
-        yaxis=dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7"),
-        xaxis=dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7"),
+        yaxis=yaxis,
+        xaxis=cfg_barras["xaxis"] if barras else eje_fechas_dias(df["FechaHora"]),
+        **extra,
     ))
     return fig
-
-
 
 
 COLOR_OPERADOR_AZUL = "#4F67F2"
@@ -1294,11 +1376,11 @@ def construir_colores_operador_por_ranking(df_auto: pd.DataFrame):
     return color_map
 
 
-
 def grafico_auto_por_operador(
     df_auto: pd.DataFrame,
     mostrar_etiquetas: bool,
     mostrar_linea: bool,
+    tipo_grafico: str = "Líneas",
 ):
     """
     Evolución del movimiento automático por operador.
@@ -1364,6 +1446,13 @@ def grafico_auto_por_operador(
     # acumuladas del rango/filtros actualmente visibles.
     color_map_operador = construir_colores_operador_por_ranking(df)
 
+    # Modo barras: una barra por ciclo, en orden cronológico, del color de su operador.
+    barras = _es_barras(tipo_grafico)
+    if barras:
+        df = df.reset_index(drop=True)
+        df["_x"], cfg_barras = _eje_barras_por_dia(df["FechaHora"])
+        df["_fecha_txt"] = df["FechaHora"].dt.strftime("%d/%m/%Y %H:%M")
+
     for idx, operador in enumerate(operadores):
         color_operador = color_map_operador.get(
             str(operador),
@@ -1421,13 +1510,16 @@ def grafico_auto_por_operador(
             else pd.Series([None] * len(g), index=g.index)
         )
 
-        custom = np.column_stack([
+        cols_custom = [
             ciclos.astype(object),
             jumbos.astype(object),
             tipos.astype(object),
             rocas.astype(object),
             barrenos.astype(object),
-        ])
+        ]
+        if barras:
+            cols_custom.append(g["_fecha_txt"].astype(object))
+        custom = np.column_stack(cols_custom)
 
         symbols = [
             jumbo_symbols.get(str(j), "diamond")
@@ -1440,54 +1532,79 @@ def grafico_auto_por_operador(
             else operador
         )
 
-        fig.add_trace(
-            go.Scatter(
-                x=g["FechaHora"],
-                y=g["Pct_Movimiento_Automatico_Brazos"],
-                mode="lines+markers" if mostrar_linea else "markers",
-                name=nombre_leyenda,
-                line=(
-                    dict(
-                        width=2.8,
-                        color=color_operador,
-                        shape="spline",
-                        smoothing=1.0,
-                    )
-                    if mostrar_linea
-                    else None
-                ),
-                marker=dict(
-                    size=9,
-                    symbol=symbols,
-                    color=color_operador,
-                    line=dict(
-                        color="#ffffff",
-                        width=1.1,
-                    ),
-                ),
-                customdata=custom,
-                hovertemplate=(
-                    f"<b>{operador}</b>"
-                    "<br>Fecha: %{x|%d/%m/%Y %H:%M}"
-                    "<br>Jumbo: %{customdata[1]}"
-                    "<br>Ciclo: %{customdata[0]}"
-                    "<br>Automático: %{y:.1f}%"
-                    "<br>Barrenos: %{customdata[4]}"
-                    "<br>Tipo de disparo: %{customdata[2]}"
-                    "<br>Tipo de roca: %{customdata[3]}"
-                    "<extra></extra>"
-                ),
-            )
+        hover_op = (
+            f"<b>{operador}</b>"
+            "<br>Fecha: " + ("%{customdata[5]}" if barras else "%{x|%d/%m/%Y %H:%M}") +
+            "<br>Jumbo: %{customdata[1]}"
+            "<br>Ciclo: %{customdata[0]}"
+            "<br>Automático: %{y:.1f}%"
+            "<br>Barrenos: %{customdata[4]}"
+            "<br>Tipo de disparo: %{customdata[2]}"
+            "<br>Tipo de roca: %{customdata[3]}"
+            "<extra></extra>"
         )
+        if barras:
+            fig.add_trace(
+                go.Bar(
+                    x=g["_x"],
+                    y=g["Pct_Movimiento_Automatico_Brazos"],
+                    name=nombre_leyenda,
+                    width=0.8,
+                    marker=dict(
+                        color=color_operador,
+                        line=dict(color="#ffffff", width=0.6),
+                    ),
+                    text=(
+                        [_pct_entero_txt(v) for v in g["Pct_Movimiento_Automatico_Brazos"]]
+                        if mostrar_etiquetas else None
+                    ),
+                    textposition="outside",
+                    cliponaxis=False,
+                    constraintext="none",
+                    textfont=dict(size=_font_etiqueta_barras(len(df)), color="#334155"),
+                    customdata=custom,
+                    hovertemplate=hover_op,
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=g["FechaHora"],
+                    y=g["Pct_Movimiento_Automatico_Brazos"],
+                    mode="lines+markers" if mostrar_linea else "markers",
+                    name=nombre_leyenda,
+                    line=(
+                        dict(
+                            width=2.8,
+                            color=color_operador,
+                            shape="spline",
+                            smoothing=1.0,
+                        )
+                        if mostrar_linea
+                        else None
+                    ),
+                    marker=dict(
+                        size=9,
+                        symbol=symbols,
+                        color=color_operador,
+                        line=dict(
+                            color="#ffffff",
+                            width=1.1,
+                        ),
+                    ),
+                    customdata=custom,
+                    hovertemplate=hover_op,
+                )
+            )
 
-        if mostrar_etiquetas:
+        if mostrar_etiquetas and not barras:
             for i, (_, r) in enumerate(g.iterrows()):
                 points.append({
                     "x": r["FechaHora"],
                     "y": r["Pct_Movimiento_Automatico_Brazos"],
                     "text": (
                         f"{operador.split()[-1]}<br>"
-                        f"{r['Pct_Movimiento_Automatico_Brazos']:.1f}%"
+                        f"{_pct_entero_txt(r['Pct_Movimiento_Automatico_Brazos'])}"
                     ),
                     "rank": i + idx * 100,
                 })
@@ -1495,12 +1612,13 @@ def grafico_auto_por_operador(
         # Guardar la etiqueta final para posicionarla después.
         # El ajuste conjunto permite evitar superposición entre apellidos.
         ultimo = g.iloc[-1]
-        etiquetas_finales.append({
-            "x": ultimo["FechaHora"],
-            "y": float(ultimo["Pct_Movimiento_Automatico_Brazos"]),
-            "texto": operador.split()[-1],
-            "color": color_operador,
-        })
+        if not barras:
+            etiquetas_finales.append({
+                "x": ultimo["FechaHora"],
+                "y": float(ultimo["Pct_Movimiento_Automatico_Brazos"]),
+                "texto": operador.split()[-1],
+                "color": color_operador,
+            })
 
     # ------------------------------------------------------
     # Etiquetas finales sin superposición
@@ -1580,37 +1698,41 @@ def grafico_auto_por_operador(
             )
         )
 
+    yaxis_op = dict(
+        title="Movimiento automático (%)",
+        rangemode="tozero",
+        gridcolor="#eef2f7",
+    )
+    extra_op = {}
+    if barras:
+        ymax_op = float(df["Pct_Movimiento_Automatico_Brazos"].max())
+        yaxis_op["range"] = [0, max(ymax_op * (1.18 if mostrar_etiquetas else 1.08), 10)]
+        extra_op.update(barmode="overlay", shapes=cfg_barras["shapes"])
+
     fig.update_layout(
         **base_layout(
             500,
             annotations=annotations,
             margin=dict(
                 l=78,
-                r=145,
+                # En líneas se reserva espacio para el apellido al final de cada serie.
+                r=35 if barras else 145,
                 t=55,
                 b=82,
             ),
-            yaxis=dict(
-                title="Movimiento automático (%)",
-                rangemode="tozero",
-                gridcolor="#eef2f7",
-            ),
-            xaxis=dict(
-                title="Fecha",
-                tickformat="%d/%m",
-                gridcolor="#eef2f7",
-            ),
+            yaxis=yaxis_op,
+            xaxis=cfg_barras["xaxis"] if barras else eje_fechas_dias(df["FechaHora"]),
             legend=dict(
                 orientation="h",
                 y=-0.20,
                 x=0,
             ),
             hovermode="closest",
+            **extra_op,
         )
     )
 
     return fig
-
 
 
 def grafico_horas_auto_acumuladas_operador(
@@ -1816,7 +1938,8 @@ def grafico_horas_auto_acumuladas_operador(
     return fig
 
 
-def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool):
+def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool,
+                   tipo_grafico: str = "Líneas"):
     df = df_auto[df_auto["Jumbo"].astype(str) == str(jumbo)].copy()
     # La población ya llega filtrada desde el bloque de automatización.
     df = df[df["Pct_Automatico_Brazo1"].notna() | df["Pct_Automatico_Brazo2"].notna()].copy()
@@ -1824,6 +1947,7 @@ def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool):
     if df.empty:
         return None
 
+    barras = _es_barras(tipo_grafico)
     fig = go.Figure()
     annotations = []
     points = []
@@ -1831,6 +1955,10 @@ def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool):
         ("Brazo 1", "Pct_Automatico_Brazo1", "Auto_Brazo1_min", "Manual_Brazo1_min", 0),
         ("Brazo 2", "Pct_Automatico_Brazo2", "Auto_Brazo2_min", "Manual_Brazo2_min", 1),
     ]
+    if barras:
+        df = df.reset_index(drop=True)
+        df["_x"], cfg_barras = _eje_barras_por_dia(df["FechaHora"])
+        df["_fecha_txt"] = df["FechaHora"].dt.strftime("%d/%m/%Y %H:%M")
     for nombre, col, auto_col, man_col, idx in series:
         g = df[df[col].notna()].sort_values("FechaHora")
         if g.empty:
@@ -1838,27 +1966,49 @@ def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool):
         auto = pd.to_numeric(g[auto_col], errors="coerce").sum(min_count=1)
         manual = pd.to_numeric(g[man_col], errors="coerce").sum(min_count=1)
         global_pct = auto / (auto + manual) * 100 if pd.notna(auto) and pd.notna(manual) and (auto + manual) > 0 else None
-        fig.add_trace(go.Scatter(
-            x=g["FechaHora"], y=g[col], mode="lines+markers",
-            name=f"{nombre} · Global {fmt(global_pct,1,'%')}",
-            line=dict(width=2.5, color=COLORES[idx], shape="spline"), marker=dict(size=8),
-            hovertemplate=f"{nombre}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%<extra></extra>",
-        ))
+        hover = f"{nombre}<br>%{{x|%d/%m %H:%M}}<br>Automático: %{{y:.1f}}%<extra></extra>"
+        if barras:
+            # Brazo 1 y Brazo 2 del mismo ciclo, lado a lado dentro de su posición.
+            fig.add_trace(go.Bar(
+                x=g["_x"] + (idx - 0.5) * 0.4, y=g[col],
+                name=f"{nombre} · Global {fmt(global_pct,1,'%')}", width=0.38,
+                marker=dict(color=COLORES[idx], line=dict(color="#ffffff", width=0.6)),
+                text=[_pct_entero_txt(v) for v in g[col]] if mostrar_etiquetas else None,
+                # Etiqueta vertical: las dos barras de un ciclo quedan a ~15 px una de otra.
+                textposition="outside", cliponaxis=False, constraintext="none", textangle=-90,
+                textfont=dict(size=_font_etiqueta_barras(2 * len(df)), color="#334155"),
+                customdata=g[["_fecha_txt"]].to_numpy(),
+                hovertemplate=f"{nombre}<br>%{{customdata[0]}}<br>Automático: %{{y:.1f}}%<extra></extra>",
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=g["FechaHora"], y=g[col], mode="lines+markers",
+                name=f"{nombre} · Global {fmt(global_pct,1,'%')}",
+                line=dict(width=2.5, color=COLORES[idx], shape="spline"), marker=dict(size=8),
+                hovertemplate=hover,
+            ))
         annotations.append(dict(
             xref="paper", yref="paper", x=0.01 + idx*0.25, y=1.16, xanchor="left",
             text=f"<b>{nombre} global: {fmt(global_pct,1,'%')}</b>", showarrow=False,
             bgcolor="rgba(255,255,255,0.92)", bordercolor="#dbe3ea", borderpad=5,
         ))
-        if mostrar_etiquetas:
+        if mostrar_etiquetas and not barras:
             for i, (_, r) in enumerate(g.iterrows()):
-                points.append(dict(x=r["FechaHora"], y=r[col], text=f"{r[col]:.1f}%", rank=i+idx*100))
-    if mostrar_etiquetas:
+                points.append(dict(x=r["FechaHora"], y=r[col], text=_pct_entero_txt(r[col]), rank=i+idx*100))
+    if mostrar_etiquetas and not barras:
         annotations.extend(smart_annotations(points, x_window_hours=18, y_window=4, font_size=10))
+    yaxis = dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7")
+    extra = {}
+    if barras:
+        ymax = float(pd.concat([pd.to_numeric(df[c], errors="coerce") for _, c, _, _, _ in series]).max())
+        yaxis["range"] = [0, max(ymax * (1.25 if mostrar_etiquetas else 1.08), 10)]
+        extra.update(barmode="overlay", shapes=cfg_barras["shapes"])
     fig.update_layout(**base_layout(
         430, title=dict(text=f"<b>{jumbo}</b>", x=0.01), annotations=annotations,
         margin=dict(l=72,r=30,t=92,b=72),
-        yaxis=dict(title="Movimiento automático (%)", rangemode="tozero", gridcolor="#eef2f7"),
-        xaxis=dict(title="Fecha", tickformat="%d/%m", gridcolor="#eef2f7"),
+        yaxis=yaxis,
+        xaxis=cfg_barras["xaxis"] if barras else eje_fechas_dias(df["FechaHora"]),
+        **extra,
     ))
     return fig
 
@@ -1877,7 +2027,6 @@ def preparar_cut(df_resumen: pd.DataFrame, df_reportes: pd.DataFrame) -> pd.Data
     return asegurar_fechahora(cut)
 
 
-
 def grafico_cut(
     df_cut: pd.DataFrame,
     jumbos_visibles,
@@ -1885,6 +2034,7 @@ def grafico_cut(
     rocas_visibles,
     operadores_visibles,
     mostrar_etiquetas: bool,
+    tipo_grafico: str = "Líneas",
 ):
     if df_cut.empty:
         return None
@@ -1899,8 +2049,15 @@ def grafico_cut(
     if df.empty:
         return None
 
+    barras = _es_barras(tipo_grafico)
     all_jumbos = sorted(df_cut["Jumbo"].dropna().astype(str).unique())
     visibles = sorted(df["Jumbo"].dropna().astype(str).unique())
+
+    if barras:
+        # Una barra por ciclo, en orden cronológico y agrupadas por día (ver _eje_barras_por_dia).
+        df = df.sort_values(["FechaHora", "Jumbo", "Ciclo"]).reset_index(drop=True)
+        df["_x"], cfg_barras = _eje_barras_por_dia(df["FechaHora"])
+        df["_fecha_txt"] = df["FechaHora"].dt.strftime("%d/%m/%Y %H:%M")
 
     fig = go.Figure()
     points = []
@@ -1909,27 +2066,47 @@ def grafico_cut(
     for pos_visible, jumbo in enumerate(visibles):
         idx = all_jumbos.index(jumbo)
         g = df[df["Jumbo"].astype(str) == jumbo].sort_values("FechaHora")
-        custom = g[["Ciclo", "Tipo_Disparo"]].to_numpy()
+        color = COLORES[idx % len(COLORES)]
 
-        fig.add_trace(go.Scatter(
-            x=g["FechaHora"],
-            y=g["Mediana"],
-            mode="lines+markers",
-            name=jumbo,
-            customdata=custom,
-            line=dict(
-                width=3,
-                color=COLORES[idx % len(COLORES)],
-                shape="spline",
-            ),
-            marker=dict(size=8),
-            hovertemplate=(
-                f"{jumbo}<br>%{{x|%d/%m %H:%M}}"
-                "<br>Ciclo: %{customdata[0]}"
-                "<br>Tipo: %{customdata[1]}"
-                "<br>Mediana Cut: %{y:.2f} m<extra></extra>"
-            ),
-        ))
+        if barras:
+            fig.add_trace(go.Bar(
+                x=g["_x"],
+                y=g["Mediana"],
+                name=jumbo,
+                width=0.8,
+                marker=dict(color=color, line=dict(color="#ffffff", width=0.6)),
+                # En barras la etiqueta va sin unidad (el eje ya dice "m") para que quepa.
+                text=[f"{v:.2f}" for v in g["Mediana"]] if mostrar_etiquetas else None,
+                textposition="outside", cliponaxis=False, constraintext="none",
+                textfont=dict(size=_font_etiqueta_barras(len(df)), color="#334155"),
+                customdata=g[["Ciclo", "Tipo_Disparo", "_fecha_txt"]].to_numpy(),
+                hovertemplate=(
+                    f"{jumbo}<br>%{{customdata[2]}}"
+                    "<br>Ciclo: %{customdata[0]}"
+                    "<br>Tipo: %{customdata[1]}"
+                    "<br>Mediana Cut: %{y:.2f} m<extra></extra>"
+                ),
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=g["FechaHora"],
+                y=g["Mediana"],
+                mode="lines+markers",
+                name=jumbo,
+                customdata=g[["Ciclo", "Tipo_Disparo"]].to_numpy(),
+                line=dict(
+                    width=3,
+                    color=color,
+                    shape="spline",
+                ),
+                marker=dict(size=8),
+                hovertemplate=(
+                    f"{jumbo}<br>%{{x|%d/%m %H:%M}}"
+                    "<br>Ciclo: %{customdata[0]}"
+                    "<br>Tipo: %{customdata[1]}"
+                    "<br>Mediana Cut: %{y:.2f} m<extra></extra>"
+                ),
+            ))
 
         # Global coherente con la gráfica:
         # mediana de las medianas Cut de los ciclos visibles.
@@ -1945,14 +2122,14 @@ def grafico_cut(
                 text=f"<b>{jumbo}</b> · Longitud global Cut: <b>{global_cut:.2f} m</b>",
                 font=dict(
                     size=12,
-                    color=COLORES[idx % len(COLORES)],
+                    color=color,
                 ),
                 bgcolor="rgba(255,255,255,0.95)",
                 bordercolor="#dbe3ea",
                 borderpad=5,
             ))
 
-        if mostrar_etiquetas:
+        if mostrar_etiquetas and not barras:
             for i, (_, r) in enumerate(g.iterrows()):
                 points.append(dict(
                     x=r["FechaHora"],
@@ -1961,7 +2138,7 @@ def grafico_cut(
                     rank=i + idx * 50,
                 ))
 
-    if mostrar_etiquetas:
+    if mostrar_etiquetas and not barras:
         annotations.extend(
             smart_annotations(
                 points,
@@ -1971,25 +2148,38 @@ def grafico_cut(
             )
         )
 
+    yaxis = dict(
+        title="Mediana de longitud perforada Cut (m)",
+        gridcolor="#eef2f7",
+    )
+    extra = {}
+    if barras:
+        # Barras: el eje parte de 0 (una barra con eje truncado exagera las diferencias).
+        ymax = float(pd.to_numeric(df["Mediana"], errors="coerce").max())
+        yaxis["range"] = [0, ymax * (1.15 if mostrar_etiquetas else 1.05)]
+        extra.update(barmode="overlay", shapes=cfg_barras["shapes"])
+
     fig.update_layout(**base_layout(
         450,
         annotations=annotations,
         margin=dict(l=80, r=30, t=88, b=70),
-        yaxis=dict(
-            title="Mediana de longitud perforada Cut (m)",
-            gridcolor="#eef2f7",
-        ),
-        xaxis=dict(
-            title="Fecha",
-            tickformat="%d/%m",
-            gridcolor="#eef2f7",
-        ),
+        yaxis=yaxis,
+        xaxis=cfg_barras["xaxis"] if barras else eje_fechas_dias(df["FechaHora"]),
+        **extra,
     ))
     return fig
 
 # ==========================================================
 # ZDA: RESÚMENES Y TIMELINE
 # ==========================================================
+
+
+def format_duration_hms(segundos) -> str:
+    """Duración en segundos -> "HH:MM:SS" (mismo formato que Tiempo_Perforacion_hms)."""
+    total = int(round(float(segundos)))
+    h, resto = divmod(max(total, 0), 3600)
+    m, s = divmod(resto, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _utc_dt(ts):
@@ -2171,141 +2361,6 @@ def resumen_tipos_zda(rows: pd.DataFrame) -> pd.DataFrame:
         if r["Total"] > 0:
             salida.append(r)
     return pd.DataFrame(salida)
-
-
-def grafico_zda_timeline(rows: pd.DataFrame, mostrar_etiquetas: bool):
-    if rows.empty:
-        return None
-    rows = rows.sort_values("Inicio_Perforacion_TS").copy()
-    all_jumbos = sorted(rows["Jumbo"].dropna().astype(str).unique())
-    fig = go.Figure()
-    annotations = []
-    legend_done = set()
-
-    rows["_opDate"] = rows["Inicio_Perforacion_TS"].apply(zda_operational_date)
-    for op_date, grupo in rows.groupby("_opDate", sort=True):
-        grupo = grupo.sort_values("Inicio_Perforacion_TS")
-        n = len(grupo)
-        for i, (_, r) in enumerate(grupo.iterrows()):
-            offset = (i - (n-1)/2) * 0.11
-            x = op_date + timedelta(days=offset)
-            y1 = zda_operational_hour(r["Inicio_Perforacion_TS"], op_date)
-            y2 = zda_operational_hour(r["Fin_Perforacion_TS"], op_date)
-            jumbo = str(r["Jumbo"])
-            idx = all_jumbos.index(jumbo)
-            n_b = r.get("Barrenos_ZDA") if pd.notna(r.get("Barrenos_ZDA")) else r.get("Barrenos_Realizados")
-            custom = [[r.get("Ciclo"), n_b, r.get("Inicio_Perforacion"), r.get("Fin_Perforacion"), r.get("Tiempo_Perforacion_hms"), r.get("Labor") or "-", r.get("Tipo_Disparo")]] * 2
-            fig.add_trace(go.Scatter(
-                x=[x,x], y=[y1,y2], mode="lines+markers", name=jumbo,
-                legendgroup=jumbo, showlegend=jumbo not in legend_done,
-                line=dict(
-                    width=12,
-                    color=COLORES[idx%len(COLORES)],
-                ),
-                marker=dict(
-                    size=[12, 7],
-                    symbol=["diamond", "circle"],
-                    color=COLORES[idx%len(COLORES)],
-                    line=dict(color="#ffffff", width=1.4),
-                ),
-                customdata=custom,
-                hovertemplate=(f"{jumbo} · Ciclo %{{customdata[0]}}<br>Tipo: %{{customdata[6]}}"
-                               "<br>Inicio: %{customdata[2]}<br>Fin: %{customdata[3]}<br>Tiempo: %{customdata[4]}"
-                               "<br>Barrenos: %{customdata[1]} B<br>Labor: %{customdata[5]}<extra></extra>"),
-            ))
-            legend_done.add(jumbo)
-            if mostrar_etiquetas:
-                annotations.append(dict(
-                    x=x, y=(y1+y2)/2, xref="x", yref="y", showarrow=False, xshift=18,
-                    text=f"C{r.get('Ciclo')} · {r.get('Tiempo_Perforacion_hms') or '-'} | {int(n_b) if pd.notna(n_b) else '-'}B",
-                    font=dict(size=10,color="#334155"), bgcolor="rgba(255,255,255,.9)",
-                    bordercolor="#dbe3ea", borderpad=3, xanchor="left",
-                ))
-
-    # Eje horario cada 1 hora: 07:00 -> 07:00 del día siguiente.
-    tickvals = list(range(7, 32))
-    ticktext = [f"{v%24:02d}:00" for v in tickvals]
-    op_dates = sorted(rows["_opDate"].unique())
-
-    # Jerarquía visual del eje horario:
-    # - grilla base cada 1 hora (muy tenue)
-    # - línea principal cada 2 horas
-    # - 19:00 se reserva para el cambio de turno
-    major_hour_lines = [
-        dict(
-            type="line",
-            xref="paper",
-            x0=0,
-            x1=1,
-            yref="y",
-            y0=h,
-            y1=h,
-            line=dict(
-                color="#cbd5e1",
-                width=1.15,
-            ),
-            layer="below",
-        )
-        for h in range(7, 32, 2)
-        if h != 19
-    ]
-
-    fig.update_layout(**base_layout(
-        720, annotations=annotations, margin=dict(l=80,r=150,t=55,b=72),
-        xaxis=dict(title="Fecha operativa", tickvals=op_dates,
-                   ticktext=[pd.Timestamp(x).strftime("%d/%m") for x in op_dates], gridcolor="#eef2f7"),
-        yaxis=dict(
-            title="Hora",
-            range=[31.2,6.8],
-            tickmode="array",
-            tickvals=tickvals,
-            ticktext=ticktext,
-            gridcolor="#edf2f7",
-            gridwidth=0.55,
-        ),
-        shapes=[
-            dict(
-                type="rect",
-                xref="paper",
-                x0=0,
-                x1=1,
-                yref="y",
-                y0=7,
-                y1=19,
-                fillcolor="rgba(37,99,235,.035)",
-                line=dict(width=0),
-                layer="below",
-            ),
-            dict(
-                type="rect",
-                xref="paper",
-                x0=0,
-                x1=1,
-                yref="y",
-                y0=19,
-                y1=31,
-                fillcolor="rgba(15,23,42,.035)",
-                line=dict(width=0),
-                layer="below",
-            ),
-            *major_hour_lines,
-            dict(
-                type="line",
-                xref="paper",
-                x0=0,
-                x1=1,
-                yref="y",
-                y0=19,
-                y1=19,
-                line=dict(
-                    color="#7c8da6",
-                    width=1.3,
-                    dash="dot",
-                ),
-            ),
-        ],
-    ))
-    return fig
 
 
 def _turno_inicio_ciclo(ts):
@@ -2490,7 +2545,6 @@ def preparar_timeline_ciclos_turno(rows: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index(drop=True)
     )
-
 
 
 def _kmeans_1d(valores, k, max_iter=100):
@@ -2749,8 +2803,6 @@ def analizar_clusters_primer_inicio(
     }
 
 
-
-
 def render_resumen_clusters_primer_inicio(
     cluster_info,
     turno: str,
@@ -2872,7 +2924,6 @@ def render_resumen_clusters_primer_inicio(
     )
 
 
-
 def grafico_timeline_ciclos_turno(
     ciclos: pd.DataFrame,
     turno: str,
@@ -2979,10 +3030,6 @@ def grafico_timeline_ciclos_turno(
 
     fig = go.Figure()
     legend_done = set()
-
-    # Eje X fijo para mantener siempre la misma referencia visual.
-    # 0 = inicio del turno y 12 = fin del turno.
-    x_max = 12.0
 
     for _, r in g.iterrows():
         jumbo = str(r["Jumbo"])
@@ -3295,9 +3342,6 @@ def grafico_timeline_ciclos_turno(
         )
 
     return fig
-
-
-
 
 
 def preparar_primeros_inicios_distribucion(ciclos: pd.DataFrame) -> pd.DataFrame:
@@ -4594,302 +4638,6 @@ st.download_button(
 )
 
 
-
-def preparar_barrenos_por_brazo(
-    df_detalle: pd.DataFrame,
-    df_reportes: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Cuenta los barrenos realizados por Brazo 1 y Brazo 2 en cada ciclo.
-
-    El conteo incluye todos los tipos de barreno disponibles en el detalle.
-    """
-    if df_detalle.empty:
-        return pd.DataFrame()
-
-    requeridas = {"Jumbo", "Ciclo", "Boom"}
-    if not requeridas.issubset(df_detalle.columns):
-        return pd.DataFrame()
-
-    det = df_detalle.copy()
-    det["Boom"] = pd.to_numeric(det["Boom"], errors="coerce")
-    det = det[det["Boom"].isin([1, 2])].copy()
-    if det.empty:
-        return pd.DataFrame()
-
-    # Clave de ciclo. Fecha ayuda a evitar colisiones si un número de ciclo
-    # se reutilizara en fechas diferentes.
-    keys = ["Jumbo", "Ciclo"]
-    if "Fecha_Inicio" in det.columns:
-        keys.append("Fecha_Inicio")
-
-
-    counts = (
-        det.groupby(keys + ["Boom"], dropna=False)
-        .size()
-        .unstack(fill_value=0)
-        .reset_index()
-    )
-
-    if 1 not in counts.columns:
-        counts[1] = 0
-    if 2 not in counts.columns:
-        counts[2] = 0
-
-    counts = counts.rename(
-        columns={
-            1: "Barrenos_B1",
-            2: "Barrenos_B2",
-        }
-    )
-    counts["Barrenos_B1"] = pd.to_numeric(
-        counts["Barrenos_B1"], errors="coerce"
-    ).fillna(0).astype(int)
-    counts["Barrenos_B2"] = pd.to_numeric(
-        counts["Barrenos_B2"], errors="coerce"
-    ).fillna(0).astype(int)
-    counts["Total_Barrenos_Brazos"] = (
-        counts["Barrenos_B1"] + counts["Barrenos_B2"]
-    )
-
-    # Participación porcentual por brazo dentro de cada ciclo.
-    total_seguro = counts["Total_Barrenos_Brazos"].replace(0, pd.NA)
-    counts["Pct_B1"] = (
-        counts["Barrenos_B1"] / total_seguro * 100
-    ).fillna(0.0)
-    counts["Pct_B2"] = (
-        counts["Barrenos_B2"] / total_seguro * 100
-    ).fillna(0.0)
-
-    # Añadir metadatos del ciclo para filtros y tooltip.
-    if not df_reportes.empty:
-        meta_cols = [
-            c
-            for c in [
-                "Jumbo",
-                "Ciclo",
-                "Fecha_Inicio",
-                "Hora_Inicio",
-                "Tipo_Disparo",
-                "Tipo_Roca",
-                "Fuente",
-            ]
-            if c in df_reportes.columns
-        ]
-        meta = df_reportes[meta_cols].copy()
-
-        # Prioridad ZDA en el metadata si hay ZDA del mismo ciclo.
-        if "Fuente" in meta.columns:
-            meta["_prioridad"] = (
-                meta["Fuente"]
-                .fillna("")
-                .astype(str)
-                .str.upper()
-                .eq("ZDA")
-                .astype(int)
-            )
-            meta = meta.sort_values("_prioridad", ascending=False)
-
-        merge_keys = [
-            c
-            for c in ["Jumbo", "Ciclo", "Fecha_Inicio"]
-            if c in counts.columns and c in meta.columns
-        ]
-        if not merge_keys:
-            merge_keys = [
-                c
-                for c in ["Jumbo", "Ciclo"]
-                if c in counts.columns and c in meta.columns
-            ]
-
-        meta = meta.drop_duplicates(subset=merge_keys, keep="first")
-        meta = meta.drop(
-            columns=["_prioridad"],
-            errors="ignore",
-        )
-
-        # Evita duplicar columnas que ya vienen desde el detalle.
-        add_cols = merge_keys + [
-            c
-            for c in [
-                "Hora_Inicio",
-                "Tipo_Disparo",
-                "Tipo_Roca",
-                "Fuente",
-            ]
-            if c in meta.columns and c not in merge_keys
-        ]
-        counts = counts.merge(
-            meta[add_cols],
-            on=merge_keys,
-            how="left",
-        )
-
-    if "Tipo_Disparo" not in counts.columns:
-        counts["Tipo_Disparo"] = "SIN CLASIFICAR"
-    if "Tipo_Roca" not in counts.columns:
-        counts["Tipo_Roca"] = "SIN DATO"
-
-    return counts
-
-
-def grafico_b1_participacion_unico(
-    df_brazos: pd.DataFrame,
-):
-    """
-    Gráfico único por ciclo con la participación del Brazo 1.
-
-    - Eje Y: % de participación de B1 respecto al total B1+B2.
-    - Si el valor es > 50%, B1 realizó más barrenos que B2.
-    - Si el valor es < 50%, B2 realizó más barrenos que B1.
-    - Una línea horizontal en 50% sirve como referencia visual.
-    """
-    if df_brazos.empty:
-        return None
-
-    g = df_brazos.copy()
-    g = asegurar_fechahora(g)
-    if g.empty:
-        return None
-
-    g["Ciclo_Label"] = g["Ciclo"].apply(
-        lambda v: (
-            f"C{int(v)}"
-            if pd.notna(v)
-            and str(v).replace(".", "", 1).isdigit()
-            else f"C{v}"
-        )
-    )
-
-    # Texto corto del estado de balance.
-    def _dominancia(row):
-        if float(row.get("Pct_B1", 0)) > 50:
-            return "B1 > B2"
-        if float(row.get("Pct_B1", 0)) < 50:
-            return "B2 > B1"
-        return "Balanceado"
-
-    g["Dominancia_B1"] = g.apply(_dominancia, axis=1)
-
-    # Orden cronológico y etiqueta compacta para un gráfico único.
-    g = g.reset_index(drop=True)
-    g["Orden_Ciclo"] = range(1, len(g) + 1)
-    g["X_Label"] = g.apply(
-        lambda r: f"{str(r['Jumbo'])[-3:]}·{r['Ciclo_Label']}",
-        axis=1,
-    )
-
-    fig = go.Figure()
-    colores = {
-        "JUMB001": "#4f6df5",
-        "JUMB002": "#f05a3b",
-    }
-
-    for jumbo in sorted(g["Jumbo"].dropna().astype(str).unique()):
-        gj = g[g["Jumbo"].astype(str).eq(str(jumbo))].copy()
-        if gj.empty:
-            continue
-
-        custom = gj[
-            [
-                "Jumbo",
-                "Ciclo",
-                "Barrenos_B1",
-                "Barrenos_B2",
-                "Total_Barrenos_Brazos",
-                "Pct_B1",
-                "Pct_B2",
-                "Tipo_Roca",
-                "Tipo_Disparo",
-                "Fecha_Inicio",
-                "Dominancia_B1",
-            ]
-        ].astype(object).to_numpy()
-
-        fig.add_trace(
-            go.Scatter(
-                name=jumbo,
-                x=gj["X_Label"],
-                y=gj["Pct_B1"],
-                mode="lines+markers",
-                customdata=custom,
-                line=dict(
-                    width=2.5,
-                    shape="spline",
-                    smoothing=0.80,
-                    color=colores.get(jumbo),
-                ),
-                marker=dict(size=8, color=colores.get(jumbo)),
-                hovertemplate=(
-                    "<b>%{customdata[0]} · Ciclo %{customdata[1]}</b><br>"
-                    "Participación B1: %{customdata[5]:.1f}%<br>"
-                    "Participación B2: %{customdata[6]:.1f}%<br>"
-                    "Lectura visual: %{customdata[10]}<br>"
-                    "Brazo 1: %{customdata[2]} barrenos<br>"
-                    "Brazo 2: %{customdata[3]} barrenos<br>"
-                    "Total: %{customdata[4]} barrenos<br>"
-                    "Tipo de roca: %{customdata[7]}<br>"
-                    "Tipo de disparo: %{customdata[8]}<br>"
-                    "Fecha: %{customdata[9]}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-    fig.update_layout(
-        **base_layout(
-            480,
-            margin=dict(l=72, r=30, t=70, b=95),
-            xaxis=dict(
-                title="Ciclo / round",
-                type="category",
-                categoryorder="array",
-                categoryarray=g["X_Label"].tolist(),
-                tickangle=-45,
-                gridcolor="#eef2f7",
-            ),
-            yaxis=dict(
-                title="Participación del Brazo 1 (%)",
-                range=[0, 100],
-                tickmode="array",
-                tickvals=[0, 20, 40, 50, 60, 80, 100],
-                ticktext=["0%", "20%", "40%", "50%", "60%", "80%", "100%"],
-                gridcolor="#eef2f7",
-            ),
-            shapes=[
-                dict(
-                    type="line",
-                    xref="paper",
-                    x0=0,
-                    x1=1,
-                    yref="y",
-                    y0=50,
-                    y1=50,
-                    line=dict(
-                        color="#475569",
-                        width=2.0,
-                        dash="dot",
-                    ),
-                    layer="above",
-                ),
-            ],
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="left",
-                x=0,
-            ),
-        )
-    )
-
-    return fig
-
-
-
-
-
-
 def aplicar_filtro_fechas_global(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aplica Fecha inicio / Fecha fin del sidebar a un DataFrame
@@ -4993,17 +4741,18 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
     fecha_inicio_sel = st.session_state.get("fecha_inicio_zda_global")
     fecha_fin_sel = st.session_state.get("fecha_fin_zda_global")
 
+    def _rango_compacto(d0, d1):
+        # "24 ago – 03 sep": sin guiones ni puntos para que quepa en una sola línea.
+        f0 = _fecha_corta_es(d0).replace("-", " ").replace(".", "")
+        f1 = _fecha_corta_es(d1).replace("-", " ").replace(".", "")
+        return f"{f0} – {f1}"
+
     if fecha_inicio_sel is not None and fecha_fin_sel is not None:
-        rango_fecha = (
-            f"{_fecha_corta_es(pd.Timestamp(fecha_inicio_sel))} – "
-            f"{_fecha_corta_es(pd.Timestamp(fecha_fin_sel))}"
-        )
-        fechas_sub = f"{len(fechas)} ciclos en el rango"
+        rango_fecha = _rango_compacto(pd.Timestamp(fecha_inicio_sel), pd.Timestamp(fecha_fin_sel))
+        fechas_sub = f"{len(fechas)} {'ciclo' if len(fechas) == 1 else 'ciclos'} en el rango"
     elif not fechas.empty:
-        fecha_min = fechas.min()
-        fecha_max = fechas.max()
-        rango_fecha = f"{_fecha_corta_es(fecha_min)} – {_fecha_corta_es(fecha_max)}"
-        fechas_sub = f"{len(fechas)} ciclos con fecha"
+        rango_fecha = _rango_compacto(fechas.min(), fechas.max())
+        fechas_sub = f"{len(fechas)} {'ciclo' if len(fechas) == 1 else 'ciclos'} con fecha"
     else:
         rango_fecha = "-"
         fechas_sub = "Sin fechas válidas"
@@ -5076,14 +4825,30 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
     st.markdown(
         """
         <style>
+        /* Las 4 tarjetas viven en UNA grilla: todas toman la altura de la más alta. */
+        .ebr-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-auto-rows: 1fr;
+            gap: 1rem;
+            align-items: stretch;
+            margin-bottom: 0.45rem;
+        }
+        @media (max-width: 1100px) {
+            .ebr-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
         .ebr-kpi-card {
-            min-height: 142px;
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            min-height: 150px;
+            min-width: 0;
             border: 1px solid #e2e8f0;
             border-radius: 18px;
             background: #ffffff;
             padding: 1.15rem 1.25rem 1.05rem 1.25rem;
             box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
-            margin-bottom: 0.45rem;
+            container-type: inline-size;   /* permite dimensionar la fuente según el ancho REAL de la tarjeta */
         }
         .ebr-kpi-label {
             font-size: 0.78rem;
@@ -5092,18 +4857,30 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
             color: #8a8a84;
             font-weight: 500;
             margin-bottom: 0.50rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .ebr-kpi-value {
-            font-size: 2.00rem;
-            line-height: 1.05;
+            font-size: clamp(1.15rem, 2.0vw, 1.85rem);          /* respaldo si no hay container queries */
+            font-size: min(1.85rem, calc(100cqw / (var(--n, 8) * 0.62)));   /* --n = nº de caracteres */
+            height: 2.2rem;              /* alto fijo: el texto de abajo queda alineado entre tarjetas */
+            line-height: 2.2rem;
             color: #111111;
             font-weight: 750;
-            margin-bottom: 0.48rem;
+            margin-bottom: 0.30rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .ebr-kpi-sub {
-            font-size: 0.95rem;
+            font-size: 0.92rem;
             line-height: 1.30;
             color: #66645f;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
         }
         </style>
         """,
@@ -5124,7 +4901,7 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
         (
             "Horas automático (total)",
             horas_auto_txt,
-            f"{ciclos_binarios} ciclos con dato automático/manual",
+            f"{ciclos_binarios} {'ciclo' if ciclos_binarios == 1 else 'ciclos'} con dato automático/manual",
         ),
         (
             "Sin operador registrado",
@@ -5133,25 +4910,55 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
         ),
     ]
 
-    cols = st.columns(4)
-    for col, (label, value, sub) in zip(cols, cards):
-        with col:
-            st.markdown(
-                f"""
-                <div class="ebr-kpi-card">
-                    <div class="ebr-kpi-label">{label}</div>
-                    <div class="ebr-kpi-value">{value}</div>
-                    <div class="ebr-kpi-sub">{sub}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
+    from html import escape as _esc
+    tarjetas_html = "".join(
+        f'<div class="ebr-kpi-card" title="{_esc(str(label))}: {_esc(str(value))} · {_esc(str(sub))}">'
+        f'<div class="ebr-kpi-label">{_esc(str(label))}</div>'
+        f'<div class="ebr-kpi-value" style="--n:{max(len(str(value)), 4)}">{_esc(str(value))}</div>'
+        f'<div class="ebr-kpi-sub">{_esc(str(sub))}</div>'
+        f'</div>'
+        for label, value, sub in cards
+    )
+    st.markdown(f'<div class="ebr-kpi-grid">{tarjetas_html}</div>', unsafe_allow_html=True)
 
 
 # ==========================================================
 # BLOQUE 1 - AUTOMATIZACIÓN
 # ==========================================================
+
+def _controles_grafico(clave: str, con_curva: bool = False) -> dict:
+    """Controles que van SOBRE cada gráfico (reemplazan las opciones del panel lateral).
+
+    - Tipo de gráfico: Líneas / Barras (solo cambia la presentación).
+    - Etiquetas: muestra u oculta los valores sobre puntos o barras.
+    - Línea curva (opcional): suaviza la línea; se desactiva en barras.
+    Devuelve {"tipo": "Líneas"|"Barras", "etiquetas": bool, "curva": bool}.
+    """
+    opciones = ["Líneas", "Barras"]
+    anchos = [2.4, 1.3, 1.7, 4.0] if con_curva else [2.4, 1.3, 5.7]
+    cols = st.columns(anchos, vertical_alignment="center")
+    with cols[0]:
+        valor = st.segmented_control(
+            "Tipo de gráfico", opciones, default="Líneas",
+            key=f"{clave}_tipo", label_visibility="collapsed",
+        )
+    tipo = valor if valor in opciones else "Líneas"      # None si se des-selecciona
+    with cols[1]:
+        etiquetas = st.checkbox(
+            "Etiquetas", value=False, key=f"{clave}_lbl",
+            help="Muestra u oculta los valores sobre los puntos o las barras.",
+        )
+    curva = True
+    if con_curva:
+        with cols[2]:
+            curva = st.checkbox(
+                "Línea curva", value=True, key=f"{clave}_curva",
+                disabled=(tipo == "Barras"),
+                help="Solo en líneas. Desmarcado: solo puntos. Marcado: curva suavizada que "
+                     "conecta los ciclos sin modificar los valores reales.",
+            )
+    return {"tipo": tipo, "etiquetas": bool(etiquetas), "curva": bool(curva)}
+
 
 @fragment
 def render_automation_section(
@@ -5160,9 +4967,6 @@ def render_automation_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
-    mostrar_auto: bool,
-    mostrar_linea_auto: bool,
-    mostrar_arm: bool,
 ):
     if df_automatico.empty:
         st.info("Sin datos suficientes de automatización.")
@@ -5191,11 +4995,13 @@ def render_automation_section(
     ].copy()
 
     st.subheader("Evolución del movimiento automático")
+    ctl_evol = _controles_grafico("auto_evol", con_curva=True)
 
     fig_auto = grafico_auto(
         df_visible,
-        mostrar_auto,
-        mostrar_linea_auto,
+        ctl_evol["etiquetas"],
+        ctl_evol["curva"],
+        ctl_evol["tipo"],
     )
 
     if fig_auto is not None:
@@ -5215,13 +5021,17 @@ def render_automation_section(
         "Cada línea representa un operador y cada punto un ciclo/round. "
         "El color se asigna por horas automáticas acumuladas del rango visible: "
         "azul = más horas, verde = segundo, naranja = tercero y rojo = menos horas. "
-        "El símbolo identifica el jumbo: círculo = JUMB001, cuadrado = JUMB002."
+        "El símbolo identifica el jumbo: círculo = JUMB001, cuadrado = JUMB002. "
+        "En barras, los ciclos simultáneos de dos jumbos se muestran lado a lado "
+        "(el jumbo y la hora exacta figuran en el hover)."
     )
+    ctl_oper = _controles_grafico("auto_oper", con_curva=True)
 
     fig_auto_operador = grafico_auto_por_operador(
         df_visible,
-        mostrar_auto,
-        mostrar_linea_auto,
+        ctl_oper["etiquetas"],
+        ctl_oper["curva"],
+        ctl_oper["tipo"],
     )
 
     if fig_auto_operador is not None:
@@ -5264,6 +5074,7 @@ def render_automation_section(
         )
 
     st.subheader("Uso automático por brazo")
+    ctl_brazo = _controles_grafico("auto_brazo")
 
     jumbos_visibles = sorted(
         df_visible.get(
@@ -5284,7 +5095,8 @@ def render_automation_section(
         fig_arm = grafico_brazos(
             df_visible,
             jumbo,
-            mostrar_arm,
+            ctl_brazo["etiquetas"],
+            ctl_brazo["tipo"],
         )
         if fig_arm is not None:
             hubo_grafico = True
@@ -5312,7 +5124,6 @@ def render_cut_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
-    mostrar_cut: bool,
 ):
     st.subheader("Evolución de la longitud perforada en barrenos Cut")
 
@@ -5326,10 +5137,11 @@ def render_cut_section(
         return
 
     st.caption(
-        "Cada punto representa la mediana de la longitud perforada "
+        "Cada punto (o barra) representa la mediana de la longitud perforada "
         "de los barrenos Cut de cada ciclo. Se aplican los filtros "
-        "globales del panel lateral."
+        "globales del panel lateral. En barras el eje parte de 0."
     )
+    ctl_cut = _controles_grafico("cut")
 
     fig_cut = grafico_cut(
         df_cut,
@@ -5337,7 +5149,8 @@ def render_cut_section(
         sel_tipos,
         sel_rocas,
         sel_operadores,
-        mostrar_cut,
+        ctl_cut["etiquetas"],
+        ctl_cut["tipo"],
     )
 
     if fig_cut is not None:
@@ -5363,7 +5176,6 @@ def render_zda_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
-    mostrar_zda: bool,
 ):
     st.subheader("Tiempos de ciclo de perforación")
 
@@ -7008,7 +6820,6 @@ def render_rop_section(
     )
 
 
-
 def render_resultados_section(resultados_validos):
     st.caption(
         f"{len(resultados_validos)} archivo(s) procesado(s) acumulado(s)"
@@ -7403,27 +7214,6 @@ def render_resultados_section(resultados_validos):
 # EFICIENCIA DE PERFORACIÓN · GEOMETRÍA ZDA
 # ==========================================================
 
-COLORES_BARRENO_3D = {
-    "Contour": "#173F5F",
-    "Bottom": "#2A6F97",
-    "Cut": "#7A1F5D",
-    "Easer": "#E07A1F",
-    "Reaming": "#5B6770",
-    "Casing": "#8A8A8A",
-}
-
-
-def _color_barreno_3d(tipo):
-    return COLORES_BARRENO_3D.get(str(tipo).strip().title(), "#8A8A8A")
-
-
-def _area_poligono_xz(puntos):
-    a = np.asarray(puntos, dtype=float)
-    if len(a) < 3:
-        return 0.0
-    x, z = a[:, 0], a[:, 1]
-    return float(abs(np.dot(x, np.roll(z, -1)) - np.dot(z, np.roll(x, -1))) / 2.0)
-
 
 @st.cache_data(show_spinner=False, max_entries=12)
 def _cargar_eficiencia_desde_path(path_str, mtime_ns, size_bytes):
@@ -7432,52 +7222,625 @@ def _cargar_eficiencia_desde_path(path_str, mtime_ns, size_bytes):
     return procesar_eficiencia_zda(raw, filename=Path(path_str).name)
 
 
-def render_eficiencia_perforacion_section(resultados):
+def _volumen_unico_ciclo(resultado):
+    """Única fuente: integral de las mismas secciones que muestran el 2D, 3D y PDF."""
+    return volumen_unico_ciclo(resultado)
+
+
+def _resumenes_eficiencia_sesion(paths):
+    """Resumen liviano (DGT, fuera, no cubierto) por ZDA, calculado UNA vez por sesión.
+
+    Antes el selector llamaba al resultado completo de cada ciclo mediante st.cache_data con
+    max_entries=12: con más de 12 ciclos el caché expulsaba entradas en cada rerun y se
+    reprocesaban todos los ZDA ante cualquier interacción. Aquí se guarda solo el resumen
+    (sin secciones ni DataFrames) en session_state, con clave (ruta, fecha, tamaño, versión).
+    Los ciclos que faltan se calculan en un solo lote (en paralelo si hay núcleos).
+    """
+    cache = st.session_state.setdefault("_eficiencia_resumenes", {})
+    claves = {}
+    for p in paths:
+        try:
+            stt = Path(p).stat()
+            claves[str(p)] = (str(p), stt.st_mtime_ns, stt.st_size, PROCESADOR_EFICIENCIA_VERSION)
+        except OSError:
+            continue
+    faltan = [p for p, k in claves.items() if k not in cache]
+    if faltan:
+        with st.spinner(f"Calculando eficiencia de {len(faltan)} ciclo(s)..."):
+            nuevos = resumenes_eficiencia_lote(faltan)
+        for p, resumen in nuevos.items():
+            cache[claves[p]] = resumen
+    return {p: cache.get(k) for p, k in claves.items()}
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_mask_3d(mask_sections):
+    fig_3d = go.Figure()
+    valid_3d = True
+    for mask_key_3d, color_3d, label_3d in (
+        ("programado", "#315FCB", "Programado"),
+        ("real", "#00A878", "Real"),
+    ):
+        rings_3d = []
+        for sec_3d in mask_sections:
+            boundary_3d = sec_3d[mask_key_3d].get("boundary", [])
+            pts_3d = np.asarray(boundary_3d, dtype=float)
+            if pts_3d.ndim != 2 or pts_3d.shape[0] < 3 or pts_3d.shape[1] < 2:
+                valid_3d = False
+                break
+            pts_3d = pts_3d[:, :2]
+            if np.allclose(pts_3d[0], pts_3d[-1]):
+                pts_3d = pts_3d[:-1]
+            seg_3d = np.linalg.norm(np.roll(pts_3d, -1, axis=0) - pts_3d, axis=1)
+            perimeter_3d = float(seg_3d.sum())
+            if perimeter_3d <= 0:
+                valid_3d = False
+                break
+            arc_3d = np.r_[0.0, np.cumsum(seg_3d)]
+            closed_3d = np.vstack([pts_3d, pts_3d[0]])
+            samples_3d = np.linspace(0.0, perimeter_3d, 80, endpoint=False)
+            ring_3d = np.column_stack([
+                np.interp(samples_3d, arc_3d, closed_3d[:, axis_3d])
+                for axis_3d in (0, 1)
+            ])
+            # Anclar el inicio en la misma dirección polar para reducir
+            # torsiones visuales entre anillos de distinto número de vértices.
+            start_3d = int(np.argmax(ring_3d[:, 0]))
+            rings_3d.append(np.roll(ring_3d, -start_3d, axis=0))
+        if not valid_3d:
+            break
+        n_ring_3d = len(rings_3d[0])
+        xyz_3d = np.asarray([
+            (pt[0], float(sec_3d["depth_m"]), pt[1])
+            for sec_3d, ring_3d in zip(mask_sections, rings_3d)
+            for pt in ring_3d
+        ])
+        tri_3d = []
+        for idx_3d in range(len(rings_3d) - 1):
+            for j_3d in range(n_ring_3d):
+                a_3d = idx_3d * n_ring_3d + j_3d
+                b_3d = idx_3d * n_ring_3d + (j_3d + 1) % n_ring_3d
+                c_3d = (idx_3d + 1) * n_ring_3d + j_3d
+                d_3d = (idx_3d + 1) * n_ring_3d + (j_3d + 1) % n_ring_3d
+                tri_3d.extend([(a_3d, b_3d, c_3d), (b_3d, d_3d, c_3d)])
+        tri_3d = np.asarray(tri_3d, dtype=int)
+        fig_3d.add_trace(go.Mesh3d(
+            x=xyz_3d[:, 0], y=xyz_3d[:, 1], z=xyz_3d[:, 2],
+            i=tri_3d[:, 0], j=tri_3d[:, 1], k=tri_3d[:, 2],
+            color=color_3d, opacity=0.25, flatshading=True,
+            name=f"Modelo {label_3d}", showlegend=True,
+            hovertemplate="X: %{x:.2f} m<br>Profundidad: %{y:.2f} m<br>Z: %{z:.2f} m<extra></extra>",
+        ))
+        for edge_idx_3d, edge_label_3d in (
+            (0, f"collar ({float(mask_sections[0]['depth_m']):.2f} m)"),
+            (-1, f"sección final ({float(mask_sections[-1]['depth_m']):.2f} m)"),
+        ):
+            ring_3d = rings_3d[edge_idx_3d]
+            closed_ring_3d = np.vstack([ring_3d, ring_3d[0]])
+            fig_3d.add_trace(go.Scatter3d(
+                x=closed_ring_3d[:, 0],
+                y=[float(mask_sections[edge_idx_3d]["depth_m"])] * len(closed_ring_3d),
+                z=closed_ring_3d[:, 1], mode="lines",
+                line=dict(color=color_3d, width=5 if edge_idx_3d == 0 else 4,
+                          dash="solid" if edge_idx_3d == 0 else "dash"),
+                name=f"{label_3d} · {edge_label_3d}",
+            ))
+    return fig_3d, valid_3d
+
+
+@fragment
+def _render_mask_depth_fragment(mask_volume, masks_result, round_id, ciclo_info):
+    # Nuevo método en paralelo: máscaras trianguladas por profundidad e integración.
+    with st.expander("Integración volumétrica de secciones por profundidad", expanded=True):
+        if not mask_volume.get("ok"):
+            st.info(mask_volume.get("reason", "No se pudo reconstruir la serie de máscaras."))
+        else:
+            st.caption("Fuente única de volumetría: triangulación de barrenos disponibles en cada "
+                       "profundidad e integración trapezoidal. Los barrenos cortos no se extrapolan. "
+                       "La reconstrucción geométrica no mide sobrerotura post-voladura.")
+            mask_sections = mask_volume.get("sections", [])
+            if mask_sections:
+                selected_depth = st.select_slider(
+                    "Profundidad de las secciones (m)",
+                    options=list(range(len(mask_sections))),
+                    value=len(mask_sections) - 1,
+                    format_func=lambda idx: f"{mask_sections[idx]['depth_m']:.2f} m",
+                    key=f"mask_depth_{round_id}",
+                )
+                section = mask_sections[selected_depth]
+                # Escalas comunes para comparar ambos paneles: el cero de Z debe
+                # ocupar exactamente la misma altura en programado y real.
+                coords_depth = []
+                for mask_key in ("programado", "real"):
+                    mask_entry = section[mask_key]
+                    coords_depth.extend(mask_entry.get("points", []))
+                    coords_depth.extend(mask_entry.get("boundary", []))
+                coords_depth.extend(masks_result.get("nominal", []))
+                coords_depth = [pt for pt in coords_depth if len(pt) >= 2
+                                and np.isfinite(pt[0]) and np.isfinite(pt[1])]
+                if coords_depth:
+                    shared_x = [min(pt[0] for pt in coords_depth) - 0.4,
+                                max(pt[0] for pt in coords_depth) + 0.4]
+                    shared_z = [min(pt[1] for pt in coords_depth) - 0.4,
+                                max(pt[1] for pt in coords_depth) + 0.4]
+                else:
+                    shared_x, shared_z = [-3.0, 3.0], [-1.0, 5.5]
+                mask_cols_depth = st.columns(2)
+                for col_depth, key_depth, color_depth in zip(
+                    mask_cols_depth, ("programado", "real"), ("#315FCB", "#00A878")
+                ):
+                    entry_depth = section[key_depth]
+                    fig_depth = go.Figure()
+                    mesh_x, mesh_z = [], []
+                    for triangle in entry_depth.get("triangles", []):
+                        ring = triangle + [triangle[0]]
+                        mesh_x.extend([pt[0] for pt in ring] + [None])
+                        mesh_z.extend([pt[1] for pt in ring] + [None])
+                    if mesh_x:
+                        fig_depth.add_trace(go.Scatter(
+                            x=mesh_x, y=mesh_z, mode="lines",
+                            line=dict(color=color_depth, width=0.7),
+                            opacity=0.35, showlegend=False, hoverinfo="skip"))
+                    outline_depth = entry_depth.get("boundary", [])
+                    if outline_depth:
+                        fig_depth.add_trace(go.Scatter(
+                            x=[pt[0] for pt in outline_depth], y=[pt[1] for pt in outline_depth],
+                            mode="lines", line=dict(color=color_depth, width=3),
+                            name="Contorno reconstruido"))
+                    # Referencia fija de diseño: solo visual, no recorta máscaras ni altera volúmenes.
+                    nominal_depth = masks_result.get("nominal", [])
+                    if nominal_depth:
+                        fig_depth.add_trace(go.Scatter(
+                            x=[pt[0] for pt in nominal_depth],
+                            y=[pt[1] for pt in nominal_depth],
+                            mode="lines",
+                            line=dict(color="#64748B", dash="dash", width=1.5),
+                            name="Perfil nominal", opacity=0.8,
+                            hovertemplate="Perfil nominal<extra></extra>",
+                        ))
+                    pts_depth = entry_depth.get("points", [])
+                    if pts_depth:
+                        fig_depth.add_trace(go.Scatter(
+                            x=[pt[0] for pt in pts_depth], y=[pt[1] for pt in pts_depth],
+                            mode="markers", marker=dict(color=color_depth, size=5),
+                            text=entry_depth.get("ids", []),
+                            hovertemplate="Hole ID: %{text}<extra></extra>", name="Barrenos"))
+                    fig_depth.update_layout(
+                        template="plotly_white", height=460,
+                        title=f"Sección {'programada' if key_depth == 'programado' else 'ejecutada'} a {section['depth_m']:.2f} m",
+                        xaxis=dict(title="X (m)", range=shared_x, constrain="domain"),
+                        yaxis=dict(title="Z (m)", range=shared_z, scaleanchor="x",
+                                   scaleratio=1, constrain="domain"),
+                        margin=dict(l=25, r=15, t=48, b=30),
+                        legend=dict(orientation="h", y=1.01, yanchor="bottom"))
+                    with col_depth:
+                        st.plotly_chart(fig_depth, width="stretch",
+                                        key=f"mask_section_{key_depth}_{round_id}")
+                        area_depth = entry_depth.get("area_m2")
+                        n_bar_depth = entry_depth.get("n_barrenos")
+                        n_tot_depth = entry_depth.get("n_total")
+                        if area_depth is None:
+                            st.caption("Sección sin geometría válida: no se extrapola.")
+                        else:
+                            if n_bar_depth is None:
+                                detalle_depth = f"{len(pts_depth)} puntos"
+                            elif key_depth == "programado":
+                                detalle_depth = (f"{n_bar_depth} barrenos · {len(pts_depth)} posiciones únicas "
+                                                 "(IDs coincidentes juntos en el hover)")
+                            else:
+                                detalle_depth = (f"{n_bar_depth} de {n_tot_depth} barrenos alcanzan esta profundidad")
+                                if n_tot_depth and n_bar_depth < n_tot_depth:
+                                    detalle_depth += " · los más cortos no se extrapolan"
+                                detalle_depth += f" · {len(pts_depth)} posiciones únicas"
+                            st.caption(f"{detalle_depth} · Área: {area_depth:.2f} m²")
+            if mask_volume.get("complete"):
+                vol_base = float(mask_volume["programado_m3"])
+                vol_fuera = float(mask_volume["outside_m3"])
+                vol_no_cubierto = float(mask_volume["not_covered_m3"])
+                pct_fuera = 100 * vol_fuera / vol_base if vol_base > 0 else None
+                pct_no_cubierto = 100 * vol_no_cubierto / vol_base if vol_base > 0 else None
+                pct_dgt = pct_fuera + pct_no_cubierto if pct_fuera is not None else None
+                cols_mask_metrics = st.columns(4)
+                cols_mask_metrics[0].metric("Volumen programado", f"{mask_volume['programado_m3']:,.2f} m³")
+                cols_mask_metrics[1].metric("Volumen ejecutado", f"{mask_volume['real_m3']:,.2f} m³")
+                cols_mask_metrics[2].metric(
+                    "Fuera del programado",
+                    f"{vol_fuera:,.2f} m³",
+                    f"{pct_fuera:.2f}%" if pct_fuera is not None else None,
+                    delta_color="off",
+                )
+                cols_mask_metrics[3].metric(
+                    "No cubierto",
+                    f"{vol_no_cubierto:,.2f} m³",
+                    f"{pct_no_cubierto:.2f}%" if pct_no_cubierto is not None else None,
+                    delta_color="off",
+                )
+                dgt_help = (
+                    "FÓRMULAS\n"
+                    "Fuera (%) = Volumen fuera del programado / Volumen programado × 100\n"
+                    "No cubierto (%) = Volumen no cubierto / Volumen programado × 100\n"
+                    "DGT (m³) = Volumen fuera del programado + Volumen no cubierto\n"
+                    "DGT (%) = DGT (m³) / Volumen programado × 100\n\n"
+                    "VALORES DEL CICLO SELECCIONADO\n"
+                    f"Volumen programado: {vol_base:,.2f} m³\n"
+                    f"Fuera del programado: {vol_fuera:,.2f} m³"
+                    + (f" ({pct_fuera:.2f}%)\n" if pct_fuera is not None else "\n")
+                    + f"No cubierto: {vol_no_cubierto:,.2f} m³"
+                    + (f" ({pct_no_cubierto:.2f}%)\n" if pct_no_cubierto is not None else "\n")
+                    + f"DGT = {vol_fuera:,.2f} + {vol_no_cubierto:,.2f} = {vol_fuera + vol_no_cubierto:,.2f} m³\n"
+                    + (f"DGT (%) = ({vol_fuera + vol_no_cubierto:,.2f} / {vol_base:,.2f}) × 100 = {pct_dgt:.2f}%\n\n"
+                       if pct_dgt is not None else "DGT (%): no disponible; volumen programado no válido.\n\n")
+                    + "El cálculo usa los valores originales sin redondear. "
+                    "Es una comparación geométrica estimada de la perforación; "
+                    "no mide sobrerotura posterior a la voladura."
+                )
+                st.metric("Desviación geométrica total",
+                          f"{vol_fuera + vol_no_cubierto:,.2f} m³",
+                          f"{pct_dgt:.2f}% del programado" if pct_dgt is not None else None,
+                          delta_color="off", help=dgt_help)
+                # Variación porcentual respecto al volumen programado (mismo método).
+                v_plan = float(mask_volume["programado_m3"])
+                v_real = float(mask_volume["real_m3"])
+                variation_pct = 100.0 * (v_real - v_plan) / v_plan if v_plan > 0 else None
+                # El tooltip usa valores originales para el resultado y valores visibles
+                # redondeados solo para mostrar la sustitución de la fórmula.
+                variation_help = (
+                    "FÓRMULA\n"
+                    "Variación (%) = (Volumen ejecutado − Volumen programado) "
+                    "/ Volumen programado × 100\n\n"
+                    "VALORES DEL CICLO SELECCIONADO\n"
+                    f"= ({v_real:,.2f} − {v_plan:,.2f}) / {v_plan:,.2f} × 100\n"
+                )
+                if variation_pct is not None:
+                    variation_help += (
+                        f"= {variation_pct:+.2f}%\n\n"
+                        "El resultado se calcula con los volúmenes originales, sin redondear; "
+                        "por eso puede diferir ligeramente del cálculo con los valores visibles."
+                    )
+                else:
+                    variation_help += "Resultado no disponible: el volumen programado debe ser mayor que cero."
+                variation_help += (
+                    "\n\nComparación geométrica exploratoria de perforación; "
+                    "no es una medición de sobrerotura posterior a la voladura."
+                )
+                st.metric("Variación de volumen (ejecutado vs. programado)",
+                          f"{variation_pct:+.2f}%" if variation_pct is not None else "N/D",
+                          help=variation_help)
+
+                # Vista 3D construida con las MISMAS secciones utilizadas en la integral.
+                # Cada superficie lateral interpola la frontera de secciones consecutivas;
+                # no modifica el algoritmo ni los resultados volumétricos.
+                with st.expander("Modelo volumétrico 3D · secciones trianguladas y reporte", expanded=True):
+                    left_3d, right_report = st.columns([1.65, 1], gap="large")
+                    fig_3d, valid_3d = _cached_mask_3d(mask_sections)
+                    with left_3d:
+                        if valid_3d and len(mask_sections) >= 2:
+                            fig_3d.update_layout(
+                                template="plotly_white", height=620,
+                                scene=dict(xaxis_title="X (m)", yaxis_title="Profundidad (m)",
+                                           zaxis_title="Z (m)", aspectmode="data"),
+                                margin=dict(l=0, r=0, t=15, b=0),
+                                legend=dict(orientation="h", y=-0.06),
+                            )
+                            st.plotly_chart(fig_3d, width="stretch",
+                                            key=f"mask_3d_{round_id}")
+                        else:
+                            st.info("No hay contornos válidos en todas las profundidades para la vista 3D.")
+                    with right_report:
+                        st.markdown("#### Área de sección (m²)")
+                        sec_first, sec_last = mask_sections[0], mask_sections[-1]
+                        rows_area = []
+                        for sec_label, sec_item in (("Collar", sec_first), ("Fondo", sec_last)):
+                            ap = sec_item["programado"].get("area_m2")
+                            ar = sec_item["real"].get("area_m2")
+                            rows_area.append({"Sección": f"{sec_label} ({sec_item['depth_m']:.2f} m)",
+                                              "Programado": round(ap, 2) if ap is not None else None,
+                                              "Real": round(ar, 2) if ar is not None else None,
+                                              "Diferencia": round(ar-ap, 2) if ap is not None and ar is not None else None,
+                                              "Variación %": f"{100*(ar-ap)/ap:+.1f}%" if ap and ar is not None else "N/D"})
+                        st.dataframe(pd.DataFrame(rows_area), hide_index=True, width="stretch")
+                        st.markdown("#### Diferencias espaciales (m³)")
+                        spatial_rows = [
+                            {"Indicador": "Fuera del programado", "Volumen (m³)": f"{vol_fuera:,.2f}",
+                             "% del programado": f"{pct_fuera:.2f}%" if pct_fuera is not None else "N/D"},
+                            {"Indicador": "No cubierto", "Volumen (m³)": f"{vol_no_cubierto:,.2f}",
+                             "% del programado": f"{pct_no_cubierto:.2f}%" if pct_no_cubierto is not None else "N/D"},
+                            {"Indicador": "Desviación geométrica total", "Volumen (m³)": f"{vol_fuera + vol_no_cubierto:,.2f}",
+                             "% del programado": f"{pct_dgt:.2f}%" if pct_dgt is not None else "N/D"},
+                        ]
+                        st.dataframe(
+                            pd.DataFrame(spatial_rows).style.apply(
+                                lambda row: ["font-weight: bold" if row.name == 2 else "" for _ in row], axis=1
+                            ), hide_index=True, width="stretch",
+                            column_config={
+                                "Indicador": st.column_config.TextColumn(width=220),
+                                "Volumen (m³)": st.column_config.TextColumn(width=125),
+                                "% del programado": st.column_config.TextColumn(width=155),
+                            },
+                        )
+                        st.markdown("#### Volumen integrado (m³)")
+                        st.dataframe(pd.DataFrame([{
+                            "Sección": f"0–{mask_sections[-1]['depth_m']:.2f} m",
+                            "Programado": round(v_plan, 2), "Real": round(v_real, 2),
+                            "Diferencia": round(v_real-v_plan, 2),
+                            "Variación %": f"{variation_pct:+.1f}%" if variation_pct is not None else "N/D",
+                        }]), hide_index=True, width="stretch")
+                    # Generación bajo demanda: no se exportan imágenes al mover la profundidad.
+                    st.markdown("#### Reporte técnico del ciclo")
+                    report_key = f"pdf_perforacion_{round_id}"
+                    if st.button("Generar reporte PDF", key=f"generar_pdf_{round_id}"):
+                        if not (valid_3d and len(mask_sections) >= 2):
+                            st.error("No se puede generar el reporte: falta un modelo 3D válido.")
+                        else:
+                            with st.spinner("Exportando los gráficos del ciclo y componiendo el PDF..."):
+                                try:
+                                    st.session_state[report_key] = generar_reporte_pdf(
+                                        mask_volume, masks_result, fig_3d, round_id,
+                                        fecha=ciclo_info.get("fecha"),
+                                        equipo=ciclo_info.get("equipo"),
+                                        operador=ciclo_info.get("operador"),
+                                    )
+                                except Exception as exc:
+                                    st.session_state.pop(report_key, None)
+                                    st.error(f"No se pudo generar el PDF: {exc}")
+                    if st.session_state.get(report_key):
+                        st.download_button(
+                            "Descargar reporte PDF",
+                            data=st.session_state[report_key],
+                            file_name=f"Reporte_Eficiencia_Perforacion_Ciclo_{round_id}.pdf",
+                            mime="application/pdf", key=f"descargar_pdf_{round_id}",
+                        )
+                        st.info("Vista 3D exploratoria: superficies interpoladas entre secciones. "
+                                "Las áreas y volúmenes provienen de la integración de secciones, "
+                                "no de la malla visual ni de una medición post-voladura.")
+            else:
+                st.warning("No se calculan volúmenes: existen secciones sin geometría válida. "
+                           "No se interpolan áreas a través de vacíos de datos.")
+            st.warning(mask_volume.get("warning", "Resultados exploratorios: no sustituyen los indicadores vigentes."))
+
+
+_CSS_SELECTBOX_MARCA = """
+<style>
+/* ---- Campo del selector ------------------------------------------------------------
+   Streamlit reciente dibuja st.selectbox con React Aria (ya NO con BaseWeb): el campo
+   es un div con role="group" y fondo del tema; el texto es un input con role="combobox"
+   y la flecha un button con aria-label="Open". Los selectores de abajo usan esos
+   atributos (estables) y no las clases emotion generadas. */
+__C__ [data-testid="stSelectbox"] [role="group"] {
+    background-color: __FONDO__ !important;
+    border: 1px solid __BORDE__ !important;
+    border-radius: 8px !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.25);
+    transition: background-color 120ms ease, box-shadow 120ms ease;
+}
+__C__ [data-testid="stSelectbox"] [role="group"]:hover {
+    background-color: __FONDO_HOVER__ !important;
+}
+__C__ [data-testid="stSelectbox"] [role="group"][data-focus-within] {
+    border-color: __BORDE_FOCO__ !important;
+    box-shadow: 0 0 0 3px __ANILLO__ !important;
+}
+__C__ [data-testid="stSelectbox"] input {
+    background: transparent !important;
+    color: __TEXTO__ !important;
+    -webkit-text-fill-color: __TEXTO__ !important;
+    caret-color: __TEXTO__ !important;
+}
+__C__ [data-testid="stSelectbox"] [role="group"] button,
+__C__ [data-testid="stSelectbox"] [role="group"] svg {
+    color: __TEXTO__ !important;
+    fill: __TEXTO__ !important;
+}
+/* Streamlit anterior (BaseWeb): mismo aspecto. */
+__C__ [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+    background-color: __FONDO__ !important;
+    border: 1px solid __BORDE__ !important;
+    border-radius: 8px !important;
+}
+__C__ [data-testid="stSelectbox"] [data-baseweb="select"] * {
+    color: __TEXTO__ !important;
+    -webkit-text-fill-color: __TEXTO__ !important;
+}
+/* ---- Lista desplegable ---------------------------------------------------------------
+   Se monta fuera del contenedor (portal en <body>): se acota con :has() para que solo
+   cambie mientras ESTE selector está abierto y no afecte a los demás. */
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [data-testid="stSelectboxVirtualDropdown"] {
+    border: 1px solid __BORDE__ !important;
+}
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-selected="true"] [data-item-hl],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"] [role="option"][aria-selected="true"] {
+    background-color: __FONDO__ !important;
+}
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-hovered] [data-item-hl],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-focused] [data-item-hl],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"] [role="option"]:hover {
+    background-color: __RESALTE__ !important;
+}
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-selected="true"],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-hovered],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [role="option"][data-focused],
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"] [role="option"][aria-selected="true"] *,
+body:has(__C__ [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"] [role="option"]:hover * {
+    color: __TEXTO__ !important;
+    -webkit-text-fill-color: __TEXTO__ !important;
+}
+</style>
+"""
+
+
+def _css_selectbox_marca(
+    clase: str,
+    fondo: str = "#125B37",
+    fondo_hover: str = "#0F4A2D",
+    texto: str = "#FFFFFF",
+    borde: str = "#008F49",
+    borde_foco: str = "#4CC38A",
+    anillo: str = "rgba(0, 143, 73, 0.35)",
+    resalte: str = "#008F49",
+) -> str:
+    """CSS con los colores de marca para un st.selectbox dentro del contenedor `clase`.
+
+    `clase` es la clase que Streamlit genera para un widget/contenedor con key, p. ej.
+    ".st-key-eficiencia_selector_destacado". Sirve para cualquier otro selector: basta
+    con envolverlo en st.container(key="...") y llamar a esta función con esa clase.
+    """
+    css = _CSS_SELECTBOX_MARCA
+    for marcador, valor in (
+        ("__C__", clase), ("__FONDO_HOVER__", fondo_hover), ("__FONDO__", fondo),
+        ("__TEXTO__", texto), ("__BORDE_FOCO__", borde_foco), ("__BORDE__", borde),
+        ("__ANILLO__", anillo), ("__RESALTE__", resalte),
+    ):
+        css = css.replace(marcador, valor)
+    return css
+
+
+def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel_rocas, sel_operadores):
     st.subheader("Eficiencia de Perforación")
+    st.markdown("**Evaluación del cumplimiento y desviación geométrica de la perforación**")
+    st.markdown(
+        "**Objetivo:** Comparar la geometría programada y ejecutada de los barrenos "
+        "mediante la reconstrucción de secciones transversales y modelos volumétricos, "
+        "cuantificando las desviaciones respecto al diseño mediante integración numérica."
+    )
     st.caption(
-        "Compara la geometría programada con la geometría realmente perforada usando únicamente el archivo ZDA. "
-        "La comparación volumétrica se realiza a una profundidad común alcanzada."
+        "Estas desviaciones podrían contribuir a la sobrerotura o subexcavación; "
+        "los resultados no constituyen una medición directa del perfil excavado después de la voladura."
     )
 
+    # Calcular una sola vez por ZDA (cacheado por ruta, fecha y tamaño).
+    # El porcentaje replica exactamente la fórmula de la tarjeta del ciclo.
     disponibles = []
+    resumenes_eficiencia = _resumenes_eficiencia_sesion([
+        r.get("_source_path") for r in resultados
+        if not r.get("error") and r.get("_source_path") and Path(r["_source_path"]).exists()
+    ])
     for r in resultados:
         path_str = r.get("_source_path")
         if r.get("error") or not path_str or not Path(path_str).exists():
             continue
         rep = r.get("resumen_reporte") or {}
-        n_barrenos_lista = (
-            rep.get("N_Barrenos")
-            or rep.get("Barrenos")
-            or rep.get("Barrenos_Realizados")
-        )
-        if n_barrenos_lista is None:
-            det_lista = r.get("detalle")
-            if isinstance(det_lista, pd.DataFrame) and not det_lista.empty:
-                n_barrenos_lista = len(det_lista)
-
+        # Aplicar los mismos filtros del sidebar ANTES de construir el selector.
+        # La clasificación se basa en el mismo conteo de barrenos realizados
+        # que utiliza el reporte consolidado.
+        n_clasificacion = rep.get("Barrenos_Realizados")
+        if n_clasificacion is None or pd.isna(n_clasificacion):
+            continue
+        if clasificar_tipo_disparo_v33(n_clasificacion) not in sel_tipos:
+            continue
+        if str(rep.get("Jumbo")) not in {str(x) for x in sel_jumbos}:
+            continue
+        if rep.get("Tipo_Roca") not in sel_rocas or rep.get("Operador_Filtro") not in sel_operadores:
+            continue
+        try:
+            fecha_ciclo = datetime.strptime(str(rep.get("Fecha_Inicio")), "%d/%m/%Y").date()
+            desde = st.session_state.get("fecha_inicio_zda_global")
+            hasta = st.session_state.get("fecha_fin_zda_global")
+            if (desde is not None and fecha_ciclo < desde) or (hasta is not None and fecha_ciclo > hasta):
+                continue
+        except (TypeError, ValueError):
+            pass
+        det_lista = r.get("detalle")
+        n_barrenos_lista = rep.get("N_Barrenos") or rep.get("Barrenos") or rep.get("Barrenos_Realizados")
+        if n_barrenos_lista is None and isinstance(det_lista, pd.DataFrame) and not det_lista.empty:
+            n_barrenos_lista = len(det_lista)
         barrenos_txt = (
             f" · {int(n_barrenos_lista)} barrenos"
-            if n_barrenos_lista is not None and pd.notna(n_barrenos_lista)
-            else ""
+            if n_barrenos_lista is not None and pd.notna(n_barrenos_lista) else ""
         )
+        # El selector usa la MISMA integral de secciones del análisis y PDF
+        # (resumen calculado una vez por sesión; un ZDA defectuoso queda "No calculada").
+        volumen_ciclo = resumenes_eficiencia.get(str(path_str))
+        desviacion_pct = volumen_ciclo["dgt_pct"] if volumen_ciclo else np.nan
+        fuera_pct = volumen_ciclo["fuera_pct"] if volumen_ciclo else np.nan
+        no_cubierto_pct = volumen_ciclo["no_cubierto_pct"] if volumen_ciclo else np.nan
+        desviacion_txt = f"{desviacion_pct:.1f}%" if np.isfinite(desviacion_pct) else "No calculada"
+        fuera_txt = f"{fuera_pct:.1f}%" if np.isfinite(fuera_pct) else "N/D"
+        no_cubierto_txt = f"{no_cubierto_pct:.1f}%" if np.isfinite(no_cubierto_pct) else "N/D"
         etiqueta = (
             f"{rep.get('Jumbo') or '-'} · Ciclo {rep.get('Ciclo') or '-'} · "
             f"{rep.get('Fecha_Inicio') or '-'}{barrenos_txt} · "
-            f"{r.get('nombre_archivo') or Path(path_str).name}"
+            f"{r.get('nombre_archivo') or Path(path_str).name} · DGT: {desviacion_txt} · Fuera: {fuera_txt} · No cubierto: {no_cubierto_txt}"
         )
-        disponibles.append((etiqueta, r))
+        disponibles.append({
+            "id": str(Path(path_str).resolve()), "etiqueta": etiqueta,
+            "resultado": r, "desviacion": desviacion_pct,
+            "fuera_pct": fuera_pct, "no_cubierto_pct": no_cubierto_pct,
+            "fecha": str(rep.get("Fecha_Inicio") or ""),
+            "ciclo": str(rep.get("Ciclo") or ""),
+        })
 
     if not disponibles:
-        st.info("Carga y procesa al menos un archivo ZDA para visualizar la eficiencia de perforación.")
+        st.info("No hay ciclos ZDA que cumplan los filtros seleccionados.")
         return
 
-    etiquetas = [x[0] for x in disponibles]
-    seleccion = st.selectbox(
-        "Ciclo a analizar",
-        etiquetas,
-        key="eficiencia_ciclo_seleccionado",
+    st.markdown("**Ciclo a analizar**")
+    # Resaltar únicamente el selector de ciclos.
+    st.markdown("""
+    <style>
+    .st-key-eficiencia_selector_destacado {
+        background: #E6F4EC;
+        border: 1px solid #008F49;
+        border-left: 5px solid #008F49;
+        border-radius: 10px;
+        padding: 12px 16px 14px;
+        margin: 8px 0 16px;
+    }
+    .st-key-eficiencia_selector_destacado [data-testid="stSelectbox"] label p {
+        color: #125B37;
+        font-weight: 700;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown(
+        _css_selectbox_marca(".st-key-eficiencia_selector_destacado"),
+        unsafe_allow_html=True,
     )
-    rsel = dict(disponibles)[seleccion]
+    orden = st.radio(
+        "Ordenar ciclos por",
+        ["Mayor desviación geométrica total", "Mayor fuera del programado",
+         "Mayor no cubierto", "Fecha / ciclo"],
+        index=0,
+        key="eficiencia_orden_ciclos_dgt",
+    )
+    def clave_fecha(item):
+        try:
+            fecha = datetime.strptime(item["fecha"], "%d/%m/%Y")
+        except (ValueError, TypeError):
+            fecha = datetime.min
+        try:
+            ciclo = int(item["ciclo"])
+        except (ValueError, TypeError):
+            ciclo = -1
+        return fecha, ciclo
+
+    # Las métricas no disponibles se colocan al final sin atribuirles cero.
+    if orden == "Fecha / ciclo":
+        disponibles.sort(key=clave_fecha, reverse=True)
+    else:
+        campo = {
+            "Mayor desviación geométrica total": "desviacion",
+            "Mayor fuera del programado": "fuera_pct",
+            "Mayor no cubierto": "no_cubierto_pct",
+        }[orden]
+        validos = [item for item in disponibles if np.isfinite(item[campo])]
+        invalidos = [item for item in disponibles if not np.isfinite(item[campo])]
+        validos.sort(key=lambda item: item[campo], reverse=True)
+        invalidos.sort(key=clave_fecha, reverse=True)
+        disponibles = validos + invalidos
+
+    por_id = {item["id"]: item for item in disponibles}
+    ids = [item["id"] for item in disponibles]
+    if st.session_state.get("eficiencia_ciclo_id") not in por_id:
+        st.session_state["eficiencia_ciclo_id"] = ids[0]
+    with st.container(key="eficiencia_selector_destacado"):
+        seleccion_id = st.selectbox(
+            "Seleccionar ciclo", ids,
+            format_func=lambda identificador: por_id[identificador]["etiqueta"],
+            key="eficiencia_ciclo_id",
+        )
+    st.caption("DGT = (volumen fuera del plan + volumen no cubierto) / volumen programado × 100. "
+               "La DGT compara geometrías de perforación; no mide la sobrerotura después de la voladura.")
+    rsel = por_id[seleccion_id]["resultado"]
     path = Path(rsel["_source_path"])
 
     try:
@@ -7498,6 +7861,30 @@ def render_eficiencia_perforacion_section(resultados):
         st.warning("El ZDA no contiene barrenos válidos para reconstruir la geometría.")
         return
 
+    # Conciliación documentada: todos los registros y sus coordenadas originales.
+    aud = rr.get("auditoria_conteos") or {}
+    with st.expander("Auditoría ZDA · barrenos programados y ejecutados", expanded=False):
+        if aud.get("conciliado"):
+            st.success(
+                f"Conciliado: {aud['programados_extraidos']} programados y "
+                f"{aud['ejecutados_extraidos']} ejecutados recuperados del ZDA."
+            )
+        else:
+            st.warning("El número de registros recuperados no coincide con lo declarado en round.txt.")
+        columnas_aud = ["ID", "Tipo", "Estado_Barreno", "Plan_X", "Plan_Y", "Plan_Z",
+                        "Plan_X2", "Plan_Y2", "Plan_Z2", "X", "Y", "Z",
+                        "X2", "Y2", "Z2", "Offset_Boom", "Tamano_Registro_Boom"]
+        aud_df = df[[c for c in columnas_aud if c in df.columns]].copy()
+        st.dataframe(aud_df, hide_index=True, width="stretch")
+        st.download_button(
+            "Descargar auditoría de coordenadas CSV",
+            data=aud_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"Auditoria_ZDA_Ciclo_{meta.get('round', 'x')}.csv",
+            mime="text/csv", key=f"descargar_auditoria_zda_{meta.get('round', 'x')}",
+        )
+        st.caption("Los barrenos no perforados conservan su collar y fondo programados; "
+                   "sus coordenadas ejecutadas permanecen vacías. Los extras no tienen plan.")
+
     # --------------------------------------------------------------
     # Conteos ZDA
     # --------------------------------------------------------------
@@ -7508,96 +7895,71 @@ def render_eficiencia_perforacion_section(resultados):
     if n_real is None:
         n_real = int(len(df))
 
-    # --------------------------------------------------------------
-    # Volumetría/perímetro. IMPORTANTE:
-    # no asumir que perimeter_rows existe. Algunos ciclos pueden no
-    # tener suficientes Contour/Bottom o una profundidad de referencia.
-    # El 3D se genera de todas maneras con los barrenos disponibles.
-    # --------------------------------------------------------------
-    volumetria_ok = bool(v.get("ok"))
+    # ÚNICA volumetría: secciones transversales variables e integración trapezoidal.
+    # No se mezclan volúmenes del método de perímetro con máscaras trianguladas.
+    m = rr.get("mask_volumetry") or {}
+    unico = _volumen_unico_ciclo(rr)
+    L = float(m.get("depth_m", np.nan)) if m.get("ok") else np.nan
+    Vprog = unico["programado_m3"] if unico else np.nan
+    Vreal = unico["real_m3"] if unico else np.nan
     per = v.get("perimeter_rows")
     if not isinstance(per, pd.DataFrame):
         per = pd.DataFrame()
-
-    L = np.nan
-    Lp = np.nan
-    t = 1.0
-    prog_common = []
-    ss = np.array([], dtype=float)
-    areas_prog = []
-    areas_real = []
-    Vprog = np.nan
-    Vreal = np.nan
-    delta = np.nan
-    delta_pct = np.nan
-
-    if volumetria_ok and not per.empty:
-        try:
-            L = float(v.get("cut_median_advance_y_m"))
-            Lp = float(np.nanmedian(np.abs(per["Plan_Y2"] - per["Plan_Y"])))
-
-            if np.isfinite(L) and L > 0 and np.isfinite(Lp) and Lp > 0:
-                t = min(1.0, L / Lp)
-
-                prog_common = [
-                    (
-                        q.Plan_X + (q.Plan_X2 - q.Plan_X) * t,
-                        q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * t,
-                    )
-                    for _, q in per.iterrows()
-                ]
-
-                ss = np.linspace(0.0, L, 81)
-                for d in ss:
-                    td = min(1.0, d / Lp)
-                    pts = [
-                        (
-                            q.Plan_X + (q.Plan_X2 - q.Plan_X) * td,
-                            q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * td,
-                        )
-                        for _, q in per.iterrows()
-                    ]
-                    areas_prog.append(_area_poligono_xz(pts))
-
-                Vprog = float(np.trapezoid(np.asarray(areas_prog), ss))
-                Vreal = float(v.get("v3_integrated_m3", np.nan))
-                delta = Vreal - Vprog
-                delta_pct = (delta / Vprog * 100.0) if Vprog > 0 else np.nan
-
-                # El procesador entrega la evolución real en secciones normalizadas.
-                real_src = v.get("sections_area_m2") or []
-                if len(real_src) >= 2:
-                    x_src = np.linspace(0.0, L, len(real_src))
-                    areas_real = np.interp(
-                        ss, x_src, np.asarray(real_src, dtype=float)
-                    ).tolist()
-        except Exception:
-            volumetria_ok = False
+    volumetria_ok = bool(unico)
+    if not unico:
+        st.error("Volumetría única no disponible: faltan secciones válidas o falla la identidad "
+                 "volumen ejecutado − programado = fuera − no cubierto. "
+                 "No se mostrarán volúmenes obtenidos con otro método.")
 
     # --------------------------------------------------------------
     # Tarjetas
     # --------------------------------------------------------------
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Barrenos programados", f"{int(n_prog)}" if n_prog is not None else "-")
     c2.metric("Barrenos realizados", f"{int(n_real)}" if n_real is not None else "-")
     c3.metric("Longitud de perforación alcanzada", f"{L:.2f} m" if np.isfinite(L) else "-")
     c4.metric("Volumen programado", f"{Vprog:.2f} m³" if np.isfinite(Vprog) else "-")
     c5.metric("Volumen real barrenado", f"{Vreal:.2f} m³" if np.isfinite(Vreal) else "-")
-    c6.metric(
-        "Real − programado",
-        f"{delta:+.2f} m³" if np.isfinite(delta) else "-",
-        f"{delta_pct:+.1f}%" if np.isfinite(delta_pct) else None,
+
+    fuera_prog = unico["outside_m3"] if unico else np.nan
+    no_cubierto = unico["not_covered_m3"] if unico else np.nan
+    d1, d2, d3 = st.columns(3)
+    espacial_ok = bool(unico)
+    fuera_pct = unico["fuera_pct"] if unico else np.nan
+    no_cubierto_pct = unico["no_cubierto_pct"] if unico else np.nan
+    dgt_m3 = unico["dgt_m3"] if unico else np.nan
+    dgt_pct = unico["dgt_pct"] if unico else np.nan
+
+    d1.metric(
+        "Fuera del programado",
+        f"{fuera_prog:.2f} m³" if np.isfinite(fuera_prog) else "No calculado",
+        f"{fuera_pct:.2f}% del programado" if np.isfinite(fuera_pct) else None,
+        delta_color="off",
+    )
+    d2.metric(
+        "No cubierto respecto al programado",
+        f"{no_cubierto:.2f} m³" if np.isfinite(no_cubierto) else "No calculado",
+        f"{no_cubierto_pct:.2f}% del programado" if np.isfinite(no_cubierto_pct) else None,
+        delta_color="off",
+    )
+    d3.metric(
+        "Desviación geométrica total",
+        f"{dgt_m3:.2f} m³" if np.isfinite(dgt_m3) else "No calculada",
+        f"{dgt_pct:.2f}% del programado" if np.isfinite(dgt_pct) else None,
+        delta_color="off",
+        help="DGT = fuera del programado + no cubierto. Los porcentajes usan el volumen programado como denominador.",
     )
 
-    st.caption(
-        "La longitud de perforación alcanzada se utiliza como longitud común de referencia para comparar "
-        "la geometría programada y la geometría real."
-    )
-    st.caption(
-        "El indicador Real − programado representa diferencia geométrica de perforación; "
-        "no corresponde a sobrerotura real post-voladura."
-    )
+    if not espacial_ok:
+        st.warning(
+            "La comparación espacial Fuera del programado / No cubierto no pudo calcularse. "
+            "Verifique que Shapely esté instalado (se incluye en requirements.txt)."
+        )
 
+    st.caption(
+        "Los volúmenes provienen de integrar las áreas de las mismas secciones transversales "
+        "a lo largo de la profundidad de referencia."
+    )
     if not volumetria_ok or per.empty or not np.isfinite(L):
         motivo = v.get("reason") or "No se pudo construir un perímetro volumétrico confiable para este ciclo."
         st.info(
@@ -7605,335 +7967,85 @@ def render_eficiencia_perforacion_section(resultados):
             "El modelo 3D de los barrenos disponibles se muestra igualmente."
         )
 
-    # --------------------------------------------------------------
-    # 2D · perfiles de control
-    # --------------------------------------------------------------
-    if volumetria_ok and not per.empty and np.isfinite(L):
-        fig2 = go.Figure()
-
-        def add_poly2(pts, name, dash, group, group_title, color):
-            pts = list(pts)
-            if not pts:
-                return
-            fig2.add_trace(go.Scatter(
-                x=[p[0] for p in pts] + [pts[0][0]],
-                y=[p[1] for p in pts] + [pts[0][1]],
-                mode="lines",
-                name=name,
-                legendgroup=group,
-                legendgrouptitle_text=group_title,
-                line=dict(width=3, dash=dash, color=color),
-            ))
-
-        add_poly2(
-            v.get("planned_polygon", []),
-            "Programado · Collar (0 m)", "dot",
-            "collar", "INICIO · COLLAR", "#E4573D",
-        )
-        add_poly2(
-            v.get("start_polygon", []),
-            "Real · Collar", "solid",
-            "collar", None, "#00A878",
-        )
-        add_poly2(
-            prog_common,
-            f"Programado · {L:.2f} m", "dashdot",
-            "fondo", f"FONDO · {L:.2f} m", "#7B61FF",
-        )
-        add_poly2(
-            v.get("end_polygon", []),
-            "Real · Fondo", "solid",
-            "fondo", None, "#F4A261",
-        )
-
-        fig2.update_layout(
-            template="plotly_white",
-            height=610,
-            xaxis_title="X (m)",
-            yaxis_title="Z (m)",
-            yaxis=dict(scaleanchor="x", scaleratio=1),
-            legend=dict(orientation="h", traceorder="grouped", y=1.14),
-            margin=dict(t=95),
-        )
-        st.markdown("#### Perfiles de control")
-        st.plotly_chart(
-            fig2,
-            width="stretch",
-            key=f"eficiencia_perfiles_2d_{meta.get('round', 'x')}",
-        )
-
-        # ----------------------------------------------------------
-        # Evolución de las áreas · gráfico recuperado
-        # ----------------------------------------------------------
-        if len(areas_prog) == len(ss) and len(areas_real) == len(ss):
-            fig_area = go.Figure()
-            fig_area.add_trace(go.Scatter(
-                x=ss,
-                y=areas_real,
-                mode="lines",
-                name="Real",
-                line=dict(width=3, color="#5B6CFF"),
-            ))
-            fig_area.add_trace(go.Scatter(
-                x=ss,
-                y=areas_prog,
-                mode="lines",
-                name="Programado",
-                line=dict(width=3, dash="dash", color="#FF5538"),
-            ))
-
-            nominal_area = v.get("nominal_area_m2")
-            if nominal_area is not None:
-                try:
-                    nominal_area = float(nominal_area)
-                except Exception:
-                    nominal_area = np.nan
-            if nominal_area is not None and np.isfinite(nominal_area):
-                fig_area.add_trace(go.Scatter(
-                    x=[0.0, L],
-                    y=[nominal_area, nominal_area],
-                    mode="lines",
-                    name="Nominal",
-                    line=dict(width=2, dash="dot", color="#334A73"),
-                ))
-
-            fig_area.update_layout(
-                template="plotly_white",
-                height=520,
-                xaxis_title="Profundidad longitudinal (m)",
-                yaxis_title="Área (m²)",
-                legend=dict(orientation="h", y=1.10),
-                margin=dict(t=70),
-            )
-            st.markdown("#### Evolución de las áreas")
-            st.latex(r"V = \int A(s)\,ds")
-            st.plotly_chart(
-                fig_area,
-                width="stretch",
-                key=f"eficiencia_areas_{meta.get('round', 'x')}",
-            )
-
-    # --------------------------------------------------------------
-    # 3D · independiente de perimeter_rows.
-    # Esto evita que un ciclo sin perímetro volumétrico bloquee el 3D.
-    # --------------------------------------------------------------
-    fig3 = go.Figure()
-    trazas_3d = 0
-
-    plan_cols = ["Plan_X", "Plan_Y", "Plan_Z", "Plan_X2", "Plan_Y2", "Plan_Z2"]
-    real_cols = ["X", "Y", "Z", "X2", "Y2", "Z2"]
-
-    if all(c in df.columns for c in plan_cols):
-        plan3d = df.copy()
-        for c in plan_cols:
-            plan3d[c] = pd.to_numeric(plan3d[c], errors="coerce")
-        plan3d = plan3d.dropna(subset=plan_cols)
-
-        for _, q in plan3d.iterrows():
-            tp = t if np.isfinite(L) and np.isfinite(Lp) and Lp > 0 else 1.0
-            e = (
-                q.Plan_X + (q.Plan_X2 - q.Plan_X) * tp,
-                q.Plan_Y + (q.Plan_Y2 - q.Plan_Y) * tp,
-                q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * tp,
-            )
-            fig3.add_trace(go.Scatter3d(
-                x=[q.Plan_X, e[0]],
-                y=[q.Plan_Y, e[1]],
-                z=[q.Plan_Z, e[2]],
-                mode="lines",
-                line=dict(
-                    width=2,
-                    dash="dot",
-                    color=_color_barreno_3d(q.Tipo),
-                ),
-                showlegend=False,
-                hovertemplate=(
-                    f"Programado · {q.Tipo}<br>"
-                    f"ID: {q.ID}<extra></extra>"
-                ),
-            ))
-            trazas_3d += 1
-
-    if all(c in df.columns for c in real_cols):
-        real3d = df.copy()
-        for c in real_cols:
-            real3d[c] = pd.to_numeric(real3d[c], errors="coerce")
-        real3d = real3d.dropna(subset=real_cols)
-
-        for _, q in real3d.iterrows():
-            tipo_q = str(q.get("Tipo", "Other"))
-            id_q = q.get("ID", "-")
-            color_q = _color_barreno_3d(tipo_q)
-            fig3.add_trace(go.Scatter3d(
-                x=[float(q["X"]), float(q["X2"])],
-                y=[float(q["Y"]), float(q["Y2"])],
-                z=[float(q["Z"]), float(q["Z2"])],
-                mode="lines+markers",
-                line=dict(width=4, color=color_q),
-                marker=dict(size=2, color=color_q),
-                showlegend=False,
-                hovertemplate=(
-                    f"Real · {tipo_q}<br>"
-                    f"ID: {id_q}<extra></extra>"
-                ),
-            ))
-            trazas_3d += 1
-
-    for typ in ["Contour", "Bottom", "Cut", "Easer", "Reaming", "Casing"]:
-        if "Tipo" in df.columns and (df["Tipo"].astype(str) == typ).any():
-            fig3.add_trace(go.Scatter3d(
-                x=[None], y=[None], z=[None],
-                mode="lines",
-                name=typ,
-                line=dict(width=5, color=_color_barreno_3d(typ)),
-                legendgroup="tipos",
-            ))
-
-    # Contornos gruesos de referencia en 3D.
-    # Se muestran Programado · Collar, Programado · Fondo común y Real · Fondo.
-    if not per.empty:
-        try:
-            pc = list(zip(per.Plan_X, per.Plan_Y, per.Plan_Z))
-            if pc:
-                pc.append(pc[0])
-                fig3.add_trace(go.Scatter3d(
-                    x=[p[0] for p in pc],
-                    y=[p[1] for p in pc],
-                    z=[p[2] for p in pc],
-                    mode="lines",
-                    name="Contorno programado · Collar (0 m)",
-                    line=dict(width=9, dash="dot", color="#111827"),
-                    legendgroup="contornos_collar",
-                ))
-
-            # Contorno real del collar: puntos X/Y/Z realmente registrados
-            # para los barrenos perimetrales.
-            real_collar = []
-            for _, q in per.iterrows():
-                vals = [
-                    pd.to_numeric(q.get("X"), errors="coerce"),
-                    pd.to_numeric(q.get("Y"), errors="coerce"),
-                    pd.to_numeric(q.get("Z"), errors="coerce"),
-                ]
-                if all(pd.notna(vv) for vv in vals):
-                    real_collar.append((float(vals[0]), float(vals[1]), float(vals[2])))
-
-            if len(real_collar) >= 3:
-                real_collar.append(real_collar[0])
-                fig3.add_trace(go.Scatter3d(
-                    x=[p[0] for p in real_collar],
-                    y=[p[1] for p in real_collar],
-                    z=[p[2] for p in real_collar],
-                    mode="lines",
-                    name="Contorno real · Collar",
-                    line=dict(width=9, color="#00A878"),
-                    legendgroup="contornos_collar",
-                ))
-
-            if np.isfinite(L) and np.isfinite(Lp) and Lp > 0:
-                pf = [
-                    (
-                        q.Plan_X + (q.Plan_X2 - q.Plan_X) * t,
-                        q.Plan_Y + (q.Plan_Y2 - q.Plan_Y) * t,
-                        q.Plan_Z + (q.Plan_Z2 - q.Plan_Z) * t,
-                    )
-                    for _, q in per.iterrows()
-                ]
-                if pf:
-                    pf.append(pf[0])
-                    fig3.add_trace(go.Scatter3d(
-                        x=[p[0] for p in pf],
-                        y=[p[1] for p in pf],
-                        z=[p[2] for p in pf],
-                        mode="lines",
-                        name=f"Contorno programado · {L:.2f} m",
-                        line=dict(width=9, dash="dash", color="#6D28D9"),
-                        legendgroup="contornos_fondo",
+    # Vista de collar; la integración oficial utiliza las secciones por profundidad.
+    with st.expander("Secciones transversales trianguladas (plan vs. ejecutado)", expanded=True):
+        masks_result = rr.get("experimental_masks") or {}
+        if not masks_result.get("ok"):
+            st.info(masks_result.get("reason", "Máscaras no disponibles."))
+        else:
+            st.caption("Reconstrucción exploratoria con todos los collares disponibles. "
+                       "La sección programada conserva el contorno de sus puntos; la ejecutada descarta "
+                       "triángulos con lados mayores de 2 m. Las áreas mostradas son solo "
+                       "diagnósticas: NO se usan para calcular volúmenes ni certifican el contorno.")
+            mask_cols = st.columns(2)
+            for mask_col, mask_key, mask_color, mask_title in zip(
+                mask_cols, ("programado", "real"), ("#315FCB", "#00A878"),
+                ("Sección programada · collar", "Sección ejecutada · collar")
+            ):
+                entry = masks_result.get("masks", {}).get(mask_key, {})
+                mesh_fig = go.Figure()
+                for triangle in entry.get("triangles", []):
+                    ring = triangle + [triangle[0]]
+                    mesh_fig.add_trace(go.Scatter(
+                        x=[pt[0] for pt in ring], y=[pt[1] for pt in ring],
+                        mode="lines", line=dict(color=mask_color, width=0.8),
+                        opacity=0.38, hoverinfo="skip", showlegend=False,
                     ))
+                outline = entry.get("boundary", [])
+                if outline:
+                    mesh_fig.add_trace(go.Scatter(
+                        x=[pt[0] for pt in outline], y=[pt[1] for pt in outline],
+                        mode="lines", line=dict(color=mask_color, width=3),
+                        name="Contorno reconstruido",
+                    ))
+                nominal_line = masks_result.get("nominal", [])
+                if nominal_line:
+                    mesh_fig.add_trace(go.Scatter(
+                        x=[pt[0] for pt in nominal_line], y=[pt[1] for pt in nominal_line],
+                        mode="lines", line=dict(color="#64748B", dash="dash", width=1.5),
+                        name="Perfil nominal", opacity=0.8,
+                    ))
+                coords = entry.get("points", [])
+                if coords:
+                    mesh_fig.add_trace(go.Scatter(
+                        x=[pt[0] for pt in coords], y=[pt[1] for pt in coords],
+                        mode="markers", marker=dict(color=mask_color, size=6),
+                        text=entry.get("ids", []), hovertemplate="Hole ID: %{text}<br>X: %{x:.2f}<br>Z: %{y:.2f}<extra></extra>",
+                        name="Collares",
+                    ))
+                mesh_fig.update_layout(
+                    template="plotly_white", height=460,
+                    title=mask_title, xaxis_title="X (m)", yaxis_title="Z (m)",
+                    yaxis=dict(scaleanchor="x", scaleratio=1),
+                    margin=dict(l=25, r=15, t=48, b=30),
+                    legend=dict(orientation="h", y=1.01, yanchor="bottom"),
+                )
+                with mask_col:
+                    st.plotly_chart(mesh_fig, width="stretch", key=f"mascara_{mask_key}_{meta.get('round', 'x')}")
+                    st.caption(
+                        f"{entry.get('n_barrenos', len(coords))} barrenos · "
+                        f"{len(coords)} posiciones de collar únicas · "
+                        f"{len(entry.get('triangles', []))} triángulos. "
+                        "IDs superpuestos visibles juntos al pasar el cursor."
+                    )
+                    if entry.get("warning"):
+                        st.warning(entry["warning"])
 
-            # Contorno real del fondo: usa los extremos reales X2/Y2/Z2
-            # de los mismos barrenos perimetrales.
-            real_fondo = []
-            for _, q in per.iterrows():
-                vals = [
-                    pd.to_numeric(q.get("X2"), errors="coerce"),
-                    pd.to_numeric(q.get("Y2"), errors="coerce"),
-                    pd.to_numeric(q.get("Z2"), errors="coerce"),
-                ]
-                if all(pd.notna(vv) for vv in vals):
-                    real_fondo.append((float(vals[0]), float(vals[1]), float(vals[2])))
+    # La función fragmentada no tiene acceso a `rep` ni a `rsel` del ámbito padre.
+    # Se pasan explícitamente los datos de la selección para la cabecera del PDF.
+    rep_seleccionado = rsel.get("resumen_reporte") or {}
+    ciclo_info = {
+        "fecha": rep_seleccionado.get("Fecha_Inicio") or meta.get("Fecha_Inicio") or meta.get("fecha"),
+        "equipo": rep_seleccionado.get("Jumbo") or meta.get("Jumbo") or meta.get("jumbo"),
+        "operador": (rep_seleccionado.get("Operador_ZDA") or rep_seleccionado.get("Operador")
+                     or rep_seleccionado.get("Operario") or rep_seleccionado.get("Operador_Filtro")
+                     or meta.get("Operador_ZDA") or meta.get("Operador") or meta.get("operador")),
+    }
+    _render_mask_depth_fragment(rr.get("mask_volumetry") or {}, masks_result, meta.get("round", "x"), ciclo_info)
 
-            if len(real_fondo) >= 3:
-                real_fondo.append(real_fondo[0])
-                fig3.add_trace(go.Scatter3d(
-                    x=[p[0] for p in real_fondo],
-                    y=[p[1] for p in real_fondo],
-                    z=[p[2] for p in real_fondo],
-                    mode="lines",
-                    name="Contorno real · Fondo",
-                    line=dict(width=9, color="#F4A261"),
-                    legendgroup="contornos_fondo",
-                ))
-        except Exception:
-            pass
-
-    st.markdown("#### Modelo 3D giratorio")
-    st.caption(
-        "Color = tipo de barreno · Programado = punteado · Real = continuo"
-    )
-
-    n_real_3d = len(real3d) if "real3d" in locals() else 0
-    n_plan_3d = len(plan3d) if "plan3d" in locals() else 0
-    if n_real_3d > 0 and n_plan_3d < n_real_3d:
-        st.caption(
-            f"Geometría 3D disponible: {n_real_3d} barrenos reales y "
-            f"{n_plan_3d} trayectorias programadas con coordenadas completas."
-        )
-
-    if trazas_3d == 0:
-        st.warning("Este ciclo no contiene coordenadas 3D válidas para representar los barrenos.")
-    else:
-        fig3.update_layout(
-            template="plotly_white",
-            height=860,
-            scene=dict(
-                domain=dict(x=[0.03, 0.97], y=[0.20, 0.98]),
-                aspectmode="data",
-                xaxis=dict(
-                    title="X (m)",
-                    showaxeslabels=True,
-                    showticklabels=True,
-                    showspikes=True,
-                ),
-                yaxis=dict(
-                    title="Y / avance (m)",
-                    showaxeslabels=True,
-                    showticklabels=True,
-                    showspikes=True,
-                ),
-                zaxis=dict(
-                    title="Z (m)",
-                    showaxeslabels=True,
-                    showticklabels=True,
-                    showspikes=True,
-                ),
-                bgcolor="white",
-            ),
-            legend=dict(
-                orientation="h",
-                x=0.01,
-                xanchor="left",
-                y=0.02,
-                yanchor="bottom",
-                traceorder="grouped",
-            ),
-            margin=dict(l=10, r=10, t=20, b=10),
-        )
-        st.plotly_chart(
-            fig3,
-            width="stretch",
-            key=f"eficiencia_modelo_3d_{meta.get('round', 'x')}",
-        )
+    # El análisis principal termina con el modelo de secciones y su PDF. Las visualizaciones
+    # históricas basadas en el perímetro (otro modelo de volumen) se retiraron para no presentar
+    # volúmenes o perfiles contradictorios.
 
 # ==========================================================
 # PRESENTACIÓN POR SECCIONES
@@ -7987,61 +8099,33 @@ def _cambiar_seccion_analisis(seccion):
 st.markdown(
     """
     <style>
-    .secciones-tabs-wrap {
-        margin-top: 0.35rem;
-        margin-bottom: 0.85rem;
-        padding: 0.18rem;
-        background: #f8fbff;
-        border: 1px solid #dbe7f5;
-        border-radius: 14px;
-        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    /* Menú de secciones: todos los botones con la MISMA altura, texto centrado.
+       Se apunta por la key del widget (st-key-btn_seccion_N), que Streamlit sí genera. */
+    [class*="st-key-btn_seccion_"] button {
+        height: 76px !important;
+        min-height: 76px !important;
+        max-height: 76px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        text-align: center !important;
+        padding: 0.4rem 0.6rem !important;
+        overflow: hidden;
     }
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
-        width: 100%;
-        min-height: 68px;
-        font-size: 1.00rem;
-        font-weight: 600;
+    [class*="st-key-btn_seccion_"] button p {
+        margin: 0 !important;
+        line-height: 1.15 !important;
+        text-align: center !important;
         white-space: normal;
-        line-height: 1.12;
-        padding: 0.80rem 0.80rem;
-        border-radius: 10px;
-        box-shadow: none !important;
-        transition: all 0.15s ease;
-    }
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="secondary"] {
-        background: #ffffff !important;
-        color: #334155 !important;
-        border: 1px solid #e2e8f0 !important;
-    }
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="secondary"]:hover {
-        background: #f8fafc !important;
-        color: #0f172a !important;
-        border: 1px solid #cbd5e1 !important;
-    }
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="primary"] {
-        background: #eaf3ff !important;
-        color: #1663d6 !important;
-        border: 1px solid #cfe0fb !important;
-        box-shadow: inset 0 -4px 0 #2f7ef7 !important;
-    }
-    div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav[kind="primary"]:hover {
-        background: #e6f0ff !important;
-        color: #1257c1 !important;
-        border: 1px solid #bfd5fb !important;
     }
     @media (max-width: 1100px) {
-        div[data-testid="stHorizontalBlock"] div[data-testid="column"] .stButton > button.seccion-nav {
-            min-height: 62px;
-            font-size: 0.96rem;
-            padding: 0.65rem 0.55rem;
-        }
+        [class*="st-key-btn_seccion_"] button { height: 68px !important; min-height: 68px !important; max-height: 68px !important; }
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="secciones-tabs-wrap">', unsafe_allow_html=True)
 cols_sec = st.columns(len(SECCIONES_ANALISIS))
 for i, seccion in enumerate(SECCIONES_ANALISIS):
     activa = st.session_state.get("seccion_analisis_principal") == seccion
@@ -8054,38 +8138,10 @@ for i, seccion in enumerate(SECCIONES_ANALISIS):
         on_click=_cambiar_seccion_analisis,
         args=(seccion,),
     )
-st.markdown('</div>', unsafe_allow_html=True)
 
 seccion_activa = st.session_state.get(
     "seccion_analisis_principal",
     SECCIONES_ANALISIS[0],
-)
-
-st.markdown(
-    """
-    <script>
-    const marcarBotonesSeccion = () => {
-      const bloques = window.parent.document.querySelectorAll('button[kind]');
-      bloques.forEach((btn) => {
-        const txt = (btn.innerText || "").trim();
-        if (
-          txt.includes("Uso Automático") ||
-          txt.includes("Longitud de Perforación") ||
-          txt.includes("Primer Golpe") ||
-          txt.includes("Eficiencia de Perforación") ||
-          txt.includes("Clasificación") ||
-          txt.includes("ROP por barreno") ||
-          txt.includes("Resultados por archivo")
-        ) {
-          btn.classList.add("seccion-nav");
-        }
-      });
-    };
-    setTimeout(marcarBotonesSeccion, 100);
-    setTimeout(marcarBotonesSeccion, 600);
-    </script>
-    """,
-    unsafe_allow_html=True,
 )
 
 if seccion_activa == "Uso Automático":
@@ -8096,9 +8152,6 @@ if seccion_activa == "Uso Automático":
             global_tipos,
             global_rocas,
             global_operadores,
-            global_lbl_auto,
-            global_line_auto,
-            global_lbl_arm,
         )
 
 elif seccion_activa == "Longitud de Perforación":
@@ -8110,7 +8163,6 @@ elif seccion_activa == "Longitud de Perforación":
             global_tipos,
             global_rocas,
             global_operadores,
-            global_lbl_cut,
         )
 
 elif seccion_activa == "Primer Golpe":
@@ -8121,12 +8173,13 @@ elif seccion_activa == "Primer Golpe":
             global_tipos,
             global_rocas,
             global_operadores,
-            global_lbl_zda,
         )
 
 elif seccion_activa == "Eficiencia de Perforación":
     with st.container(border=True):
-        render_eficiencia_perforacion_section(resultados_validos)
+        render_eficiencia_perforacion_section(
+            resultados_validos, global_jumbos, global_tipos, global_rocas, global_operadores
+        )
 
 elif seccion_activa == "Clasificación":
     with st.container(border=True):

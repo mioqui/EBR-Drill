@@ -19,13 +19,7 @@ from matplotlib.patches import Patch
 ORDEN_TIPOS = ["Bottom", "Easer", "Cut", "Contour", "Reaming", "Casing"]
 JUMBOS = {"125D114796": "JUMB001", "125D98943": "JUMB002"}
 
-VERSION_PROCESADOR = "V34.47-Python-ZDA-ONLY"
-
-
-def limpiar_texto(texto) -> str:
-    if texto is None:
-        return ""
-    return " ".join(str(texto).split())
+VERSION_PROCESADOR = "V34.49-PLAN-COMPLETO"
 
 
 def identificar_jumbo(numero_serie: Optional[str]) -> str:
@@ -43,40 +37,10 @@ def identificar_jumbo(numero_serie: Optional[str]) -> str:
     return JUMBOS.get(serie, f"Serie {serie}")
 
 
-def _normalizar_serie(serie_completa: str) -> str:
-    return re.sub(r"-\d+$", "", serie_completa.strip())
-
-
-def tiempo_a_minutos(valor: Optional[str]) -> Optional[float]:
-    if not valor:
-        return None
-    m = re.fullmatch(r"\s*(\d+):(\d{2})\s*", valor)
-    if not m:
-        return None
-    return int(m.group(1)) * 60 + int(m.group(2))
-
-
 def pct(parte: Optional[float], total: Optional[float]) -> Optional[float]:
     if parte is None or total is None or total <= 0:
         return None
     return (parte / total) * 100.0
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def generar_grafico(df: pd.DataFrame, metadatos: Dict):
@@ -482,15 +446,10 @@ def generar_grafico(df: pd.DataFrame, metadatos: Dict):
     return fig
 
 
-
-
-
-
 # ==========================================================
 # SALIDA ESTÁNDAR + LECTOR ZDA
 # ==========================================================
 
-TIPOS_ZDA = ORDEN_TIPOS
 ZDA_TIPO_CODES = {
     0: "Reaming",
     1: "Contour",
@@ -502,11 +461,11 @@ ZDA_TIPO_CODES = {
 
 
 def clasificar_tipo_disparo_v33(barrenos_realizados):
-    """Criterio exacto de la HTML V33: FRENTE >45; SELLADA 25-45; resto <25."""
+    """Clasificación: FRENTE >=45; SELLADA 25-44; ESTOCADA <25."""
     if barrenos_realizados is None or pd.isna(barrenos_realizados):
         return "SIN CLASIFICAR"
     n = int(barrenos_realizados)
-    if n > 45:
+    if n >= 45:
         return "FRENTE"
     if n >= 25:
         return "SELLADA"
@@ -611,8 +570,6 @@ def _enriquecer_resultado_estandar(resultado: Dict, fuente: str) -> Dict:
         "fuente": fuente,
     })
     return resultado
-
-
 
 
 def _zda_kv(texto: str) -> Dict[str, str]:
@@ -770,6 +727,17 @@ def _parse_zda_boom(data: bytes, nombre_archivo: str, metadata: Dict) -> Tuple[p
             length = math.sqrt((x2-x)**2 + (y2-y)**2 + (z2-z)**2)
 
             ts_ok = 1577836800 < start_ts < 2051222400 and start_ts <= end_ts < 2051222400
+            if not ts_ok:
+                if data[start + 17] == 0x8A and data[start + 21] == 3:
+                    # Terminó el bloque de ejecutados de 297 bytes; a continuación
+                    # hay barrenos solo programados de 154 bytes (marca kind=3).
+                    # Nunca interpretarlos como perforaciones.
+                    raw_records -= 1
+                    break
+                # Registro ejecutado con marca de tiempo dañada: se cuenta como
+                # inválido y se continúa; NO se descartan los barrenos siguientes.
+                invalid += 1
+                continue
             geom_ok = all(np.isfinite(v) for v in [x,y,z,x2,y2,z2,length]) and 0.10 < length < 20
             boom_ok = boom0 in (0,1) and 0 < sec < 100
             if not tipo:
@@ -783,7 +751,7 @@ def _parse_zda_boom(data: bytes, nombre_archivo: str, metadata: Dict) -> Tuple[p
             boom = boom0 + 1
             ident = _zda_ascii(data, start + 26, 30)
             if not ident:
-                ident = f"R{boom}-{sec}" if tipo == "Reaming" else f"S{boom}-{sec}"
+                ident = f"E{sum(1 for r in rows if str(r['ID']).startswith('E')) + 1}"
             length2 = round(length, 2)
             depth2 = round(y2, 2)
             rows.append({
@@ -968,36 +936,6 @@ def _parse_zda_mwd(zf: zipfile.ZipFile, names: List[str], metadata: Dict) -> Tup
         "layouts_mwd_no_estandar": bad_layout, "metros_mwd": round(total_m,3),
         "paso_mwd_mediana_m": paso,
     }
-
-
-
-def _convex_hull_2d(points):
-    """Convex hull 2D por monotone chain, sin dependencias externas."""
-    pts = sorted(set((float(x), float(y)) for x, y in points))
-    if len(pts) <= 1:
-        return pts
-
-    def cross(o, a, b):
-        return (
-            (a[0] - o[0]) * (b[1] - o[1])
-            - (a[1] - o[1]) * (b[0] - o[0])
-        )
-
-    lower = []
-    for p in pts:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-
-    upper = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-
-    return lower[:-1] + upper[:-1]
-
-
 
 
 def _seccion_desde_plan(plan_perforacion: Optional[str]) -> Tuple[float, float, str]:
@@ -1350,7 +1288,6 @@ def generar_plano_zda_png(
     return buffer.getvalue()
 
 
-
 def procesar_zda(
     zda_path: Path,
     nombre_archivo: Optional[str] = None,
@@ -1499,18 +1436,7 @@ def procesar_archivo(
 # ==========================================================
 
 
-from dataclasses import dataclass
-from io import BytesIO
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import math
-import re
-import struct
-import zipfile
-
-import numpy as np
-import pandas as pd
-
+# (los imports generales ya están al inicio del módulo)
 try:
     from shapely.geometry import Polygon
 except Exception:
@@ -1520,6 +1446,7 @@ except Exception:
 TIPO_CODES = {
     0: "Reaming",
     1: "Contour",
+    3: "Reference",
     4: "Cut",
     5: "Easer",
     8: "Bottom",
@@ -1530,7 +1457,7 @@ PERIMETER_TYPES = {"Contour", "Bottom"}
 BOOM_RECORD_SIZE = 297
 BOOM_FIRST_RECORD = 4
 
-VERSION = "V1.0-ZDA-VOLUMETRIA"
+VERSION = "V1.2-ZDA-PLAN-COMPLETO"
 
 
 def _ascii(data: bytes) -> str:
@@ -1549,6 +1476,10 @@ def _u64(data: bytes, offset: int) -> int:
     return struct.unpack_from("<Q", data, offset)[0]
 
 
+# np.trapezoid solo existe desde NumPy 2.0; requirements permite >=1.26.
+_trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+
+
 def _polygon_area(points: List[Tuple[float, float]]) -> float:
     if len(points) < 3:
         return float("nan")
@@ -1556,13 +1487,6 @@ def _polygon_area(points: List[Tuple[float, float]]) -> float:
     x = arr[:, 0]
     z = arr[:, 1]
     return float(abs(np.dot(x, np.roll(z, -1)) - np.dot(z, np.roll(x, -1))) / 2.0)
-
-
-def _order_points_radial(points: List[Tuple[float, float]]) -> List[int]:
-    arr = np.asarray(points, dtype=float)
-    cx, cz = np.nanmean(arr[:, 0]), np.nanmean(arr[:, 1])
-    angles = np.arctan2(arr[:, 1] - cz, arr[:, 0] - cx)
-    return list(np.argsort(angles))
 
 
 def _segment_key(p: Tuple[float, float], nd: int = 5):
@@ -1688,45 +1612,74 @@ def _extract_operator(tunnel_id: str) -> Optional[str]:
 
 
 def parse_boom_dat(data: bytes) -> pd.DataFrame:
+    """Lee los DOS formatos de registros del boom.dat DD322i.
+
+    - 297 bytes: barreno ejecutado, con plan opcional y coordenadas reales.
+    - 154 bytes (+ 5 bytes finales compartidos en el último registro):
+      barreno SOLO programado; conserva collar y fondo aunque no se perforó.
+
+    Las coordenadas planificadas ocupan offsets 111..158 en ambos formatos.
+    La longitud de los registros se detecta a partir de las marcas de tiempo y
+    coordenadas de ejecución, no de un número de barrenos fijo para el ciclo.
+    """
     rows = []
-    for start in range(BOOM_FIRST_RECORD, len(data) - BOOM_RECORD_SIZE + 1, BOOM_RECORD_SIZE):
+    cursor = BOOM_FIRST_RECORD
+    extra_index = 0
+    while cursor + 159 <= len(data):
+        start = cursor
         try:
-            boom0 = data[start + 159]
-            sec = data[start + 160]
-            type_code = data[start + 175]
-            tipo = TIPO_CODES.get(type_code)
-            if tipo is None or boom0 not in (0, 1) or not (0 < sec < 100):
-                continue
-
+            # El código del tipo se ubica a +175 en registro ejecutado
+            # y a +90 en registro exclusivamente programado.
+            tipo = None
             hole_id = _ascii(data[start + 26:start + 56])
-            boom = boom0 + 1
-            if not hole_id:
-                hole_id = f"R{boom}-{sec}" if tipo == "Reaming" else f"S{boom}-{sec}"
-
+            boom0 = data[start + 5]
+            seq = data[start + 6]
             p = [_f64(data, start + o) for o in (111, 119, 127)]
             p2 = [_f64(data, start + o) for o in (135, 143, 151)]
-            a = [_f64(data, start + o) for o in (183, 191, 199)]
-            a2 = [_f64(data, start + o) for o in (257, 265, 273)]
+            plan_len = math.dist(p, p2) if all(math.isfinite(v) for v in p + p2) else float('nan')
+            long_record = False
+            if start + BOOM_RECORD_SIZE <= len(data):
+                ts = _u32(data, start + 163)
+                end = _u32(data, start + 240)
+                actual = [_f64(data, start + o) for o in (183, 191, 199, 257, 265, 273)]
+                actual_ok = (all(math.isfinite(v) and abs(v) < 100 for v in actual)
+                             and 0.1 < math.dist(actual[:3], actual[3:]) < 20)
+                long_record = (1577836800 < ts <= end < 2051222400 and actual_ok
+                               and boom0 in (0, 1) and 0 < seq < 100
+                               )
+            type_code = data[start + (175 if long_record else 90)]
+            tipo = TIPO_CODES.get(type_code, f"Desconocido (código {type_code})")
+            if long_record:
+                record_size = BOOM_RECORD_SIZE
+                a = actual[:3]
+                a2 = actual[3:]
+                start_ts, end_ts = ts, end
+            else:
+                record_size = 154
+                # No tomar valores del registro siguiente como ejecución.
+                a = a2 = [float('nan')] * 3
+                start_ts = end_ts = None
+                if not (tipo is not None and 0.1 < plan_len < 20.0
+                        and all(math.isfinite(v) and abs(v) < 100 for v in p + p2)):
+                    raise ValueError(f"Registro de diseño no reconocido en offset {start}.")
 
-            if not all(math.isfinite(v) for v in p + p2 + a + a2):
-                continue
-
-            plan_len = math.dist(p, p2)
-            actual_len = math.dist(a, a2)
-            actual_dy = a2[1] - a[1]
-
-            planned_exists = (
-                not hole_id.upper().startswith("E")
-                and plan_len > 0.1
-                and plan_len < 20
-            )
-
+            if not hole_id:
+                if long_record:
+                    extra_index += 1
+                    hole_id = f"E{extra_index}"
+                else:
+                    raise ValueError(f"Barreno programado sin ID en offset {start}.")
+            extra = (not (0.1 < plan_len < 20.0)
+                     or (hole_id.upper().startswith('E') and long_record))
+            if (not long_record) and hole_id.upper().startswith('E'):
+                raise ValueError(f"Barreno sin ejecución y marcado extra: {hole_id}.")
+            planned_exists = (not extra and 0.1 < plan_len < 20.0)
+            actual_len = math.dist(a, a2) if long_record else float('nan')
             rows.append({
-                "ID": hole_id,
-                "Brazo": boom,
-                "Secuencia": int(sec),
-                "Tipo": tipo,
-                "Extra": hole_id.upper().startswith("E"),
+                # En registros solo programados, Brazo es el brazo PLANIFICADO (offset +5).
+                "ID": hole_id, "Brazo": boom0 + 1 if boom0 in (0, 1) else np.nan,
+                "Secuencia": int(seq) if long_record and 0 < seq < 100 else np.nan,
+                "Tipo": tipo, "Extra": extra,
                 "Plan_X": p[0] if planned_exists else np.nan,
                 "Plan_Y": p[1] if planned_exists else np.nan,
                 "Plan_Z": p[2] if planned_exists else np.nan,
@@ -1737,13 +1690,19 @@ def parse_boom_dat(data: bytes) -> pd.DataFrame:
                 "X": a[0], "Y": a[1], "Z": a[2],
                 "X2": a2[0], "Y2": a2[1], "Z2": a2[2],
                 "Longitud_m": actual_len,
-                "Avance_Y_m": actual_dy,
-                "Inicio_TS": _u32(data, start + 163),
-                "Fin_TS": _u32(data, start + 240),
+                "Avance_Y_m": a2[1] - a[1] if long_record else np.nan,
+                "Inicio_TS": start_ts, "Fin_TS": end_ts,
+                "Estado_Barreno": ("Extra ejecutado" if extra else
+                                   "Plan y ejecución" if long_record else "Programado no perforado"),
+                "Fuente_Plan": "ZDA boom.dat" if planned_exists else None,
+                "Fuente_Real": "ZDA boom.dat" if long_record else None,
+                "Offset_Boom": start, "Tamano_Registro_Boom": record_size,
             })
-        except Exception:
-            continue
-
+            cursor += record_size
+        except (struct.error, IndexError, OverflowError) as exc:
+            raise ValueError(f"Registro binario dañado en boom.dat offset {start}: {exc}") from exc
+    if cursor + 5 != len(data):
+        raise ValueError(f"Fin de boom.dat inesperado: cursor={cursor}, tamaño={len(data)}")
     df = pd.DataFrame(rows)
     if not df.empty:
         df["Desv_Collar_m"] = np.sqrt(
@@ -1823,45 +1782,73 @@ def parse_round_dat_profile(data: bytes) -> Dict:
     }
 
 
-def _perimeter_rows(df: pd.DataFrame) -> pd.DataFrame:
-    out = df[
-        df["Tipo"].isin(PERIMETER_TYPES)
-        & (~df["Extra"].fillna(False))
-    ].copy()
-    out = out[
-        out[["Plan_X","Plan_Z","X","Z","X2","Z2"]].notna().all(axis=1)
-    ].copy()
-    return out
-
-
-def _build_ordered_profiles(df: pd.DataFrame) -> Dict:
-    per = _perimeter_rows(df)
-    if per.empty:
-        return {}
-    planned_pts = list(zip(per["Plan_X"], per["Plan_Z"]))
-    order = _order_points_radial(planned_pts)
-    per = per.iloc[order].reset_index(drop=True)
-
-    planned = list(zip(per["Plan_X"], per["Plan_Z"]))
-    actual_start = list(zip(per["X"], per["Z"]))
-    actual_end = list(zip(per["X2"], per["Z2"]))
-
-    return {
-        "rows": per,
-        "planned": planned,
-        "actual_start": actual_start,
-        "actual_end": actual_end,
-        "area_planned_m2": _polygon_area(planned),
-        "area_start_m2": _polygon_area(actual_start),
-        "area_end_m2": _polygon_area(actual_end),
-    }
-
-
-def _interpolate_profile(p0, p1, t: float):
-    return [
-        (x0 + (x1-x0)*t, z0 + (z1-z0)*t)
-        for (x0,z0),(x1,z1) in zip(p0,p1)
-    ]
+def _build_ordered_profiles(df: pd.DataFrame, nominal_profile: Dict | None = None) -> Dict:
+    """Reconstrucción conservadora: el diseño manda; nunca completar con reales."""
+    nominal_pts = (nominal_profile or {}).get("polygon", [])
+    # LEGACY perimeter model requires pairs with both geometries; the official
+    # masks use separate full plan (54) and executed (50) sets below.
+    candidates = df[(~df["Extra"].fillna(False)) &
+                    df[["Plan_X", "Plan_Z", "Plan_X2", "Plan_Z2",
+                        "X", "Z", "X2", "Z2"]].notna().all(axis=1)].copy()
+    if candidates.empty or len(nominal_pts) < 3:
+        return {"ok": False, "reason": "Faltan collares programados o perfil nominal.", "audit_rows": candidates}
+    boundary = np.asarray(nominal_pts, dtype=float)
+    if not np.isfinite(boundary).all():
+        return {"ok": False, "reason": "Perfil nominal con coordenadas inválidas.", "audit_rows": candidates}
+    # Proyección a la polilínea nominal: posición longitudinal y distancia.
+    a = boundary[:-1] if np.linalg.norm(boundary[0]-boundary[-1]) < 1e-6 else boundary
+    b = np.roll(a, -1, axis=0)
+    ab = b-a; lengths = np.linalg.norm(ab, axis=1)
+    cumulative = np.r_[0., np.cumsum(lengths)]
+    distances=[]; stations=[]
+    for _, hole in candidates.iterrows():
+        point=np.array([float(hole["Plan_X"]),float(hole["Plan_Z"])])
+        u=np.clip(np.divide(np.sum((point-a)*ab,axis=1),np.sum(ab*ab,axis=1),out=np.zeros(len(a)),where=lengths>1e-9),0,1)
+        d=np.linalg.norm(point-(a+u[:,None]*ab),axis=1)
+        j=int(np.argmin(d));distances.append(float(d[j]));stations.append(float(cumulative[j]+u[j]*lengths[j]))
+    candidates["Distancia_nominal_m"]=distances
+    candidates["Posicion_perimetro_m"]=stations
+    # Tipo es evidencia auxiliar; la proximidad geométrica es obligatoria.
+    near=candidates["Distancia_nominal_m"] <= 0.65
+    base = candidates["Tipo"].isin(PERIMETER_TYPES) & near
+    per=candidates.loc[base].copy()
+    # Otros tipos solo como candidatos si la selección principal deja huecos;
+    # nunca se promueven indiscriminadamente todos los Easer cercanos.
+    def _largest_gap(rows):
+        if rows.empty: return float("inf")
+        st=np.sort(rows["Posicion_perimetro_m"].to_numpy())
+        return float(np.diff(np.r_[st,st[0]+cumulative[-1]]).max())
+    if _largest_gap(per)>max(2.25,0.16*float(cumulative[-1])):
+        extra=candidates.loc[near & ~candidates["Tipo"].isin(PERIMETER_TYPES)].copy()
+        # Incorporar candidatos solo cuando reducen el mayor tramo sin puntos.
+        for _, candidate in extra.sort_values("Distancia_nominal_m").iterrows():
+            trial=pd.concat([per,candidate.to_frame().T],ignore_index=True)
+            if _largest_gap(trial)<_largest_gap(per)-0.05:
+                per=trial
+    per=per.sort_values(["Posicion_perimetro_m","Distancia_nominal_m"]).drop_duplicates(subset=["Plan_X","Plan_Z"]).reset_index(drop=True)
+    excluded=candidates.loc[~near,"ID"].tolist()
+    if len(per)<8:
+        return {"ok":False,"reason":"Menos de ocho collares programados próximos al perímetro nominal.","audit_rows":candidates,"excluded_interior_ids":excluded}
+    # No publicar geometrías si faltan tramos enteros del perímetro.
+    perimeter_length=float(cumulative[-1]);st=np.sort(per["Posicion_perimetro_m"].to_numpy())
+    gaps=np.diff(np.r_[st,st[0]+perimeter_length]);max_gap=float(np.max(gaps))
+    if max_gap>max(2.25,0.16*perimeter_length):
+        return {"ok":False,"reason":f"Diseño perimetral incompleto: tramo sin collar programado de {max_gap:.2f} m. No se interpolan barrenos faltantes desde coordenadas reales.","audit_rows":candidates,"excluded_interior_ids":excluded,"max_gap_m":max_gap}
+    needed=["Plan_X2","Plan_Z2","X","Z","X2","Z2","Plan_Y","Plan_Y2","Y","Y2"]
+    if per[needed].isna().any().any():
+        return {"ok":False,"reason":"Hay barrenos del perímetro sin coordenadas programadas o reales completas.","audit_rows":candidates,"excluded_interior_ids":excluded}
+    planned=list(zip(per["Plan_X"],per["Plan_Z"]))
+    actual_start=list(zip(per["X"],per["Z"]))
+    actual_end=list(zip(per["X2"],per["Z2"]))
+    if Polygon is None:
+        return {"ok":False,"reason":"Shapely no está disponible para validar polígonos.","audit_rows":candidates}
+    polys=[Polygon(points) for points in (planned,actual_start,actual_end)]
+    if any((not q.is_valid or q.area<3) for q in polys):
+        return {"ok":False,"reason":"El contorno programado o real se cruza, degenera o contiene coordenadas anómalas.","audit_rows":candidates,"excluded_interior_ids":excluded}
+    return {"ok":True,"rows":per,"audit_rows":candidates,"excluded_interior_ids":excluded,
+            "planned":planned,"actual_start":actual_start,"actual_end":actual_end,
+            "area_planned_m2":_polygon_area(planned),"area_start_m2":_polygon_area(actual_start),
+            "area_end_m2":_polygon_area(actual_end)}
 
 
 def _safe_polygon(points):
@@ -1876,28 +1863,31 @@ def _safe_polygon(points):
         return None
 
 
-def calculate_volumetry(df: pd.DataFrame, nominal_profile: Dict, n_sections: int = 41) -> Dict:
-    prof = _build_ordered_profiles(df)
-    if not prof:
-        return {"ok": False, "reason": "No se pudo construir el perímetro Contour+Bottom."}
+def calculate_volumetry(df: pd.DataFrame, nominal_profile: Dict) -> Dict:
+    """Valida el contorno perimetral y fija la profundidad común de referencia.
 
-    cuts = df[(df["Tipo"] == "Cut") & (df["Longitud_m"] > 0.1)].copy()
-    referencia = cuts
-    referencia_tipo = "Cut"
+    La profundidad común es la mediana del avance (eje Y) de los barrenos Cut; si no hay Cut se
+    usan los Easer y, en último caso, todos los barrenos de frente. La integración de volúmenes
+    ya NO se hace aquí: la realiza `calculate_mask_volumetry` con esta profundidad.
+    Devuelve `ok`, `perimeter_rows`, `cut_median_advance_y_m` o, si falla, `ok=False` y `reason`.
+    """
+    prof = _build_ordered_profiles(df, nominal_profile)
+    if not prof.get("ok"):
+        return {"ok": False, "reason": prof.get("reason", "Contorno no validado.")}
+
+    referencia = df[(df["Tipo"] == "Cut") & (df["Longitud_m"] > 0.1)].copy()
 
     if referencia.empty:
         referencia = df[
             (df["Tipo"] == "Easer")
             & (pd.to_numeric(df["Longitud_m"], errors="coerce") > 0.1)
         ].copy()
-        referencia_tipo = "Easer"
 
     if referencia.empty:
         referencia = df[
             df["Tipo"].isin(["Bottom", "Easer", "Cut", "Contour"])
             & (pd.to_numeric(df["Longitud_m"], errors="coerce") > 0.1)
         ].copy()
-        referencia_tipo = "Frente"
 
     if referencia.empty:
         return {
@@ -1905,93 +1895,209 @@ def calculate_volumetry(df: pd.DataFrame, nominal_profile: Dict, n_sections: int
             "reason": "No existen barrenos de frente válidos para determinar la profundidad común.",
         }
 
-    L = float(pd.to_numeric(referencia["Longitud_m"], errors="coerce").median())
     Ly = float(pd.to_numeric(referencia["Avance_Y_m"], errors="coerce").abs().median())
 
-    p0 = prof["actual_start"]
-    p1 = prof["actual_end"]
-    ts = np.linspace(0.0, 1.0, max(5, int(n_sections)))
-    areas = []
-    over_areas = []
-    under_areas = []
-    nominal_poly = _safe_polygon(nominal_profile.get("polygon", [])) if nominal_profile else None
-
-    for t in ts:
-        pts = _interpolate_profile(p0, p1, float(t))
-        a = _polygon_area(pts)
-        areas.append(a)
-
-        if nominal_poly is not None:
-            p = _safe_polygon(pts)
-            if p is not None:
-                over_areas.append(float(p.difference(nominal_poly).area))
-                under_areas.append(float(nominal_poly.difference(p).area))
-            else:
-                over_areas.append(np.nan)
-                under_areas.append(np.nan)
-
-    # Integración trapezoidal sobre profundidad longitudinal de referencia.
-    s = ts * Ly
-    v3 = float(np.trapezoid(np.asarray(areas, dtype=float), s))
-    v1 = float(prof["area_start_m2"] * Ly)
-    v2 = float(prof["area_end_m2"] * Ly)
-
-    # Simpson prismoidal simple usando perfil medio.
-    mid_pts = _interpolate_profile(p0, p1, 0.5)
-    a_mid = _polygon_area(mid_pts)
-    v3_simpson = float(Ly / 6.0 * (prof["area_start_m2"] + 4*a_mid + prof["area_end_m2"]))
-
-    nominal_area = float(nominal_profile.get("area_m2", np.nan)) if nominal_profile else np.nan
-    v_nominal = float(nominal_area * Ly) if math.isfinite(nominal_area) else np.nan
-
-    over_v = float(np.trapezoid(np.asarray(over_areas, dtype=float), s)) if over_areas and np.isfinite(over_areas).any() else np.nan
-    under_v = float(np.trapezoid(np.asarray(under_areas, dtype=float), s)) if under_areas and np.isfinite(under_areas).any() else np.nan
-
-    # Calidad/representatividad: qué proporción del perímetro alcanzó al menos 85% del avance Cut longitudinal.
     per = prof["rows"].copy()
     per["Avance_Y_abs_m"] = (per["Y2"] - per["Y"]).abs()
-    threshold = 0.85 * Ly
-    complete = per["Avance_Y_abs_m"] >= threshold
-    ratio_complete = float(complete.mean()) if len(per) else np.nan
-    if ratio_complete >= 0.85:
-        confidence = "ALTA"
-    elif ratio_complete >= 0.60:
-        confidence = "MEDIA"
-    else:
-        confidence = "BAJA"
 
     return {
         "ok": True,
         "perimeter_rows": per,
-        "planned_polygon": prof["planned"],
-        "start_polygon": p0,
-        "end_polygon": p1,
-        "mid_polygon": mid_pts,
-        "area_planned_m2": prof["area_planned_m2"],
-        "area_start_m2": prof["area_start_m2"],
-        "area_mid_m2": a_mid,
-        "area_end_m2": prof["area_end_m2"],
-        "cut_median_length_m": L,
         "cut_median_advance_y_m": Ly,
-        "reference_hole_type": referencia_tipo,
-        "v1_m3": v1,
-        "v2_m3": v2,
-        "v3_integrated_m3": v3,
-        "v3_simpson_m3": v3_simpson,
-        "nominal_area_m2": nominal_area,
-        "nominal_volume_m3": v_nominal,
-        "overprofile_potential_m3": over_v,
-        "underprofile_potential_m3": under_v,
-        "overprofile_potential_pct_nominal": (over_v / v_nominal * 100.0) if math.isfinite(over_v) and v_nominal > 0 else np.nan,
-        "perimeter_holes_n": int(len(per)),
-        "perimeter_holes_ge85pct_cut_n": int(complete.sum()),
-        "perimeter_holes_ge85pct_cut_pct": ratio_complete * 100.0,
-        "confidence": confidence,
-        "sections_t": ts.tolist(),
-        "sections_area_m2": [float(x) for x in areas],
-        "sections_over_m2": [float(x) if math.isfinite(x) else None for x in over_areas],
-        "sections_under_m2": [float(x) if math.isfinite(x) else None for x in under_areas],
     }
+
+
+def _mask_triangles(pts: np.ndarray, planned: bool, nominal_buf, max_edge_m: float):
+    """Triangula una nube de puntos y devuelve (triángulos válidos (k,3,2), unión Shapely o None).
+
+    Versión vectorizada: todo el filtrado (validez, área mínima, arista máxima y centroide
+    dentro del nominal ampliado) se hace en bloque con Shapely 2, sin crear un polígono ni un
+    buffer por triángulo. El resultado es idéntico al del bucle anterior.
+    """
+    import shapely
+    from matplotlib.tri import Triangulation
+
+    tri = Triangulation(pts[:, 0], pts[:, 1]).triangles
+    T = pts[tri]                                    # (n, 3, 2)
+    polys = shapely.polygons(T)
+    keep = shapely.is_valid(polys) & (shapely.area(polys) >= 1e-7)
+    if not planned:
+        # El programado no se recorta contra el nominal; el real descarta aristas largas
+        # y triángulos cuyo centroide queda fuera del nominal + 1.5 m.
+        edges_max = np.linalg.norm(T - np.roll(T, 1, axis=1), axis=2).max(axis=1)
+        keep &= (edges_max <= max_edge_m) & shapely.covers(nominal_buf, shapely.centroid(polys))
+    if not keep.any():
+        return T[:0], None
+    good = polys[keep]
+    # Los triángulos de una Delaunay forman una cobertura (sin solapes y con aristas
+    # compartidas), así que la unión de cobertura es ~10x más rápida que union_all.
+    # Se valida que el área unida iguale la suma de áreas; si no, se usa union_all.
+    union = None
+    if hasattr(shapely, "coverage_union_all"):
+        try:
+            union = shapely.coverage_union_all(good)
+            if union.is_empty or abs(union.area - float(shapely.area(good).sum())) > 1e-9:
+                union = None
+        except Exception:
+            union = None
+    if union is None:
+        union = shapely.union_all(good)
+    # normalize deja anillo con orientación y vértice inicial deterministas.
+    return T[keep], shapely.normalize(union)
+
+
+def build_experimental_masks(df: pd.DataFrame, nominal_profile: Dict, max_edge_m: float = 2.0) -> Dict:
+    """Triangulación exploratoria de collares; NO valida perímetros ni calcula volúmenes.
+
+    El plano programado conserva su triangulación sin recorte nominal. La nube real
+    se triangula por separado; se rechazan triángulos largos y los alejados del
+    perfil nominal. Nunca se sustituyen coordenadas programadas por reales.
+    """
+    nominal = _safe_polygon((nominal_profile or {}).get("polygon", []))
+    if nominal is None or nominal.area < 1:
+        return {"ok": False, "reason": "No existe perfil nominal válido en el ZDA."}
+    nominal_buf = nominal.buffer(1.5)               # una sola vez (antes: uno por triángulo)
+    result = {"ok": True, "nominal": list(nominal.exterior.coords), "masks": {}}
+    for key, xc, zc, planned in (("programado", "Plan_X", "Plan_Z", True),
+                                  ("real", "X", "Z", False)):
+        rows = df[df[[xc, zc]].notna().all(axis=1)].copy()
+        if planned:
+            rows = rows[~rows["Extra"].fillna(False)]
+        rows = rows[np.isfinite(rows[xc].to_numpy(dtype=float)) & np.isfinite(rows[zc].to_numpy(dtype=float))]
+        rows = rows[(rows[xc].abs() < 100) & (rows[zc].abs() < 100)]
+        # La triangulación usa ubicaciones únicas; el gráfico y la auditoría
+        # conservan TODOS los ID coincidentes (p. ej. Cut / Reaming colocalizados).
+        n_barrenos = len(rows)
+        grouped = rows.groupby([xc, zc], sort=False, dropna=False)["ID"].agg(
+            lambda values: ", ".join(str(v) for v in values)
+        ).reset_index()
+        pts = grouped[[xc, zc]].to_numpy(dtype=float)
+        entry = {"points": [(float(x), float(z)) for x, z in pts],
+                 "ids": grouped["ID"].tolist(), "n_barrenos": n_barrenos,
+                 "triangles": [], "boundary": []}
+        if len(pts) >= 3:
+            try:
+                # La envolvente planificada incluye sus puntos exteriores (sin recorte nominal).
+                kept, union = _mask_triangles(pts, planned, nominal_buf, max_edge_m)
+                entry["triangles"] = [[(float(x), float(z)) for x, z in tri] for tri in kept]
+                if union is not None:
+                    if union.geom_type == "Polygon":
+                        entry["boundary"] = [(float(x), float(z)) for x, z in union.exterior.coords]
+                    entry["mesh_area_m2"] = float(union.area)
+            except (ValueError, RuntimeError) as exc:
+                entry["warning"] = f"No se pudo triangular: {exc}"
+        result["masks"][key] = entry
+    return result
+
+
+def calculate_mask_volumetry(df: pd.DataFrame, nominal_profile: Dict,
+                              reference: Dict, n_sections: int = 41,
+                              max_edge_m: float = 2.0) -> Dict:
+    """Comparación EXPERIMENTAL por máscaras a profundidad longitudinal común.
+
+    No extrapola barrenos reales cortos. Re-triangula cada sección y compara
+    uniones poligonales completas, no solamente sus envolventes exteriores.
+    Los resultados se mantienen separados de la volumetría vigente.
+    """
+    if not reference.get("ok"):
+        return {"ok": False, "reason": "Sin profundidad de referencia validada."}
+    depth = float(reference.get("cut_median_advance_y_m", 0))
+    if not np.isfinite(depth) or depth <= 0.1:
+        return {"ok": False, "reason": "Profundidad longitudinal no válida."}
+    nominal = _safe_polygon((nominal_profile or {}).get("polygon", []))
+    if nominal is None:
+        return {"ok": False, "reason": "No hay perfil nominal para controlar los triángulos reales."}
+
+    nominal_buf = nominal.buffer(1.5)               # una sola vez (antes: uno por triángulo)
+    prepared = {}
+    for key, planned in (("programado", True), ("real", False)):
+        cols = (["Plan_X", "Plan_Y", "Plan_Z", "Plan_X2", "Plan_Y2", "Plan_Z2"]
+                if planned else ["X", "Y", "Z", "X2", "Y2", "Z2"])
+        rows = df.copy()
+        if planned:
+            rows = rows[~rows["Extra"].fillna(False)]
+        vals = rows[cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(vals).all(axis=1) & (np.abs(vals) < 100).all(axis=1)
+        rows, vals = rows.loc[valid].copy(), vals[valid]
+        if len(vals) < 3:
+            return {"ok": False, "reason": f"Insuficientes coordenadas {key}."}
+        prepared[key] = (rows, vals)
+    # Cantidades independientes de la profundidad: se calculan una vez, no en cada sección.
+    adv_all = {k: np.abs(v[1][:, 4] - v[1][:, 1]) for k, v in prepared.items()}
+    len_real = pd.to_numeric(prepared["real"][0]["Longitud_m"], errors="coerce").to_numpy(dtype=float)
+
+    def section(key, distance):
+        rows, vals = prepared[key]
+        advance = adv_all[key]
+        valid = advance >= distance - 1e-6
+        # Un barreno corto no puede proyectarse artificialmente hasta el fondo.
+        if key == "real":
+            valid &= np.isfinite(len_real) & (len_real >= distance - 1e-6)
+        valid &= advance > 1e-5
+        vals = vals[valid]
+        ids = rows.loc[valid, "ID"].astype(str).tolist()
+        n_total, n_barrenos = int(len(rows)), int(len(vals))
+        if len(vals) < 3:
+            return None, {"points": [], "ids": [], "triangles": [], "boundary": [], "area_m2": None,
+                          "n_barrenos": n_barrenos, "n_total": n_total}
+        fraction = np.clip(distance / np.abs(vals[:, 4] - vals[:, 1]), 0, 1)
+        pts = np.column_stack((vals[:, 0] + fraction * (vals[:, 3] - vals[:, 0]),
+                               vals[:, 2] + fraction * (vals[:, 5] - vals[:, 2])))
+        # Deduplicación estable: posiciones coincidentes (p. ej. Reaming sobre un Cut)
+        # se funden en un punto, pero conservando TODOS los IDs ("50, 89").
+        _, first, inv = np.unique(np.round(pts, 5), axis=0, return_index=True, return_inverse=True)
+        inv = np.asarray(inv).ravel()
+        orden = np.argsort(first)
+        ids = [", ".join(ids[j] for j in np.where(inv == g)[0]) for g in orden]
+        pts = pts[first[orden]]
+        entry = {"points": pts.tolist(), "ids": ids, "triangles": [], "boundary": [], "area_m2": None,
+                 "n_barrenos": n_barrenos, "n_total": n_total}
+        if len(pts) < 3:
+            return None, entry
+        try:
+            # Programado: sin recorte nominal (se conserva la envolvente planificada).
+            kept, geom = _mask_triangles(pts, key == "programado", nominal_buf, max_edge_m)
+            entry["triangles"] = kept.tolist()
+            if geom is None:
+                return None, entry
+            entry["area_m2"] = float(geom.area)
+            if geom.geom_type == "Polygon":
+                entry["boundary"] = list(geom.exterior.coords)
+            return geom, entry
+        except (ValueError, RuntimeError, FloatingPointError) as exc:
+            entry["warning"] = str(exc)
+            return None, entry
+
+    distances = np.linspace(0, depth, max(5, int(n_sections)))
+    sections = []
+    for distance in distances:
+        gp, ep = section("programado", float(distance))
+        gr, er = section("real", float(distance))
+        record = {"depth_m": float(distance), "programado": ep, "real": er,
+                  "outside_m2": None, "not_covered_m2": None}
+        if gp is not None and gr is not None:
+            record["outside_m2"] = float(gr.difference(gp).area)
+            record["not_covered_m2"] = float(gp.difference(gr).area)
+        sections.append(record)
+    # No integrar a través de huecos de información: exigir todas las secciones.
+    keys = {"programado_m3": ("programado", "area_m2"),
+            "real_m3": ("real", "area_m2"),
+            "outside_m3": (None, "outside_m2"),
+            "not_covered_m3": (None, "not_covered_m2")}
+    result = {"ok": True, "experimental": True, "depth_m": depth,
+              "sections": sections, "n_sections": len(sections), "max_edge_m": max_edge_m}
+    for target, (group, field) in keys.items():
+        values = [row[group][field] if group else row[field] for row in sections]
+        result[target] = (float(_trapz(values, distances))
+                          if all(v is not None and np.isfinite(v) for v in values) else None)
+    if result["programado_m3"] is not None and result["real_m3"] is not None:
+        result["balance_m3"] = result["real_m3"] - result["programado_m3"]
+    else:
+        result["balance_m3"] = None
+    result["complete"] = all(result[k] is not None for k in keys)
+    result["warning"] = ("Cálculo exploratorio; verificar la conectividad, los barrenos cortos "
+                         "y el límite exterior antes de usar estos volúmenes como indicadores.")
+    return result
 
 
 def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
@@ -2014,7 +2120,20 @@ def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
             "segments": [], "chain": [], "polygon": [], "area_m2": float("nan"), "decoded": False
         }
 
-    volumetry = calculate_volumetry(holes, nominal)
+    plan_n = int(holes["Plan_X"].notna().sum())
+    drilled_n = int(holes["X"].notna().sum())
+    expected_plan = meta.get("planned_face_holes")
+    expected_drilled = meta.get("drilled_holes")
+    plan_ok = expected_plan is None or plan_n == int(expected_plan)
+    drilled_ok = expected_drilled is None or drilled_n == int(expected_drilled)
+    volumetry = calculate_volumetry(holes, nominal) if plan_ok and drilled_ok else {
+        "ok": False, "reason": "Conciliación de barrenos incompleta: "
+        f"plan {plan_n}/{expected_plan}, ejecutado {drilled_n}/{expected_drilled}."
+    }
+    masks = build_experimental_masks(holes, nominal)
+    mask_vol = calculate_mask_volumetry(holes, nominal, volumetry) if plan_ok and drilled_ok else {
+        "ok": False, "complete": False, "reason": volumetry["reason"]
+    }
 
     return {
         "filename": filename,
@@ -2022,6 +2141,11 @@ def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
         "holes": holes,
         "nominal_profile": nominal,
         "volumetry": volumetry,
+        "experimental_masks": masks,
+        "mask_volumetry": mask_vol,
+        "auditoria_conteos": {"programados_extraidos": plan_n, "ejecutados_extraidos": drilled_n,
+                              "programados_declarados": expected_plan, "ejecutados_declarados": expected_drilled,
+                              "conciliado": bool(plan_ok and drilled_ok)},
         "internal_files": names,
         "version": VERSION,
     }
@@ -2030,3 +2154,65 @@ def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
 def process_zda_file(path: str | Path) -> Dict:
     p = Path(path)
     return process_zda_bytes(p.read_bytes(), p.name)
+
+
+# ==========================================================
+# RESÚMENES POR LOTE (selector de ciclos)
+# ==========================================================
+
+def volumen_unico_ciclo(resultado: Dict) -> Optional[Dict]:
+    """Única fuente: integral de las mismas secciones que muestran el 2D, 3D y PDF.
+
+    Devuelve None si la volumetría no es completa o falla la identidad geométrica
+    (ejecutado − programado = fuera − no cubierto).
+    """
+    m = (resultado or {}).get("mask_volumetry") or {}
+    claves = ("programado_m3", "real_m3", "outside_m3", "not_covered_m3")
+    if not m.get("ok") or not m.get("complete"):
+        return None
+    try:
+        valores = {k: float(m[k]) for k in claves}
+        if not all(np.isfinite(x) and x >= 0 for x in valores.values()):
+            return None
+        vp, vr, vf, vn = (valores[k] for k in claves)
+        tolerancia = max(0.02, 1e-4 * max(vp, vr, 1.0))
+        if abs((vr - vp) - (vf - vn)) > tolerancia:
+            return None
+        if vp <= 0:
+            return None
+        return {**valores, "dgt_m3": vf + vn,
+                "fuera_pct": 100 * vf / vp,
+                "no_cubierto_pct": 100 * vn / vp,
+                "dgt_pct": 100 * (vf + vn) / vp}
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def resumen_eficiencia_desde_path(path_str: str) -> Optional[Dict]:
+    """Procesa un ZDA y devuelve solo el resumen liviano (sin secciones ni DataFrames)."""
+    try:
+        return volumen_unico_ciclo(process_zda_file(path_str))
+    except Exception:
+        return None          # ZDA defectuoso: el selector lo muestra como "No calculada"
+
+
+def _resumen_worker(path_str: str):
+    return path_str, resumen_eficiencia_desde_path(path_str)
+
+
+def resumenes_eficiencia_lote(paths, max_workers: Optional[int] = None) -> Dict[str, Optional[Dict]]:
+    """Resúmenes de varios ZDA. Usa procesos en paralelo si hay núcleos y archivos suficientes;
+    ante cualquier problema con el paralelismo cae al modo secuencial (mismo resultado)."""
+    import os
+    lista = list(dict.fromkeys(str(p) for p in paths))
+    if max_workers is None:
+        max_workers = min(4, (os.cpu_count() or 1) - 1)
+    if max_workers >= 2 and len(lista) >= 4:
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as ex:
+                return dict(ex.map(_resumen_worker, lista, chunksize=1))
+        except Exception:
+            pass
+    return dict(_resumen_worker(p) for p in lista)
