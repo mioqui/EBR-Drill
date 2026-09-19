@@ -118,6 +118,20 @@ st.markdown(
         color: #BDD0CD !important;
         line-height: 1.5;
     }
+    /* Signo de interrogación de ayuda (help=): claro para que se vea sobre el verde del panel. */
+    /* El trazo del ícono lo fija Streamlit con un gris oscuro (no usa currentColor): se fuerza aquí. */
+    [data-testid="stSidebar"] [data-testid="stTooltipIcon"] button {
+        color: #BDD0CD !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stTooltipIcon"] svg,
+    [data-testid="stSidebar"] [data-testid="stTooltipIcon"] svg * {
+        stroke: #BDD0CD !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stTooltipIcon"] button:hover svg,
+    [data-testid="stSidebar"] [data-testid="stTooltipIcon"] button:hover svg * {
+        stroke: #FFFFFF !important;
+    }
     [data-testid="stSidebar"] [data-testid="stCheckbox"] {
         margin: 0 !important;
         padding: .02rem 0 !important;
@@ -425,9 +439,10 @@ with st.sidebar:
 
         # Igual que la interfaz HTML: opciones visibles sin desplegables.
         # El estado global_* sigue siendo una lista y mantiene los filtros originales.
-        def _grupo_checks(titulo, clave, opciones):
+        def _grupo_checks(titulo, clave, opciones, ayuda=None):
             st.divider()
-            st.markdown(f"#### {titulo}")
+            # `ayuda` muestra un signo de interrogación con el mensaje al pasar el mouse.
+            st.markdown(f"#### {titulo}", help=ayuda)
             seleccion_previa = set(st.session_state.get(clave, opciones))
             elegidos = []
             for opcion in opciones:
@@ -443,7 +458,11 @@ with st.sidebar:
             return elegidos
 
         global_jumbos = _grupo_checks("Jumbos", "global_jumbos", jumbos_detectados)
-        global_tipos = _grupo_checks("Tipo de disparo", "global_tipos", tipos_detectados)
+        global_tipos = _grupo_checks(
+            "Tipo de disparo", "global_tipos", tipos_detectados,
+            ayuda=("Clasificación por barrenos realizados: Frente ≥45 | Sellada 25–44 | "
+                   "Estocada y/o correcciones <25."),
+        )
         global_rocas = _grupo_checks("Tipo de roca", "global_rocas", rocas_detectadas)
         global_operadores = _grupo_checks("Operadores", "global_operadores", operadores_detectados)
 
