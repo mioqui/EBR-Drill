@@ -51,11 +51,6 @@ COLORES = qualitative.Plotly
 st.set_page_config(page_title=f"EBR Drill Analytics · Piloto {PUBLIC_VERSION}", page_icon="⛏️", layout="wide")
 st.title("EBR Drill Analytics")
 st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de archivos ZDA de equipos Jumbo")
-st.info(
-    "Consolida y analiza información de perforación desde archivos ZDA, mostrando automatización por jumbo y brazo, "
-    "longitud perforada en barrenos Cut, tasa de penetración ROP, tiempos de ciclo, clasificación de disparos y exportación de datos a Excel."
-)
-
 st.markdown(
     """
     <style>
@@ -75,6 +70,14 @@ st.markdown(
         padding-top: 0.15rem !important;
         overflow: visible !important;
     }
+    /* Los <style> de primer nivel son elementos vacíos que igual suman el hueco entre elementos
+       (16 px cada uno): se ocultan. Solo afecta al nivel superior de la página. */
+    [data-testid="stAppViewBlockContainer"] > [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:has(> [data-testid="stMarkdown"] style) {
+        display: none;
+    }
+    /* Tarjeta "Cargar ciclos": menos aire arriba y separación uniforme entre sus elementos. */
+    .st-key-zona_carga { gap: 0.6rem !important; padding-bottom: 0.6rem !important; }
+    .st-key-zona_carga h3 { padding: 0 0 0.55rem 0 !important; margin: 0 !important; }
     h2 { font-size: 1.22rem !important; margin-top: 0.7rem !important; }
     h3 { font-size: 1.00rem !important; margin-top: 0.55rem !important; margin-bottom: 0.25rem !important; }
     [data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
@@ -765,6 +768,20 @@ def _font_etiqueta_barras(n_barras):
     return 8
 
 
+def _estilo_linea(color, curva=True, simbolo="circle", ancho=3.0):
+    """Estilo de línea de los gráficos de evolución: curva suave con marcadores huecos
+    (círculo blanco con borde del color de la serie). Sin relleno bajo la línea.
+    Sin `curva` solo se dibujan los marcadores."""
+    marcador = dict(size=9, symbol=simbolo, color="#ffffff", line=dict(color=color, width=2.5))
+    if not curva:
+        return dict(mode="markers", marker=marcador)
+    return dict(
+        mode="lines+markers",
+        line=dict(width=ancho, color=color, shape="spline", smoothing=1.0),
+        marker=marcador,
+    )
+
+
 def _es_barras(tipo_grafico):
     return str(tipo_grafico).strip().lower().startswith("barra")
 
@@ -1261,21 +1278,10 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
         else:
             fig.add_trace(go.Scatter(
                 x=g["FechaHora"], y=g["Pct_Movimiento_Automatico_Brazos"],
-                mode="lines+markers" if mostrar_linea else "markers",
                 name=jumbo,
-                line=dict(
-                    width=3,
-                    color=color,
-                    shape="spline",
-                    smoothing=1.0,
-                ) if mostrar_linea else None,
-                marker=dict(
-                    size=9,
-                    color=color,
-                    line=dict(color="#ffffff", width=1.2),
-                ),
                 customdata=custom,
                 hovertemplate=hover,
+                **_estilo_linea(color, curva=mostrar_linea, ancho=3.0),
             ))
         auto = pd.to_numeric(g["Auto_Total_Brazos_min"], errors="coerce").sum(min_count=1)
         manual = pd.to_numeric(g["Manual_Total_Brazos_min"], errors="coerce").sum(min_count=1)
@@ -1608,29 +1614,10 @@ def grafico_auto_por_operador(
                 go.Scatter(
                     x=g["FechaHora"],
                     y=g["Pct_Movimiento_Automatico_Brazos"],
-                    mode="lines+markers" if mostrar_linea else "markers",
                     name=nombre_leyenda,
-                    line=(
-                        dict(
-                            width=2.8,
-                            color=color_operador,
-                            shape="spline",
-                            smoothing=1.0,
-                        )
-                        if mostrar_linea
-                        else None
-                    ),
-                    marker=dict(
-                        size=9,
-                        symbol=symbols,
-                        color=color_operador,
-                        line=dict(
-                            color="#ffffff",
-                            width=1.1,
-                        ),
-                    ),
                     customdata=custom,
                     hovertemplate=hover_op,
+                    **_estilo_linea(color_operador, curva=mostrar_linea, simbolo=symbols, ancho=2.8),
                 )
             )
 
@@ -1772,22 +1759,25 @@ def grafico_auto_por_operador(
     return fig
 
 
-def grafico_horas_auto_acumuladas_operador(
+def grafico_uso_auto_promedio_operador(
     df_auto: pd.DataFrame,
     operadores_visibles=None,
 ):
     """
-    Total de horas de movimiento automático acumuladas por operador.
+    Uso promedio del movimiento automático (%) por operador.
 
-    - Suma Auto_Total_Brazos_min y convierte a horas.
+    - % = horas en automático / (automático + manual) de TODOS los ciclos visibles del
+      operador. Es el mismo "Global" que figura en la leyenda de la evolución por operador,
+      de modo que ambos gráficos muestran la misma cifra.
+    - En el hover se agrega el promedio simple de los porcentajes de cada ciclo.
     - Los ciclos sin operador se agrupan como "Sin registrar".
     - Para operadores identificados se muestra solo el apellido.
-    - La paleta mantiene coherencia con el gráfico de evolución por operador.
+    - Cada operador conserva el color del gráfico de evolución por operador.
     """
     if df_auto is None or df_auto.empty:
         return None
 
-    if "Auto_Total_Brazos_min" not in df_auto.columns:
+    if not {"Auto_Total_Brazos_min", "Manual_Total_Brazos_min"}.issubset(df_auto.columns):
         return None
 
     df = df_auto.copy()
@@ -1807,10 +1797,7 @@ def grafico_horas_auto_acumuladas_operador(
             dtype=object,
         )
 
-    operador_upper = operador_raw.str.upper()
-    es_sin_registro = operador_upper.isin(
-        ["", "SIN DATO", "NONE", "NAN"]
-    )
+    es_sin_registro = operador_raw.str.upper().isin(["", "SIN DATO", "NONE", "NAN"])
 
     df["_Operador_Agrupado"] = operador_raw
     df.loc[es_sin_registro, "_Operador_Agrupado"] = "Sin registrar"
@@ -1822,11 +1809,13 @@ def grafico_horas_auto_acumuladas_operador(
             operadores_sel.add("Sin registrar")
         df = df[df["_Operador_Agrupado"].isin(operadores_sel)].copy()
 
-    df["_Auto_min"] = pd.to_numeric(
-        df["Auto_Total_Brazos_min"],
-        errors="coerce",
+    df["_Auto_min"] = pd.to_numeric(df["Auto_Total_Brazos_min"], errors="coerce")
+    df["_Manual_min"] = pd.to_numeric(df["Manual_Total_Brazos_min"], errors="coerce")
+    df["_Pct_ciclo"] = (
+        pd.to_numeric(df["Pct_Movimiento_Automatico_Brazos"], errors="coerce")
+        if "Pct_Movimiento_Automatico_Brazos" in df.columns else np.nan
     )
-    df = df[df["_Auto_min"].notna()].copy()
+    df = df[df["_Auto_min"].notna() & df["_Manual_min"].notna()].copy()
 
     if df.empty:
         return None
@@ -1835,20 +1824,20 @@ def grafico_horas_auto_acumuladas_operador(
         df.groupby("_Operador_Agrupado", as_index=False)
         .agg(
             Auto_min=("_Auto_min", "sum"),
+            Manual_min=("_Manual_min", "sum"),
+            Pct_promedio_ciclos=("_Pct_ciclo", "mean"),
             Ciclos=("_Auto_min", "size"),
         )
     )
-    resumen["Horas_auto"] = resumen["Auto_min"] / 60.0
-
-    resumen = resumen[
-        resumen["Horas_auto"].notna()
-    ].copy()
+    total_min = resumen["Auto_min"] + resumen["Manual_min"]
+    resumen["Pct_uso"] = np.where(total_min > 0, resumen["Auto_min"] / total_min.where(total_min > 0) * 100.0, np.nan)
+    resumen = resumen[resumen["Pct_uso"].notna()].copy()
 
     if resumen.empty:
         return None
 
-    # Misma regla cromática que el gráfico de curvas:
-    # negro = sin registrar; operadores identificados = ranking por horas.
+    # Misma regla cromática que el gráfico de curvas (identidad de color por operador):
+    # negro = sin registrar; operadores identificados = paleta de la evolución por operador.
     color_map = construir_colores_operador_por_ranking(df)
 
     def _apellido(nombre):
@@ -1867,27 +1856,23 @@ def grafico_horas_auto_acumuladas_operador(
 
     # Orden visual:
     # 1) Sin registrar arriba como categoría de control.
-    # 2) Operadores identificados ordenados de mayor a menor horas.
+    # 2) Operadores identificados ordenados de mayor a menor porcentaje.
     resumen["_Orden_Sin_Registro"] = (
         ~resumen["_Operador_Agrupado"].eq("Sin registrar")
     ).astype(int)
 
     resumen = resumen.sort_values(
-        ["_Orden_Sin_Registro", "Horas_auto", "Etiqueta"],
+        ["_Orden_Sin_Registro", "Pct_uso", "Etiqueta"],
         ascending=[True, False, True],
     ).reset_index(drop=True)
 
-    max_horas = float(resumen["Horas_auto"].max())
-    if max_horas <= 0:
-        max_horas = 1.0
-
-    # Fondo tipo "track" para aproximar el estilo de la referencia.
+    # Fondo tipo "track": representa el 100 %.
     fig = go.Figure()
 
     fig.add_trace(
         go.Bar(
             y=resumen["Etiqueta"],
-            x=[max_horas] * len(resumen),
+            x=[100.0] * len(resumen),
             orientation="h",
             marker=dict(
                 color="#F2F1EC",
@@ -1902,17 +1887,14 @@ def grafico_horas_auto_acumuladas_operador(
     fig.add_trace(
         go.Bar(
             y=resumen["Etiqueta"],
-            x=resumen["Horas_auto"],
+            x=resumen["Pct_uso"],
             orientation="h",
             marker=dict(
                 color=resumen["Color"].tolist(),
                 line=dict(width=0),
             ),
             width=0.22,
-            text=[
-                f"{v:.2f} h"
-                for v in resumen["Horas_auto"]
-            ],
+            text=[_pct_entero_txt(v) for v in resumen["Pct_uso"]],
             textposition="outside",
             textfont=dict(
                 size=13,
@@ -1922,10 +1904,14 @@ def grafico_horas_auto_acumuladas_operador(
             customdata=np.column_stack([
                 resumen["_Operador_Agrupado"].astype(object),
                 resumen["Ciclos"].astype(object),
+                resumen["Pct_promedio_ciclos"].map(
+                    lambda v: f"{v:.1f}%" if pd.notna(v) else "N/D"
+                ).astype(object),
             ]),
             hovertemplate=(
                 "<b>%{customdata[0]}</b>"
-                "<br>Horas automático: %{x:.2f} h"
+                "<br>Uso automático promedio: %{x:.1f}%"
+                "<br>Promedio simple de los ciclos: %{customdata[2]}"
                 "<br>Ciclos con dato: %{customdata[1]}"
                 "<extra></extra>"
             ),
@@ -1945,7 +1931,7 @@ def grafico_horas_auto_acumuladas_operador(
             barmode="overlay",
             bargap=0.46,
             xaxis=dict(
-                range=[0, max_horas * 1.20],
+                range=[0, 112],
                 showgrid=False,
                 showticklabels=False,
                 zeroline=False,
@@ -2019,10 +2005,10 @@ def grafico_brazos(df_auto: pd.DataFrame, jumbo: str, mostrar_etiquetas: bool,
             ))
         else:
             fig.add_trace(go.Scatter(
-                x=g["FechaHora"], y=g[col], mode="lines+markers",
+                x=g["FechaHora"], y=g[col],
                 name=f"{nombre} · Global {fmt(global_pct,1,'%')}",
-                line=dict(width=2.5, color=COLORES[idx], shape="spline"), marker=dict(size=8),
                 hovertemplate=hover,
+                **_estilo_linea(COLORES[idx], curva=True, ancho=2.8),
             ))
         annotations.append(dict(
             xref="paper", yref="paper", x=0.01 + idx*0.25, y=1.16, xanchor="left",
@@ -4311,7 +4297,7 @@ def _streamlit_version_tuple():
     return tuple(vals)
 
 
-with st.container(border=True):
+with st.container(border=True, key="zona_carga"):
     st.subheader("Cargar ciclos (.ZDA)")
     st.caption(
         "Puedes agregar archivos individuales o seleccionar una carpeta completa. "
@@ -4435,7 +4421,7 @@ with st.container(border=True):
         )
 
     st.markdown(
-        f"<div style='font-size:0.98rem; color:#475467; padding-top:0.25rem;'>"
+        f"<div style='font-size:0.98rem; color:#475467; padding:0.25rem 0 0.7rem 0;'>"
         f"{estado_carga}</div>",
         unsafe_allow_html=True,
     )
@@ -5316,14 +5302,15 @@ def render_automation_section(
             "movimiento automático para los filtros seleccionados."
         )
 
-    st.subheader("Total horas automático acumuladas por operador")
+    st.subheader("Uso automático promedio por operador")
     st.caption(
-        "Suma el tiempo de movimiento automático de los ciclos visibles. "
-        "Colores por ranking: azul = más horas, verde = segundo, "
-        "naranja = tercero, rojo = menos horas; negro = sin registrar."
+        "Porcentaje de movimiento automático de cada operador: horas en automático ÷ "
+        "(automático + manual) de todos sus ciclos visibles. Es el mismo «Global» de la leyenda "
+        "de la evolución por operador. Cada operador conserva el color de ese gráfico; "
+        "negro = sin registrar."
     )
 
-    fig_horas_operador = grafico_horas_auto_acumuladas_operador(
+    fig_horas_operador = grafico_uso_auto_promedio_operador(
         df_visible_base,
         sel_operadores,
     )
@@ -5339,8 +5326,8 @@ def render_automation_section(
         )
     else:
         st.info(
-            "No hay datos suficientes de horas automáticas para los filtros "
-            "seleccionados."
+            "No hay datos suficientes de movimiento automático y manual para los "
+            "filtros seleccionados."
         )
 
     st.subheader("Uso automático por brazo")
@@ -8345,26 +8332,6 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
 # PRESENTACIÓN POR SECCIONES
 # ==========================================================
 
-st.divider()
-st.header("Consolidado")
-st.markdown(
-    """
-    <div style="
-        padding: 0.65rem 0 0.25rem 0;
-        font-size: 1.05rem;
-        font-weight: 700;
-        color: #1f2937;
-    ">
-        Secciones del análisis
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.caption(
-    "Selecciona una sección para mostrar únicamente ese grupo de análisis. "
-    "Se resaltan como accesos principales del app."
-)
-
 SECCIONES_ANALISIS = [
     "Uso Automático",
     "Longitud de Perforación",
@@ -8415,6 +8382,14 @@ st.markdown(
     }
     @media (max-width: 1100px) {
         [class*="st-key-btn_seccion_"] button { height: 68px !important; min-height: 68px !important; max-height: 68px !important; }
+    }
+    /* Ventana angosta (p. ej. con el panel lateral abierto): 4 botones por fila en vez de
+       apretar 8 y partir las palabras. */
+    @media (max-width: 1350px) {
+        [data-testid="stHorizontalBlock"]:has([class*="st-key-btn_seccion_"]) { flex-wrap: wrap !important; row-gap: 0.5rem; }
+        [data-testid="stHorizontalBlock"]:has([class*="st-key-btn_seccion_"]) > [data-testid="stColumn"] {
+            flex: 1 1 calc(25% - 1rem) !important; min-width: calc(25% - 1rem) !important;
+        }
     }
     </style>
     """,
