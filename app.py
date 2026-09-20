@@ -35,6 +35,7 @@ from procesador import (
     resumenes_eficiencia_lote,
     VERSION as PROCESADOR_EFICIENCIA_VERSION,
     CATALOGO_OPERADORES_ZDA,
+    parse_round_dat_profile,
 )
 
 
@@ -5605,43 +5606,43 @@ def render_zda_section(
         "y los resúmenes de esta sección."
     )
 
-    st.markdown("#### Hora promedio de inicio por jumbo y turno")
-
-    shift = resumen_turnos_zda(
-        zda_rows
-    )
-
-    if not shift.empty:
-        _mostrar_tabla_por_turno(shift)
-        st.caption(
-            "“Ciclos” cuenta todos los rounds del turno. "
-            "Para el promedio, el inicio más temprano y el más tarde "
-            "se considera solo el primer round de cada jumbo por "
-            "fecha operativa y turno."
-        )
-    else:
-        st.info(
-            "No hay ciclos visibles para calcular los indicadores de inicio."
+    # Expanders (no st.markdown("####...") fijo): permiten contraer cada tabla para no
+    # empujar el resto de "Primer Golpe" hacia abajo cuando no se necesitan.
+    with st.expander("Hora promedio de inicio por jumbo y turno", expanded=True):
+        shift = resumen_turnos_zda(
+            zda_rows
         )
 
-    st.markdown("#### Hora promedio de fin por jumbo y turno")
+        if not shift.empty:
+            _mostrar_tabla_por_turno(shift)
+            st.caption(
+                "“Ciclos” cuenta todos los rounds del turno. "
+                "Para el promedio, el inicio más temprano y el más tarde "
+                "se considera solo el primer round de cada jumbo por "
+                "fecha operativa y turno."
+            )
+        else:
+            st.info(
+                "No hay ciclos visibles para calcular los indicadores de inicio."
+            )
 
-    shift_fin = resumen_fin_turnos_zda(
-        zda_rows
-    )
+    with st.expander("Hora promedio de fin por jumbo y turno", expanded=True):
+        shift_fin = resumen_fin_turnos_zda(
+            zda_rows
+        )
 
-    if not shift_fin.empty:
-        _mostrar_tabla_por_turno(shift_fin)
-        st.caption(
-            "“Ciclos” cuenta todos los rounds iniciados en el turno. "
-            "Para el promedio, el fin más temprano y el más tarde se considera "
-            "únicamente el término del último round de cada jumbo por "
-            "fecha operativa y turno."
-        )
-    else:
-        st.info(
-            "No hay ciclos visibles para calcular los indicadores de fin."
-        )
+        if not shift_fin.empty:
+            _mostrar_tabla_por_turno(shift_fin)
+            st.caption(
+                "“Ciclos” cuenta todos los rounds iniciados en el turno. "
+                "Para el promedio, el fin más temprano y el más tarde se considera "
+                "únicamente el término del último round de cada jumbo por "
+                "fecha operativa y turno."
+            )
+        else:
+            st.info(
+                "No hay ciclos visibles para calcular los indicadores de fin."
+            )
 
     with st.expander(
         "Tipo de disparo",
@@ -6690,6 +6691,174 @@ def grafico_rop_por_barreno(
     return fig
 
 
+# Barrenos cuyo archivo MWD no calza con ningún registro de boom.dat (mismo Brazo+Secuencia):
+# no se conoce su collar ejecutado ni si el sensor de profundidad arrancó en 0. Se muestran
+# aparte y no entran en las curvas, el promedio ni las métricas del round (ver justo abajo).
+TIPO_SOSPECHOSO = "Sin identificar (posible rehecho)"
+
+TIPO_COLOR_ROP = {
+    "Bottom": "#8B5CF6", "Easer": "#F59E0B", "Cut": "#EF4444",
+    "Contour": "#0EA5E9", "Reaming": "#10B981", "Reference": "#6B7280",
+}
+
+
+def _color_tipo_rop(tipo) -> str:
+    return TIPO_COLOR_ROP.get(str(tipo), "#94A3B8")
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _datos_conjunto_rop(source_path_str, mtime_ns, size_bytes, items):
+    """Curva ROP y resumen de TODOS los barrenos de un round, para la vista de conjunto.
+
+    `items`: tupla de (archivo_interno, barreno_id, tipo, x, y_ejecutado, z) — uno por barreno
+    con MWD y coordenada ejecutada conocida (join Boom/Brazo + Secuencia ya resuelto por el
+    llamador). Cacheado por archivo + su lista de barrenos: leer las ~50 curvas de un round
+    toma alrededor de un segundo; sin caché se repetiría en cada interacción del selector de barreno.
+    Devuelve (curvas largas para el overlay, resumen una fila por barreno para el mapa).
+    """
+    source_path = Path(source_path_str)
+    curvas, resumen = [], []
+    for archivo_interno, barreno_id, tipo, x, y_exec, z in items:
+        df = _extraer_rop_mwd_desde_zda(source_path, archivo_interno)
+        if df.empty:
+            continue
+        c = df[["Profundidad_m", "ROP_m_min", "ROP_suave_m_min"]].copy()
+        c["Barreno_ID"] = barreno_id
+        c["Tipo"] = tipo
+        curvas.append(c)
+        rop = pd.to_numeric(df["ROP_m_min"], errors="coerce")
+        resumen.append({
+            "Barreno_ID": barreno_id, "Tipo": tipo, "X": x, "Y": y_exec, "Z": z,
+            "ROP_prom": rop.mean(), "ROP_mediana": rop.median(),
+            "Profundidad_max": pd.to_numeric(df["Profundidad_m"], errors="coerce").max(),
+            "N_muestras": len(df),
+        })
+    df_curvas = pd.concat(curvas, ignore_index=True) if curvas else pd.DataFrame(
+        columns=["Profundidad_m", "ROP_m_min", "ROP_suave_m_min", "Barreno_ID", "Tipo"])
+    df_resumen = pd.DataFrame(resumen)
+    return df_curvas, df_resumen
+
+
+def grafico_rop_round_overlay(df_curvas: pd.DataFrame):
+    """Todas las curvas ROP del round superpuestas (una línea fina por barreno, coloreada por
+    tipo), más la curva promedio del round en negro. Es la forma habitual de reportar el
+    conjunto de curvas MWD de un disparo: permite ver la dispersión y detectar barrenos
+    atípicos de un vistazo, algo que una sola curva a la vez no muestra.
+
+    No dibuja los barrenos "Sin identificar" (sin match en boom.dat): de esos no se sabe si el
+    sensor de profundidad arrancó en 0, así que su curva podría no representar avance real y
+    distorsionaría tanto el eje de profundidad como la curva promedio."""
+    if df_curvas is None or df_curvas.empty:
+        return None
+
+    df_curvas = df_curvas[df_curvas["Tipo"] != TIPO_SOSPECHOSO]
+    if df_curvas.empty:
+        return None
+
+    fig = go.Figure()
+    vistos = set()
+    for barreno_id, g in df_curvas.groupby("Barreno_ID", sort=False):
+        tipo = g["Tipo"].iloc[0]
+        color = _color_tipo_rop(tipo)
+        fig.add_trace(go.Scatter(
+            x=g["Profundidad_m"], y=g["ROP_suave_m_min"], mode="lines",
+            line=dict(width=1.3, color=color), opacity=0.55,
+            name=str(tipo), legendgroup=str(tipo), showlegend=tipo not in vistos,
+            hovertemplate=f"Barreno {barreno_id} · {tipo}<br>Profundidad: %{{x:.2f}} m"
+                          "<br>ROP: %{y:.2f} m/min<extra></extra>",
+        ))
+        vistos.add(tipo)
+
+    # Curva promedio del round: mediana de todos los barrenos en bins de profundidad de 0.1 m.
+    prof = pd.to_numeric(df_curvas["Profundidad_m"], errors="coerce")
+    bins = (prof / 0.1).round() * 0.1
+    prom = df_curvas.assign(_bin=bins).groupby("_bin")["ROP_m_min"].median().reset_index()
+    fig.add_trace(go.Scatter(
+        x=prom["_bin"], y=prom["ROP_m_min"], mode="lines",
+        line=dict(width=3.2, color="#111827", shape="spline", smoothing=0.4),
+        name="Promedio del round", legendgroup="_prom",
+        hovertemplate="Promedio del round<br>Profundidad: %{x:.2f} m<br>ROP: %{y:.2f} m/min<extra></extra>",
+    ))
+
+    ymax = pd.to_numeric(df_curvas["ROP_suave_m_min"], errors="coerce").max()
+    fig.update_layout(**base_layout(
+        480, margin=dict(l=75, r=30, t=30, b=65),
+        xaxis=dict(title="Progresión del barreno (m)", rangemode="tozero", gridcolor="#e6edf5"),
+        yaxis=dict(title="ROP (m/min)", range=[0, max(3.5, float(ymax) * 1.1 if pd.notna(ymax) else 3.5)],
+                   gridcolor="#e6edf5"),
+        legend=dict(orientation="h", y=-0.18, title="Tipo de barreno"),
+        hovermode="closest",
+    ))
+    return fig
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _perfil_nominal_rop(source_path_str, mtime_ns, size_bytes):
+    """Perfil nominal del frente (contorno de diseño), leído directamente de round-*.dat.
+
+    Es un archivo aparte y pequeño (~1.3 KB) del propio ZDA: no hace falta reprocesar todo el
+    archivo con el otro pipeline (el de Eficiencia de Perforación) para obtener el contorno.
+    Devuelve la lista de puntos (X, Z) del polígono, o [] si no se pudo decodificar.
+    """
+    try:
+        with zipfile.ZipFile(source_path_str, "r") as zf:
+            names = zf.namelist()
+            round_dat = next(
+                (n for n in names if re.match(r"round-[^/]*\.dat$", n, re.I)
+                 and not re.search(r"boom|counters|mwd", n, re.I)),
+                None,
+            )
+            if not round_dat:
+                return []
+            perfil = parse_round_dat_profile(zf.read(round_dat))
+    except (OSError, zipfile.BadZipFile):
+        return []
+    return perfil["polygon"] if perfil.get("decoded") else []
+
+
+def grafico_rop_round_mapa(df_resumen: pd.DataFrame, perfil_nominal=None):
+    """Mapa del frente (plano de navegación): un punto por barreno en su posición ejecutada
+    (X, Z), coloreado por su ROP promedio. Es la representación espacial que permite ver si
+    algún sector del frente (o algún tipo de barreno) perfora sistemáticamente más lento,
+    algo que las curvas por separado no muestran porque no tienen referencia de ubicación."""
+    if df_resumen is None or df_resumen.empty or df_resumen["X"].isna().all():
+        return None
+
+    d = df_resumen.dropna(subset=["X", "Z", "ROP_prom"]).copy()
+    if d.empty:
+        return None
+
+    fig = go.Figure()
+    if perfil_nominal:
+        px = [p[0] for p in perfil_nominal] + [perfil_nominal[0][0]]
+        pz = [p[1] for p in perfil_nominal] + [perfil_nominal[0][1]]
+        fig.add_trace(go.Scatter(
+            x=px, y=pz, mode="lines", line=dict(color="#94A3B8", width=1.6, dash="dot"),
+            name="Perfil nominal", hoverinfo="skip", showlegend=False,
+        ))
+    fig.add_trace(go.Scatter(
+        x=d["X"], y=d["Z"], mode="markers+text",
+        text=d["Barreno_ID"].astype(str), textposition="top center",
+        textfont=dict(size=9, color="#475569"),
+        marker=dict(
+            size=16, color=d["ROP_prom"], colorscale="RdYlGn", cmid=float(d["ROP_prom"].mean()),
+            showscale=True, colorbar=dict(title="ROP prom.<br>(m/min)"),
+            line=dict(color="#ffffff", width=1.2),
+        ),
+        customdata=np.column_stack([d["Tipo"], d["ROP_prom"], d["Profundidad_max"]]),
+        hovertemplate="<b>Barreno %{text}</b> · %{customdata[0]}"
+                      "<br>ROP promedio: %{customdata[1]:.2f} m/min"
+                      "<br>Profundidad: %{customdata[2]:.2f} m<extra></extra>",
+    ))
+    fig.update_layout(**base_layout(
+        480, margin=dict(l=60, r=20, t=30, b=55),
+        xaxis=dict(title="X (m)", gridcolor="#e6edf5", zeroline=True, scaleanchor="y"),
+        yaxis=dict(title="Z (m)", gridcolor="#e6edf5", zeroline=True),
+        hovermode="closest", showlegend=False,
+    ))
+    return fig
+
+
 def render_rop_section(
     resultados_validos,
     df_reportes,
@@ -6990,57 +7159,64 @@ def render_rop_section(
     st.markdown(
         """
         <style>
+        /* Tarjetas del barreno seleccionado: alto fijo e igual entre ambas para que se vean
+           como un solo bloque compacto, ajustado a la cantidad real de datos que muestran. */
+        .rop-kpi-card, .rop-info-card {
+            height: auto; min-height: 162px;
+            border-radius: 14px;
+            box-sizing: border-box;
+        }
         .rop-kpi-card {
-            min-height: 210px;
             border: 1px solid #dfe7f1;
-            border-radius: 16px;
             background: #ffffff;
-            padding: 1.25rem 1.35rem;
+            padding: 0.85rem 1.15rem;
             box-shadow: 0 3px 12px rgba(15,23,42,0.045);
         }
         .rop-kpi-label {
-            font-size: 1.02rem;
+            font-size: 0.86rem;
             color: #344054;
             font-weight: 650;
-            margin-bottom: 0.55rem;
+            margin-bottom: 0.30rem;
         }
         .rop-kpi-value {
-            font-size: 2.75rem;
+            font-size: 2.05rem;
             line-height: 1.0;
             color: #111827;
             font-weight: 780;
-            margin-bottom: 0.65rem;
+            margin-bottom: 0.40rem;
         }
         .rop-kpi-unit {
-            font-size: 1.35rem;
+            font-size: 1.05rem;
             font-weight: 500;
             color: #475467;
         }
         .rop-kpi-foot {
-            font-size: 0.88rem;
+            font-size: 0.82rem;
             color: #667085;
         }
         .rop-info-card {
-            min-height: 210px;
             border: 1px solid #e4e7ec;
-            border-radius: 16px;
             background: #f8fafc;
-            padding: 1.05rem 1.20rem;
+            padding: 0.70rem 1.05rem;
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0.65rem 1.35rem;
+            grid-template-columns: repeat(3, 1fr);
+            align-content: center;
+            gap: 0.55rem 1.0rem;
         }
         .rop-info-label {
-            font-size: 0.72rem;
+            font-size: 0.66rem;
             color: #98a2b3;
             text-transform: uppercase;
             letter-spacing: 0.045em;
         }
         .rop-info-value {
-            font-size: 0.95rem;
+            font-size: 0.87rem;
             color: #1d2939;
             font-weight: 650;
-            margin-top: 0.10rem;
+            margin-top: 0.05rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .rop-info-wide {
             grid-column: 1 / -1;
@@ -7051,7 +7227,7 @@ def render_rop_section(
     )
 
     c_kpi, c_info = st.columns(
-        [0.95, 1.25]
+        [0.70, 1.50]
     )
 
     with c_kpi:
@@ -7093,6 +7269,10 @@ def render_rop_section(
             f"""
             <div class="rop-info-card">
                 <div>
+                    <div class="rop-info-label">Fecha</div>
+                    <div class="rop-info-value">{item_sel['Fecha']}</div>
+                </div>
+                <div>
                     <div class="rop-info-label">Jumbo</div>
                     <div class="rop-info-value">{item_sel['Jumbo']}</div>
                 </div>
@@ -7131,15 +7311,9 @@ def render_rop_section(
             unsafe_allow_html=True,
         )
 
-    st.markdown(
-        "<div style='height:0.55rem'></div>",
-        unsafe_allow_html=True,
-    )
-
-    with st.container(border=True):
-        st.markdown(
-            "#### Tasa de penetración ROP (m/min)"
-        )
+    # Expander (no container fijo): permite contraer la curva individual para tener el
+    # selector más cerca de "Vista de conjunto del round", justo debajo.
+    with st.expander("Tasa de penetración ROP (m/min)", expanded=True):
         st.caption(
             "La curva muestra la variación de la tasa de penetración "
             "a lo largo de la progresión del barreno. La línea se suaviza "
@@ -7166,6 +7340,119 @@ def render_rop_section(
         "Barreno corresponde al ID del plan ZDA; Brazo + Secuencia identifica "
         "el registro MWD asociado dentro del ZDA."
     )
+
+    # ------------------------------------------------------
+    # Vista de conjunto del round: todas las curvas del ciclo a la vez
+    # ------------------------------------------------------
+    st.divider()
+    st.markdown("#### Vista de conjunto del round")
+    st.caption(
+        "Todos los barrenos del ciclo seleccionado a la vez, en dos formas complementarias: "
+        "las curvas ROP superpuestas (para ver la dispersión entre barrenos) y su posición real "
+        "en el frente, coloreada por ROP promedio (para ver si algún sector o tipo de barreno "
+        "perfora más lento). Usa la posición ejecutada (X, Z) reconstruida del ZDA."
+    )
+
+    items = []
+    for _, mrow in mwd.iterrows():
+        brazo_c = pd.to_numeric(pd.Series([mrow.get("Brazo")]), errors="coerce").iloc[0]
+        sec_c = pd.to_numeric(pd.Series([mrow.get("Secuencia")]), errors="coerce").iloc[0]
+        if pd.isna(brazo_c) or pd.isna(sec_c):
+            continue
+        det_fila = None
+        if (
+            isinstance(detalle_round_rop, pd.DataFrame)
+            and not detalle_round_rop.empty
+            and {"Boom", "Secuencia", "X", "Y", "Z"}.issubset(detalle_round_rop.columns)
+        ):
+            match = detalle_round_rop[
+                (pd.to_numeric(detalle_round_rop["Boom"], errors="coerce") == int(brazo_c))
+                & (pd.to_numeric(detalle_round_rop["Secuencia"], errors="coerce") == int(sec_c))
+            ]
+            if not match.empty:
+                det_fila = match.iloc[0]
+        if det_fila is not None:
+            barreno_id, tipo = mrow.get("Barreno_ID", "-"), str(det_fila.get("Tipo"))
+            x = float(det_fila.get("X")) if pd.notna(det_fila.get("X")) else np.nan
+            y_e = float(det_fila.get("Y")) if pd.notna(det_fila.get("Y")) else np.nan
+            z = float(det_fila.get("Z")) if pd.notna(det_fila.get("Z")) else np.nan
+        else:
+            # Sin registro en boom.dat con el mismo Brazo+Secuencia: no es necesariamente un
+            # arranque abortado (esos suelen tener <1 m). Puede ser un barreno rehecho, donde
+            # boom.dat y los archivos MWD numeran las secuencias de forma distinta (ver el ID
+            # del plan y el tipo real en el ZDA). Se identifica por Brazo-Secuencia del MWD y
+            # queda fuera del mapa espacial, porque no se conoce su posición ejecutada.
+            barreno_id, tipo = f"B{int(brazo_c)}-{int(sec_c):02d}", TIPO_SOSPECHOSO
+            x = y_e = z = np.nan
+        items.append((str(mrow.get("Archivo_Interno") or ""), str(barreno_id), tipo, x, y_e, z))
+
+    try:
+        stat_zda = source_path.stat()
+        df_curvas_round, df_resumen_round = _datos_conjunto_rop(
+            str(source_path), stat_zda.st_mtime_ns, stat_zda.st_size, tuple(items),
+        )
+    except OSError:
+        df_curvas_round, df_resumen_round = pd.DataFrame(), pd.DataFrame()
+
+    if df_curvas_round.empty:
+        st.info(
+            "No se pudo reconstruir la vista de conjunto (el ZDA fuente ya no está disponible "
+            "en esta sesión, o ningún barreno tiene curva MWD válida)."
+        )
+    else:
+        sospechosos = df_resumen_round[df_resumen_round["Tipo"] == TIPO_SOSPECHOSO]
+        confiables = df_resumen_round[df_resumen_round["Tipo"] != TIPO_SOSPECHOSO]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Barrenos con curva ROP", int(confiables.shape[0]))
+        rop_prom_round = pd.to_numeric(confiables["ROP_prom"], errors="coerce").mean()
+        m2.metric("ROP promedio del round", fmt(rop_prom_round, 2, " m/min"))
+        con_posicion = int(confiables[["X", "Z"]].dropna().shape[0])
+        m3.metric(
+            "Con posición ejecutada (X, Z)", f"{con_posicion}/{confiables.shape[0]}",
+            help="Barrenos con curva ROP a los que además se les pudo asociar collar ejecutado "
+                 "(X, Z) en boom.dat, cruzando por Brazo + Secuencia. Los que faltan suelen ser "
+                 "arranques abortados: el MWD registró una curva muy corta (menos de 1 m) y "
+                 "boom.dat no tiene un registro de barreno con ese mismo Brazo + Secuencia. Los "
+                 "barrenos sospechosos (ver aviso debajo) no se cuentan aquí.",
+        )
+
+        if not sospechosos.empty:
+            st.markdown(
+                f"⚠️ **{len(sospechosos)} barreno(s) sospechoso(s)** excluido(s) de las curvas, "
+                "la curva promedio y las métricas de arriba.",
+                help=(
+                    "Barrenos excluidos: " + ", ".join(sospechosos["Barreno_ID"].astype(str)) + ". "
+                    "Su archivo MWD no calza con ningún registro de boom.dat con el mismo "
+                    "Brazo + Secuencia, y su curva de profundidad no arranca cerca de 0 m: no hay "
+                    "forma de saber si el sensor arrancó en 0 o si es la continuación de un "
+                    "barreno rehecho sin reiniciar. Se prefiere no mostrarlos a mostrar una "
+                    "profundidad que podría no ser real."
+                ),
+            )
+
+        st.markdown("##### Curvas ROP superpuestas del round")
+        fig_overlay = grafico_rop_round_overlay(df_curvas_round)
+        if fig_overlay is not None:
+            st.plotly_chart(fig_overlay, width="stretch", config={"displaylogo": False})
+
+        try:
+            stat_zda2 = source_path.stat()
+            perfil_nominal = _perfil_nominal_rop(str(source_path), stat_zda2.st_mtime_ns, stat_zda2.st_size)
+        except OSError:
+            perfil_nominal = []
+
+        st.markdown("##### Mapa de ROP en el frente")
+        if not perfil_nominal:
+            st.caption("No se pudo leer el perfil nominal (round-*.dat) de este ZDA; se muestra solo el frente sin contorno.")
+        fig_mapa = grafico_rop_round_mapa(df_resumen_round, perfil_nominal)
+        if fig_mapa is not None:
+            st.plotly_chart(fig_mapa, width="stretch", config={"displaylogo": False})
+        else:
+            st.info(
+                "No hay barrenos con posición ejecutada (X, Z) conocida para dibujar el mapa "
+                "del frente de este round."
+            )
 
 
 def render_resultados_section(resultados_validos):
@@ -8430,9 +8717,9 @@ SECCIONES_ANALISIS = [
     "Longitud de Perforación",
     "Primer Golpe",
     "Eficiencia de Perforación",
+    "ROP por barreno",
     "Clasificación",
     "Resultados por archivo",
-    "ROP por barreno",
     "Asignar operadores",
 ]
 
