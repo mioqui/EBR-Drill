@@ -43,6 +43,9 @@ from procesador import (
 # ==========================================================
 
 APP_VERSION_INTERNAL = "V35.22-ORDEN-BALANCE"
+
+# Turnos del filtro lateral: Día = 07:00 a 19:00, Noche = 19:00 a 07:00 (hora de inicio del ciclo).
+TURNOS_FILTRO = ["Día", "Noche"]
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v35_22_orden_balance_20260917"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
@@ -402,6 +405,7 @@ asig.aplicar_a_resultados(st.session_state.procesados.values(), _asignaciones_op
 jumbos_detectados, tipos_detectados, rocas_detectadas, operadores_detectados = _valores_detectados_desde_cache()
 
 # Variables siempre definidas aunque aún no existan datos.
+global_turnos = list(TURNOS_FILTRO)
 global_jumbos = []
 global_tipos = []
 global_rocas = []
@@ -478,6 +482,12 @@ with st.sidebar:
             st.session_state[clave] = elegidos
             return elegidos
 
+        global_turnos = _grupo_checks(
+            "Turnos", "global_turnos", TURNOS_FILTRO,
+            ayuda=("Aplica a Uso Automático, Longitud de Perforación, Primer Golpe, Eficiencia de "
+                   "Perforación, Clasificación y ROP por barreno. Día: 07:00 a 19:00 · Noche: 19:00 a "
+                   "07:00, según la hora de inicio del ciclo (igual que el TURNO del Excel)."),
+        )
         global_jumbos = _grupo_checks("Jumbos", "global_jumbos", jumbos_detectados)
         global_tipos = _grupo_checks(
             "Tipo de disparo", "global_tipos", tipos_detectados,
@@ -768,6 +778,11 @@ def _font_etiqueta_barras(n_barras):
     return 8
 
 
+# Suavizado de las curvas de los gráficos de evolución (Plotly: 0 = tramos rectos, 1 = muy curvo).
+# Bajarlo reduce las ondulaciones y que la curva se pase por debajo de 0 entre dos puntos.
+SUAVIZADO_LINEA = 0.5
+
+
 def _estilo_linea(color, curva=True, simbolo="circle", ancho=3.0):
     """Estilo de línea de los gráficos de evolución: curva suave con marcadores huecos
     (círculo blanco con borde del color de la serie). Sin relleno bajo la línea.
@@ -777,7 +792,7 @@ def _estilo_linea(color, curva=True, simbolo="circle", ancho=3.0):
         return dict(mode="markers", marker=marcador)
     return dict(
         mode="lines+markers",
-        line=dict(width=ancho, color=color, shape="spline", smoothing=1.0),
+        line=dict(width=ancho, color=color, shape="spline", smoothing=SUAVIZADO_LINEA),
         marker=marcador,
     )
 
@@ -1770,8 +1785,8 @@ def grafico_uso_auto_promedio_operador(
       operador. Es el mismo "Global" que figura en la leyenda de la evolución por operador,
       de modo que ambos gráficos muestran la misma cifra.
     - En el hover se agrega el promedio simple de los porcentajes de cada ciclo.
-    - Los ciclos sin operador se agrupan como "Sin registrar".
-    - Para operadores identificados se muestra solo el apellido.
+    - Solo operadores identificados: los ciclos sin operador no se muestran en este gráfico.
+    - Se muestra solo el apellido.
     - Cada operador conserva el color del gráfico de evolución por operador.
     """
     if df_auto is None or df_auto.empty:
@@ -1800,13 +1815,10 @@ def grafico_uso_auto_promedio_operador(
     es_sin_registro = operador_raw.str.upper().isin(["", "SIN DATO", "NONE", "NAN"])
 
     df["_Operador_Agrupado"] = operador_raw
-    df.loc[es_sin_registro, "_Operador_Agrupado"] = "Sin registrar"
+    df = df[~es_sin_registro].copy()
 
-    # "SIN DATO" en el filtro lateral controla también la barra negra.
     if operadores_visibles is not None:
         operadores_sel = {str(x).strip() for x in operadores_visibles}
-        if "SIN DATO" in operadores_sel:
-            operadores_sel.add("Sin registrar")
         df = df[df["_Operador_Agrupado"].isin(operadores_sel)].copy()
 
     df["_Auto_min"] = pd.to_numeric(df["Auto_Total_Brazos_min"], errors="coerce")
@@ -1836,16 +1848,12 @@ def grafico_uso_auto_promedio_operador(
     if resumen.empty:
         return None
 
-    # Misma regla cromática que el gráfico de curvas (identidad de color por operador):
-    # negro = sin registrar; operadores identificados = paleta de la evolución por operador.
+    # Misma paleta que el gráfico de curvas (identidad de color por operador).
     color_map = construir_colores_operador_por_ranking(df)
 
     def _apellido(nombre):
-        nombre = str(nombre)
-        if nombre == "Sin registrar":
-            return nombre
-        partes = nombre.split()
-        return partes[-1] if partes else nombre
+        partes = str(nombre).split()
+        return partes[-1] if partes else str(nombre)
 
     resumen["Etiqueta"] = resumen["_Operador_Agrupado"].apply(_apellido)
     resumen["Color"] = (
@@ -1854,16 +1862,10 @@ def grafico_uso_auto_promedio_operador(
         .fillna("#64748b")
     )
 
-    # Orden visual:
-    # 1) Sin registrar arriba como categoría de control.
-    # 2) Operadores identificados ordenados de mayor a menor porcentaje.
-    resumen["_Orden_Sin_Registro"] = (
-        ~resumen["_Operador_Agrupado"].eq("Sin registrar")
-    ).astype(int)
-
+    # Orden visual: de mayor a menor porcentaje.
     resumen = resumen.sort_values(
-        ["_Orden_Sin_Registro", "Pct_uso", "Etiqueta"],
-        ascending=[True, False, True],
+        ["Pct_uso", "Etiqueta"],
+        ascending=[False, True],
     ).reset_index(drop=True)
 
     # Fondo tipo "track": representa el 100 %.
@@ -2114,15 +2116,9 @@ def grafico_cut(
             fig.add_trace(go.Scatter(
                 x=g["FechaHora"],
                 y=g["Mediana"],
-                mode="lines+markers",
                 name=jumbo,
                 customdata=g[["Ciclo", "Tipo_Disparo"]].to_numpy(),
-                line=dict(
-                    width=3,
-                    color=color,
-                    shape="spline",
-                ),
-                marker=dict(size=8),
+                **_estilo_linea(color, curva=True, ancho=3.0),
                 hovertemplate=(
                     f"{jumbo}<br>%{{x|%d/%m %H:%M}}"
                     "<br>Ciclo: %{customdata[0]}"
@@ -2229,6 +2225,61 @@ def zda_turno(ts):
     if 7 <= h < 19:
         return "Día", h
     return "Noche", h+24 if h < 7 else h
+
+
+def turno_ciclo(df: pd.DataFrame) -> pd.Series:
+    """Turno de cada ciclo según su HORA DE INICIO (misma regla que `zda_turno`):
+    Día = 07:00 a 19:00; Noche = 19:00 a 07:00. Devuelve None donde no hay hora."""
+    if "FechaHora" in df.columns:
+        ts = pd.to_datetime(df["FechaHora"], errors="coerce")
+    elif "Hora_Inicio" in df.columns:
+        ts = pd.to_datetime(df["Hora_Inicio"].astype(str), format="%H:%M:%S", errors="coerce")
+    else:
+        return pd.Series([None] * len(df), index=df.index, dtype=object)
+    h = ts.dt.hour + ts.dt.minute / 60 + ts.dt.second / 3600
+    turno = np.select([h.isna(), (h >= 7) & (h < 19)], [None, "Día"], default="Noche")
+    return pd.Series(turno, index=df.index, dtype=object)
+
+
+def turno_de_hora(hora) -> "str | None":
+    """Turno de una hora "HH:MM:SS" (o de un datetime): Día 07:00-19:00, Noche el resto.
+    None si no hay una hora válida. Misma regla que `turno_ciclo` y `zda_turno`."""
+    if hora is None:
+        return None
+    try:
+        t = hora if hasattr(hora, "hour") else pd.to_datetime(str(hora), format="%H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(t):
+        return None
+    h = t.hour + t.minute / 60 + t.second / 3600
+    return "Día" if 7 <= h < 19 else "Noche"
+
+
+def turno_permitido(hora, sel_turnos) -> bool:
+    """¿Un ciclo que inició a `hora` entra en los turnos elegidos? (con ambos turnos, siempre)."""
+    if sel_turnos is None or set(TURNOS_FILTRO) <= set(sel_turnos):
+        return True
+    return turno_de_hora(hora) in set(sel_turnos)
+
+
+def filtrar_por_turno(df: pd.DataFrame, sel_turnos, col_ts=None) -> pd.DataFrame:
+    """Filtra por turno. Con Día y Noche marcados (o sin filtro) devuelve el df intacto;
+    con uno solo, únicamente sus ciclos; con ninguno, un df vacío.
+
+    `col_ts`: columna con el instante de inicio de la perforación (epoch). Solo la usa
+    Primer Golpe, que etiqueta sus turnos con `zda_turno` sobre ese instante; el resto usa
+    la hora de inicio del ciclo (igual que el TURNO del Excel exportado)."""
+    if df is None or df.empty or sel_turnos is None:
+        return df
+    elegidos = set(sel_turnos)
+    if set(TURNOS_FILTRO) <= elegidos:
+        return df
+    if col_ts and col_ts in df.columns:
+        turno = df[col_ts].map(lambda x: zda_turno(x)[0] if pd.notna(x) else None)
+    else:
+        turno = turno_ciclo(df)
+    return df[turno.isin(elegidos)].copy()
 
 
 def fmt_hora_decimal(h):
@@ -4712,7 +4763,7 @@ def _fecha_corta_es(valor):
     return f"{ts.day:02d}-{meses[ts.month - 1]}"
 
 
-def render_kpis_uso_automatico(df_auto: pd.DataFrame):
+def render_kpis_uso_automatico(df_auto: pd.DataFrame, df_pendientes: pd.DataFrame = None):
     """
     Resumen superior de la sección Uso Automático.
 
@@ -4949,18 +5000,19 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame):
     st.markdown(f'<div class="ebr-kpi-grid">{tarjetas_html}</div>', unsafe_allow_html=True)
 
     # Acceso directo al módulo donde se asigna el operador a los ciclos que no lo traen.
-    # El módulo lista TODOS los ciclos cargados (sin el filtro de fechas), por eso el botón
-    # cuenta los pendientes totales y no solo los del rango de la tarjeta.
+    # El módulo lista TODOS los ciclos cargados (sin filtros de fecha ni turno), por eso el botón
+    # cuenta los pendientes totales y no solo los de la tarjeta.
+    df_total = df_pendientes if df_pendientes is not None else df_auto
     pendientes_total = int(
-        df_auto["Operador_Filtro"].map(asig.es_sin_operador).sum()
-        if "Operador_Filtro" in df_auto.columns else sin_operador
+        df_total["Operador_Filtro"].map(asig.es_sin_operador).sum()
+        if "Operador_Filtro" in df_total.columns else sin_operador
     )
     if pendientes_total > 0:
         col_boton = st.columns(4)[3]
         if col_boton.button(
-            f"Asignar operadores ({pendientes_total} {'pendiente' if pendientes_total == 1 else 'pendientes'}) →", key="kpi_ir_asignar_operadores",
-            width="stretch", help="Abre el módulo para escribir el operador de los ciclos sin registro "
-                                  "(todos los ciclos cargados, sin el filtro de fechas).",
+            f"Asignar operadores ({pendientes_total}) →", key="kpi_ir_asignar_operadores",
+            width="stretch", help=f"{pendientes_total} ciclo(s) sin operador en total (todos los cargados, "
+                                  "sin filtro de fechas ni de turno). Abre el módulo para escribir el operador.",
         ):
             st.session_state["seccion_analisis_principal"] = "Asignar operadores"
             st.rerun(scope="app")
@@ -5223,12 +5275,15 @@ def render_automation_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     if df_automatico.empty:
         st.info("Sin datos suficientes de automatización.")
         return
 
-    render_kpis_uso_automatico(df_automatico)
+    # Las tarjetas también respetan el turno; el botón "Asignar operadores" sigue contando
+    # todos los ciclos cargados (el módulo los lista sin filtros).
+    render_kpis_uso_automatico(filtrar_por_turno(df_automatico, sel_turnos), df_pendientes=df_automatico)
     st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
 
     # Base visible por Jumbo / Tipo / Roca / Fecha.
@@ -5242,6 +5297,7 @@ def render_automation_section(
         & df_automatico["Tipo_Roca"].isin(sel_rocas)
     ].copy()
 
+    df_visible_base = filtrar_por_turno(df_visible_base, sel_turnos)
     df_visible_base = aplicar_filtro_fechas_global(df_visible_base)
 
     # Los gráficos de evolución por operador siguen respetando
@@ -5306,8 +5362,8 @@ def render_automation_section(
     st.caption(
         "Porcentaje de movimiento automático de cada operador: horas en automático ÷ "
         "(automático + manual) de todos sus ciclos visibles. Es el mismo «Global» de la leyenda "
-        "de la evolución por operador. Cada operador conserva el color de ese gráfico; "
-        "negro = sin registrar."
+        "de la evolución por operador. Cada operador conserva el color de ese gráfico. "
+        "No incluye los ciclos sin operador registrado."
     )
 
     fig_horas_operador = grafico_uso_auto_promedio_operador(
@@ -5326,8 +5382,8 @@ def render_automation_section(
         )
     else:
         st.info(
-            "No hay datos suficientes de movimiento automático y manual para los "
-            "filtros seleccionados."
+            "No hay ciclos visibles con operador identificado y datos de movimiento "
+            "automático y manual para los filtros seleccionados."
         )
 
     st.subheader("Uso automático por brazo")
@@ -5381,6 +5437,7 @@ def render_cut_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     st.subheader("Evolución de la longitud perforada en barrenos Cut")
 
@@ -5392,6 +5449,8 @@ def render_cut_section(
     if df_cut.empty:
         st.info("Sin datos suficientes de barrenos Cut.")
         return
+
+    df_cut = filtrar_por_turno(df_cut, sel_turnos)
 
     st.caption(
         "Cada punto (o barra) representa la mediana de la longitud perforada "
@@ -5427,12 +5486,44 @@ def render_cut_section(
 # ==========================================================
 
 @fragment
+def _mostrar_tabla_por_turno(tabla: pd.DataFrame) -> None:
+    """Muestra la tabla de indicadores por turno como DOS tablas lado a lado (día | noche).
+
+    Antes día y noche compartían una sola tabla de 9 columnas y se leían como un mismo bloque.
+    Cada turno lleva su rótulo con el horario y columnas más cortas; la primera columna
+    (Jumbo) se repite para leer cada fila sin mirar la otra tabla.
+    """
+    def _bloque(sufijo):
+        cols = [c for c in tabla.columns if str(c).endswith(f" {sufijo}")]
+        t = tabla[["Jumbo"] + cols].copy()
+        # "Inicio más temprano día" -> "Más temprano"; "Ciclos día" -> "Ciclos"
+        nombres = []
+        for c in cols:
+            n = str(c)[: -len(sufijo) - 1]
+            for pref in ("Inicio ", "Fin "):
+                if n.startswith(pref):
+                    n = n[len(pref):]
+            nombres.append(n[:1].upper() + n[1:])
+        t.columns = ["Jumbo"] + nombres
+        return t
+
+    dia, noche = _bloque("día"), _bloque("noche")
+    col_dia, col_noche = st.columns(2, gap="large")
+    with col_dia:
+        st.markdown("**Turno día** · 07:00–19:00")
+        st.dataframe(dia, width="stretch", hide_index=True)
+    with col_noche:
+        st.markdown("**Turno noche** · 19:00–07:00")
+        st.dataframe(noche, width="stretch", hide_index=True)
+
+
 def render_zda_section(
     df_zda: pd.DataFrame,
     sel_jumbos,
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     st.subheader("Tiempos de ciclo de perforación")
 
@@ -5476,6 +5567,7 @@ def render_zda_section(
         & zda_all["Tipo_Roca"].isin(sel_rocas)
         & zda_all["Operador_Filtro"].isin(sel_operadores)
     ].copy()
+    zda_rows = filtrar_por_turno(zda_rows, sel_turnos, col_ts="Inicio_Perforacion_TS")
 
     # ------------------------------------------------------
     # FILTRO GLOBAL DE FECHAS DEL PANEL LATERAL.
@@ -5520,14 +5612,10 @@ def render_zda_section(
     )
 
     if not shift.empty:
-        st.dataframe(
-            shift,
-            width="stretch",
-            hide_index=True,
-        )
+        _mostrar_tabla_por_turno(shift)
         st.caption(
-            "“Ciclos día/noche” cuenta todos los rounds del turno. "
-            "Para promedio, inicio más temprano e inicio más tarde "
+            "“Ciclos” cuenta todos los rounds del turno. "
+            "Para el promedio, el inicio más temprano y el más tarde "
             "se considera solo el primer round de cada jumbo por "
             "fecha operativa y turno."
         )
@@ -5543,14 +5631,10 @@ def render_zda_section(
     )
 
     if not shift_fin.empty:
-        st.dataframe(
-            shift_fin,
-            width="stretch",
-            hide_index=True,
-        )
+        _mostrar_tabla_por_turno(shift_fin)
         st.caption(
-            "“Ciclos día/noche” cuenta todos los rounds iniciados en el turno. "
-            "Para promedio, fin más temprano y fin más tarde se considera "
+            "“Ciclos” cuenta todos los rounds iniciados en el turno. "
+            "Para el promedio, el fin más temprano y el más tarde se considera "
             "únicamente el término del último round de cada jumbo por "
             "fecha operativa y turno."
         )
@@ -5966,6 +6050,7 @@ def render_classification_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     filtrados = df_reportes[
         df_reportes["Jumbo"].astype(str).isin(
@@ -5975,6 +6060,7 @@ def render_classification_section(
         & df_reportes["Tipo_Roca"].isin(sel_rocas)
         & df_reportes["Operador_Filtro"].isin(sel_operadores)
     ].copy()
+    filtrados = filtrar_por_turno(filtrados, sel_turnos)
 
     st.caption(
         "Esta sección utiliza los mismos filtros globales del panel lateral."
@@ -6120,6 +6206,7 @@ def render_classification_section(
         & df_automatico["Tipo_Roca"].isin(sel_rocas)
         & df_automatico["Operador_Filtro"].isin(sel_operadores)
     ].copy()
+    auto_filtrado = filtrar_por_turno(auto_filtrado, sel_turnos)
 
     cols_auto = [
         c
@@ -6319,6 +6406,7 @@ def _catalogo_rop_resultados(
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     """
     Construye catálogo de ciclos ZDA visibles para la viñeta ROP.
@@ -6366,6 +6454,7 @@ def _catalogo_rop_resultados(
                 rep["Operador_Filtro"].isin(sel_operadores)
             ]
 
+        rep = filtrar_por_turno(rep, sel_turnos)
         rep = aplicar_filtro_fechas_global(rep)
 
         if {
@@ -6608,6 +6697,7 @@ def render_rop_section(
     sel_tipos,
     sel_rocas,
     sel_operadores,
+    sel_turnos=None,
 ):
     """
     Viñeta ROP: selección de ciclo y barreno + perfil de penetración.
@@ -6625,6 +6715,7 @@ def render_rop_section(
         sel_tipos,
         sel_rocas,
         sel_operadores,
+        sel_turnos,
     )
 
     if not catalogo:
@@ -7951,7 +8042,7 @@ def _css_selectbox_marca(
     return css
 
 
-def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel_rocas, sel_operadores):
+def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, sel_turnos=None):
     st.subheader("Eficiencia de Perforación")
     st.markdown("**Evaluación del cumplimiento y desviación geométrica de la perforación**")
     st.markdown(
@@ -7994,6 +8085,8 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         if str(rep.get("Jumbo")) not in {str(x) for x in sel_jumbos}:
             continue
         if rep.get("Tipo_Roca") not in sel_rocas or rep.get("Operador_Filtro") not in sel_operadores:
+            continue
+        if not turno_permitido(rep.get("Hora_Inicio"), sel_turnos):
             continue
         try:
             fecha_ciclo = datetime.strptime(str(rep.get("Fecha_Inicio")), "%d/%m/%Y").date()
@@ -8422,6 +8515,7 @@ if seccion_activa == "Uso Automático":
             global_tipos,
             global_rocas,
             global_operadores,
+            global_turnos,
         )
 
 elif seccion_activa == "Longitud de Perforación":
@@ -8433,6 +8527,7 @@ elif seccion_activa == "Longitud de Perforación":
             global_tipos,
             global_rocas,
             global_operadores,
+            global_turnos,
         )
 
 elif seccion_activa == "Primer Golpe":
@@ -8443,12 +8538,13 @@ elif seccion_activa == "Primer Golpe":
             global_tipos,
             global_rocas,
             global_operadores,
+            global_turnos,
         )
 
 elif seccion_activa == "Eficiencia de Perforación":
     with st.container(border=True):
         render_eficiencia_perforacion_section(
-            resultados_validos, global_jumbos, global_tipos, global_rocas, global_operadores
+            resultados_validos, global_jumbos, global_tipos, global_rocas, global_operadores, global_turnos
         )
 
 elif seccion_activa == "Clasificación":
@@ -8462,6 +8558,7 @@ elif seccion_activa == "Clasificación":
             global_tipos,
             global_rocas,
             global_operadores,
+            global_turnos,
         )
 
 elif seccion_activa == "ROP por barreno":
@@ -8473,6 +8570,7 @@ elif seccion_activa == "ROP por barreno":
             global_tipos,
             global_rocas,
             global_operadores,
+            global_turnos,
         )
 
 elif seccion_activa == "Asignar operadores":
