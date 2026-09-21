@@ -18,7 +18,6 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from plotly.colors import qualitative
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -50,11 +49,14 @@ TURNOS_FILTRO = ["Día", "Noche"]
 PUBLIC_VERSION = "v1.0"
 CACHE_SCHEMA_VERSION = "v35_22_orden_balance_20260917"
 TIPOS_DISPARO = ["FRENTE", "SELLADA", "ESTOCADA Y/O CORRECCIONES"]
-COLORES = qualitative.Plotly
+# Paleta de marca (8 colores), en el orden en que se reparte a cualquier serie categórica
+# de la app: jumbos (siempre los 2 primeros: JUMB001 = verde azulado, JUMB002 = naranja),
+# brazos (Brazo 1 / Brazo 2, mismos 2 primeros) y cualquier otra serie por índice.
+COLORES = ["#268071", "#F18604", "#009F3B", "#FAC600", "#716F6F", "#A6C82F", "#A5D5C7", "#BBBCBB"]
 
 st.set_page_config(page_title=f"EBR Drill Analytics · Piloto {PUBLIC_VERSION}", page_icon="⛏️", layout="wide")
 st.title("EBR Drill Analytics")
-st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de archivos ZDA de equipos Jumbo")
+st.caption(f"Piloto {PUBLIC_VERSION} · Análisis de reportes de perforación de equipos Jumbo")
 st.markdown(
     """
     <style>
@@ -427,7 +429,7 @@ with st.sidebar:
             </div>
             <div style="font-size:0.78rem; color:rgba(255,255,255,0.72);
                         margin-top:0.20rem; font-weight:400;">
-                ZDA Analytics
+                Análisis de reportes de perforación
             </div>
         </div>
         """,
@@ -439,7 +441,7 @@ with st.sidebar:
     if not jumbos_detectados:
         st.info(
             "Los filtros se habilitarán automáticamente después de procesar "
-            "los primeros archivos ZDA."
+            "los primeros archivos."
         )
     else:
         _sincronizar_multiselect_dinamico(
@@ -591,9 +593,9 @@ def preparar_carpeta_local(ruta_carpeta: str):
     archivos = sorted(p for p in carpeta.rglob("*")
                       if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".zda")
     if not archivos:
-        raise ValueError("La carpeta no contiene archivos .ZDA (tampoco en sus subcarpetas).")
+        raise ValueError("La carpeta no contiene archivos compatibles (tampoco en sus subcarpetas).")
     if len(archivos) > 2000:
-        raise ValueError("La carpeta contiene más de 2000 ZDA. Selecciona una subcarpeta para esta carga.")
+        raise ValueError("La carpeta contiene más de 2000 archivos. Selecciona una subcarpeta para esta carga.")
     uploads_dir = _session_work_dir() / "uploads"
     nuevos = []
     vistos = set(st.session_state.procesados)
@@ -610,6 +612,15 @@ def preparar_carpeta_local(ruta_carpeta: str):
         nuevos.append(item)
         vistos.add(clave)
     return len(archivos), len(nuevos)
+
+
+def _nombre_visible(nombre) -> str:
+    """Nombre de archivo para mostrar en pantalla, sin su extensión real (p. ej. .zda):
+    es solo un ajuste de presentación, el archivo se sigue leyendo con su nombre completo."""
+    texto = str(nombre or "").strip()
+    if texto.lower().endswith(".zda"):
+        texto = texto[: -len(".zda")]
+    return texto or "-"
 
 
 def fmt(valor, dec=1, sufijo=""):
@@ -1264,7 +1275,7 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
     fig = go.Figure()
     annotations = []
     points = []
-    jumbos = list(df["Jumbo"].dropna().astype(str).unique())
+    jumbos = sorted(df["Jumbo"].dropna().astype(str).unique())
     if barras:
         df = df.reset_index(drop=True)
         df["_x"], cfg_barras = _eje_barras_por_dia(df["FechaHora"])
@@ -1332,11 +1343,13 @@ def grafico_auto(df_auto: pd.DataFrame, mostrar_etiquetas: bool, mostrar_linea: 
     return fig
 
 
-COLOR_OPERADOR_AZUL = "#4F67F2"
-COLOR_OPERADOR_VERDE = "#16C48A"
-COLOR_OPERADOR_NARANJA = "#F59E0B"
-COLOR_OPERADOR_ROJO = "#EF4444"
-COLOR_OPERADOR_SIN_REGISTRO = "#111111"
+# Ranking de operadores por horas automáticas, con los colores de marca: sin rojo disponible,
+# el extremo "menor horas" se marca con el naranja de marca (el tono más "de alerta" del set).
+COLOR_OPERADOR_MEJOR = "#009F3B"       # 1.º (más horas)
+COLOR_OPERADOR_SEGUNDO = "#268071"     # 2.º
+COLOR_OPERADOR_MEDIO = "#FAC600"       # posiciones intermedias (4.º en adelante)
+COLOR_OPERADOR_PEOR = "#F18604"        # último (menos horas)
+COLOR_OPERADOR_SIN_REGISTRO = "#716F6F"  # sin operador identificado
 
 
 def construir_colores_operador_por_ranking(df_auto: pd.DataFrame):
@@ -1361,6 +1374,8 @@ def construir_colores_operador_por_ranking(df_auto: pd.DataFrame):
     color_map = {
         "Sin registrar": COLOR_OPERADOR_SIN_REGISTRO,
     }
+    # (Nombres históricos AZUL/VERDE/NARANJA/ROJO renombrados arriba a MEJOR/SEGUNDO/MEDIO/PEOR
+    # porque ya no corresponden a esos colores literales.)
 
     if (
         df_auto is None
@@ -1405,30 +1420,30 @@ def construir_colores_operador_por_ranking(df_auto: pd.DataFrame):
     n = len(operadores)
 
     if n == 1:
-        colores = [COLOR_OPERADOR_AZUL]
+        colores = [COLOR_OPERADOR_MEJOR]
     elif n == 2:
         colores = [
-            COLOR_OPERADOR_AZUL,
-            COLOR_OPERADOR_ROJO,
+            COLOR_OPERADOR_MEJOR,
+            COLOR_OPERADOR_PEOR,
         ]
     elif n == 3:
         colores = [
-            COLOR_OPERADOR_AZUL,
-            COLOR_OPERADOR_VERDE,
-            COLOR_OPERADOR_ROJO,
+            COLOR_OPERADOR_MEJOR,
+            COLOR_OPERADOR_SEGUNDO,
+            COLOR_OPERADOR_PEOR,
         ]
     elif n == 4:
         colores = [
-            COLOR_OPERADOR_AZUL,
-            COLOR_OPERADOR_VERDE,
-            COLOR_OPERADOR_NARANJA,
-            COLOR_OPERADOR_ROJO,
+            COLOR_OPERADOR_MEJOR,
+            COLOR_OPERADOR_SEGUNDO,
+            COLOR_OPERADOR_MEDIO,
+            COLOR_OPERADOR_PEOR,
         ]
     else:
         colores = (
-            [COLOR_OPERADOR_AZUL, COLOR_OPERADOR_VERDE]
-            + [COLOR_OPERADOR_NARANJA] * max(0, n - 3)
-            + [COLOR_OPERADOR_ROJO]
+            [COLOR_OPERADOR_MEJOR, COLOR_OPERADOR_SEGUNDO]
+            + [COLOR_OPERADOR_MEDIO] * max(0, n - 3)
+            + [COLOR_OPERADOR_PEOR]
         )
 
     color_map.update(dict(zip(operadores, colores)))
@@ -3088,17 +3103,20 @@ def grafico_timeline_ciclos_turno(
         "JUMB002": 0.16,
     }
 
+    # Mismos colores que usan los demás gráficos de la app para JUMB001/JUMB002
+    # (COLORES[0]/[1] de la paleta general), en vez del gris/negro anterior: así este
+    # timeline se reconoce a simple vista como parte del mismo tablero.
     estilos = {
         "JUMB001": {
-            "line_color": "#64748b",
+            "line_color": COLORES[0],
             "dash": "solid",
-            "marker_color": "#64748b",
+            "marker_color": COLORES[0],
             "legend_name": "JUMB001",
         },
         "JUMB002": {
-            "line_color": "#111827",
+            "line_color": COLORES[1],
             "dash": "solid",
-            "marker_color": "#111827",
+            "marker_color": COLORES[1],
             "legend_name": "JUMB002",
         },
     }
@@ -3144,12 +3162,12 @@ def grafico_timeline_ciclos_turno(
                 # En símbolos "open", Plotly usa marker.color como
                 # color principal del contorno. No debe ser blanco.
                 symbol = "square-open"
-                marker_color = "#64748b"
-                marker_line_color = "#64748b"
+                marker_color = estilo["marker_color"]
+                marker_line_color = estilo["marker_color"]
             else:
                 symbol = "square"
-                marker_color = "#111827"
-                marker_line_color = "#111827"
+                marker_color = estilo["marker_color"]
+                marker_line_color = estilo["marker_color"]
 
             fig.add_trace(
                 go.Scatter(
@@ -3207,7 +3225,7 @@ def grafico_timeline_ciclos_turno(
             )
 
             duracion = max(float(x2 - x1), 0.02)
-            ancho_barra = 0.15
+            ancho_barra = 0.17
             show_legend_actual = jumbo not in legend_done
 
             if jumbo == "JUMB001":
@@ -3223,10 +3241,8 @@ def grafico_timeline_ciclos_turno(
                         showlegend=show_legend_actual,
                         marker=dict(
                             color="rgba(255,255,255,0)",
-                            line=dict(
-                                color="#64748b",
-                                width=1.8,
-                            ),
+                            line=dict(color=estilo["line_color"], width=1.8),
+                            cornerradius=3,
                         ),
                         customdata=[custom[0]],
                         hovertemplate=hover_barra,
@@ -3244,11 +3260,11 @@ def grafico_timeline_ciclos_turno(
                         legendgroup=jumbo,
                         showlegend=show_legend_actual,
                         marker=dict(
-                            color="#111827",
-                            line=dict(
-                                color="#111827",
-                                width=0.8,
-                            ),
+                            color=estilo["marker_color"],
+                            # Sin borde propio: con rounds que se solapan en el tiempo (datos
+                            # atípicos) un borde de otro color se ve como rayas sobre la barra.
+                            line=dict(color=estilo["marker_color"], width=0),
+                            cornerradius=3,
                         ),
                         customdata=[custom[0]],
                         hovertemplate=hover_barra,
@@ -3268,6 +3284,13 @@ def grafico_timeline_ciclos_turno(
 
     y_tickvals = [y_map[pd.Timestamp(fecha)] for fecha in fechas]
     y_ticktext = [f"{pd.Timestamp(fecha).strftime('%d/%m')} · {turno}" for fecha in fechas]
+
+    # Franjas alternadas por fila (fecha operativa): ayudan a seguir una fila a lo ancho
+    # del gráfico sin que compitan con los colores de JUMB001/JUMB002.
+    for i in range(0, len(fechas), 2):
+        fig.add_hrect(
+            y0=i - 0.5, y1=i + 0.5, fillcolor="#f4f6f9", line_width=0, layer="below",
+        )
 
     height = max(420, min(980, 150 + len(fechas) * 30))
 
@@ -4350,7 +4373,7 @@ def _streamlit_version_tuple():
 
 
 with st.container(border=True, key="zona_carga"):
-    st.subheader("Cargar ciclos (.ZDA)")
+    st.subheader("Cargar archivos")
     st.caption(
         "Puedes agregar archivos individuales o seleccionar una carpeta completa. "
         "Los ciclos ya procesados permanecen cargados y puedes seguir incorporando "
@@ -4363,11 +4386,10 @@ with st.container(border=True, key="zona_carga"):
         with st.popover(
             "📄 Elegir archivos",
             use_container_width=True,
-            help="Selecciona uno o varios archivos ZDA.",
+            help="Selecciona uno o varios archivos.",
         ):
             archivos_individuales = st.file_uploader(
-                "Archivos ZDA",
-                type=["zda"],
+                "Archivos",
                 accept_multiple_files=True,
                 key=f"uploader_archivos_{st.session_state.uploader_version}",
                 label_visibility="collapsed",
@@ -4385,13 +4407,12 @@ with st.container(border=True, key="zona_carga"):
                 help="Selector de directorio del navegador. Si solo permite seleccionar archivos, usa la opción de ruta local que aparece debajo.",
             ):
                 archivos_carpeta = st.file_uploader(
-                    "Carpeta con archivos ZDA",
-                    type=["zda"],
+                    "Carpeta con archivos",
                     accept_multiple_files="directory",
                     key=f"uploader_carpeta_{st.session_state.uploader_version}",
                     label_visibility="collapsed",
                     help=(
-                        "Selecciona una carpeta. Solo se cargarán archivos ZDA; "
+                        "Selecciona una carpeta. Solo se cargarán los archivos compatibles; "
                         "también se consideran sus subcarpetas."
                     ),
                 )
@@ -4422,22 +4443,22 @@ with st.container(border=True, key="zona_carga"):
     with st.expander("📂 Cargar carpeta completa desde esta computadora", expanded=False):
         st.caption(
             "Pega la ruta de una carpeta del equipo donde se ejecuta Streamlit. "
-            "Se incluyen sus subcarpetas y solo archivos .ZDA. En Finder (Mac): "
+            "Se incluyen sus subcarpetas y solo los archivos compatibles. En Finder (Mac): "
             "selecciona la carpeta y pulsa ⌥⌘C para copiar su ruta. "
             "Si Streamlit está publicado en la nube, esta opción NO puede leer carpetas de tu Mac."
         )
         ruta_zda_local = st.text_input(
-            "Ruta de la carpeta local", key="ruta_carpeta_zda_local",
-            placeholder="/Users/usuario/Documentos/ZDA",
+            "Ruta de la carpeta local", key="ruta_carpeta_local",
+            placeholder="/Users/usuario/Documentos/Reportes",
         )
-        if st.button("Cargar todos los ZDA de esta carpeta", key="btn_cargar_ruta_zda"):
+        if st.button("Cargar todos los archivos de esta carpeta", key="btn_cargar_ruta_local"):
             try:
                 total_local, nuevos_local = preparar_carpeta_local(ruta_zda_local)
                 if nuevos_local:
                     st.session_state.auto_process_staged = True
-                    st.success(f"Detectados {total_local} ZDA; {nuevos_local} nuevos en cola de procesamiento.")
+                    st.success(f"Detectados {total_local} archivo(s); {nuevos_local} nuevos en cola de procesamiento.")
                 else:
-                    st.info(f"Se detectaron {total_local} ZDA; todos estaban cargados anteriormente.")
+                    st.info(f"Se detectaron {total_local} archivo(s); todos estaban cargados anteriormente.")
             except (ValueError, OSError, PermissionError) as exc:
                 st.error(str(exc))
 
@@ -4542,7 +4563,7 @@ if not resultados_validos:
         st.dataframe(
             pd.DataFrame([
                 {
-                    "Archivo": r.get("nombre_archivo"),
+                    "Archivo": _nombre_visible(r.get("nombre_archivo")),
                     "Error": r.get("error"),
                 }
                 for r in errores
@@ -4636,11 +4657,11 @@ if sidebar_fecha_container is not None:
 
                 # Recuperar valores previos y ajustarlos al rango disponible.
                 fecha_inicio_previa = st.session_state.get(
-                    "fecha_inicio_zda_global",
+                    "fecha_inicio_global",
                     fecha_min_sidebar,
                 )
                 fecha_fin_previa = st.session_state.get(
-                    "fecha_fin_zda_global",
+                    "fecha_fin_global",
                     fecha_max_sidebar,
                 )
 
@@ -4672,7 +4693,7 @@ if sidebar_fecha_container is not None:
                         value=fecha_inicio_previa,
                         min_value=fecha_min_sidebar,
                         max_value=fecha_max_sidebar,
-                        key="fecha_inicio_zda_global",
+                        key="fecha_inicio_global",
                         format="DD/MM/YYYY",
                     )
                 with col_fecha_hasta:
@@ -4681,7 +4702,7 @@ if sidebar_fecha_container is not None:
                         value=fecha_fin_previa,
                         min_value=fecha_min_sidebar,
                         max_value=fecha_max_sidebar,
-                        key="fecha_fin_zda_global",
+                        key="fecha_fin_global",
                         format="DD/MM/YYYY",
                     )
 
@@ -4691,9 +4712,9 @@ if sidebar_fecha_container is not None:
                     f"→ {global_fecha_fin_zda.strftime('%d/%m/%Y')}"
                 )
             else:
-                st.caption("Sin fechas ZDA válidas.")
+                st.caption("Sin fechas válidas.")
         else:
-            st.caption("Sin fechas ZDA disponibles.")
+            st.caption("Sin fechas disponibles.")
 
 
 # ==========================================================
@@ -4724,8 +4745,8 @@ def aplicar_filtro_fechas_global(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "Fecha_Inicio" not in df.columns:
         return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-    fecha_inicio = st.session_state.get("fecha_inicio_zda_global")
-    fecha_fin = st.session_state.get("fecha_fin_zda_global")
+    fecha_inicio = st.session_state.get("fecha_inicio_global")
+    fecha_fin = st.session_state.get("fecha_fin_global")
 
     if fecha_inicio is None or fecha_fin is None:
         return df.copy()
@@ -4813,8 +4834,8 @@ def render_kpis_uso_automatico(df_auto: pd.DataFrame, df_pendientes: pd.DataFram
             errors="coerce",
         ).dropna()
 
-    fecha_inicio_sel = st.session_state.get("fecha_inicio_zda_global")
-    fecha_fin_sel = st.session_state.get("fecha_fin_zda_global")
+    fecha_inicio_sel = st.session_state.get("fecha_inicio_global")
+    fecha_fin_sel = st.session_state.get("fecha_fin_global")
 
     def _rango_compacto(d0, d1):
         # "24 ago – 03 sep": sin guiones ni puntos para que quepa en una sola línea.
@@ -5037,7 +5058,7 @@ def _tabla_operadores(df_reportes: pd.DataFrame) -> pd.DataFrame:
         if "Operador_Asignado_Manual" in base.columns else pd.Series(False, index=base.index)
     )
     base["_operador"] = efectivo
-    base["_origen"] = np.where(manual, "Manual", np.where(efectivo.notna(), "ZDA", "Pendiente"))
+    base["_origen"] = np.where(manual, "Manual", np.where(efectivo.notna(), "Archivo", "Pendiente"))
     base["_sugerencia"] = asig.sugerir(base.assign(operador=efectivo), col_operador="operador")
     base["_clave"] = [asig.clave_ciclo(r) for r in base.to_dict("records")]
     return base
@@ -5071,9 +5092,9 @@ def _terminar_cambios_operador(n: int) -> None:
 def render_asignar_operadores_section(df_reportes: pd.DataFrame):
     st.subheader("Asignar operadores")
     st.caption(
-        "El ZDA guarda el operador como texto libre (campo tunnel_id). Cuando el equipo no lo "
+        "El archivo guarda el operador como texto libre (campo tunnel_id). Cuando el equipo no lo "
         "trae, el ciclo queda \"SIN DATO\". Aquí puedes asignarlo a mano: se guarda en este equipo "
-        "y se aplica a filtros, gráficos, Excel y Resultados por archivo, sin modificar los ZDA."
+        "y se aplica a filtros, gráficos, Excel y Resultados por archivo, sin modificar los archivos originales."
     )
     if df_reportes is None or df_reportes.empty:
         st.info("No hay ciclos cargados.")
@@ -5092,7 +5113,7 @@ def render_asignar_operadores_section(df_reportes: pd.DataFrame):
     n_pend = int((base["_origen"] == "Pendiente").sum())
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Ciclos cargados", len(base))
-    m2.metric("Operador del ZDA", int((base["_origen"] == "ZDA").sum()))
+    m2.metric("Operador del archivo", int((base["_origen"] == "Archivo").sum()))
     m3.metric("Asignados a mano", int((base["_origen"] == "Manual").sum()))
     m4.metric("Pendientes", n_pend)
     if n_pend == 0:
@@ -5132,7 +5153,7 @@ def render_asignar_operadores_section(df_reportes: pd.DataFrame):
     else:
         st.caption(
             "Elige el operador en la columna **Operador** (o marca varias filas y usa "
-            "\"Asignar a varias filas\" más abajo). **Texto del ZDA** es lo que el operador "
+            "\"Asignar a varias filas\" más abajo). **Texto del archivo** es lo que el operador "
             "escribió en el equipo: úsalo como pista. **Sugerencia** es el operador del ciclo más "
             "cercano (hasta 6 h) del mismo jumbo; solo se aplica si tú lo confirmas."
         )
@@ -5143,7 +5164,7 @@ def render_asignar_operadores_section(df_reportes: pd.DataFrame):
             "Fecha": visibles["Fecha_Inicio"],
             "Hora": visibles["Hora_Inicio"],
             "Barrenos": visibles["Barrenos_Realizados"] if "Barrenos_Realizados" in visibles.columns else None,
-            "Texto del ZDA": (visibles["Operador_ZDA_Raw"].fillna("") if "Operador_ZDA_Raw" in visibles.columns else ""),
+            "Texto del archivo": (visibles["Operador_ZDA_Raw"].fillna("") if "Operador_ZDA_Raw" in visibles.columns else ""),
             "Origen": visibles["_origen"],
             "Sugerencia": visibles["_sugerencia"],
             "Operador": visibles["_operador"],
@@ -5333,7 +5354,8 @@ def render_automation_section(
     st.caption(
         "Cada línea representa un operador y cada punto un ciclo/round. "
         "El color se asigna por horas automáticas acumuladas del rango visible: "
-        "azul = más horas, verde = segundo, naranja = tercero y rojo = menos horas. "
+        "verde = más horas, verde azulado = segundo, amarillo = intermedio y naranja = "
+        "menos horas. "
         "El símbolo identifica el jumbo: círculo = JUMB001, cuadrado = JUMB002. "
         "En barras, los ciclos simultáneos de dos jumbos se muestran lado a lado "
         "(el jumbo y la hora exacta figuran en el hover)."
@@ -5430,6 +5452,158 @@ def render_automation_section(
 # BLOQUE 2 - BARRENOS CUT
 # ==========================================================
 
+def grafico_cut_por_hora_turno(
+    df_cut: pd.DataFrame,
+    jumbos_visibles,
+    tipos_visibles,
+    rocas_visibles,
+    operadores_visibles,
+    turno: str = "Día",
+):
+    """Longitud perforada en Cut vs. hora de inicio dentro del turno (Día 07:00-19:00 o
+    Noche 19:00-07:00 del día siguiente).
+
+    Responde a la pregunta de si los ciclos que arrancan temprano en el turno alcanzan más
+    longitud que los que arrancan tarde, cerca del cierre. Cada punto es un ciclo (no se
+    conectan con líneas: el eje X ya no es cronológico, son horas del turno repetidas entre
+    distintas fechas). Se agrega una recta de tendencia (regresión lineal simple) por jumbo
+    para no depender de "leer a ojo" la nube de puntos.
+
+    En el turno noche la hora cruza la medianoche: para que el eje X sea continuo, la
+    madrugada (00:00-07:00) se representa como 24:00-31:00 (mismo criterio que `zda_turno`
+    y el timeline de Primer Golpe), y las etiquetas del eje se muestran ya convertidas de
+    vuelta a la hora real.
+
+    Devuelve (figura, resumen) donde `resumen` es una lista de (jumbo, pendiente, r, n) con
+    la pendiente en metros por hora y el coeficiente de correlación de Pearson; útil para
+    mostrar el indicio en texto además del gráfico.
+    """
+    if df_cut.empty:
+        return None, []
+
+    df = df_cut[
+        df_cut["Jumbo"].astype(str).isin([str(x) for x in jumbos_visibles])
+        & df_cut["Tipo_Disparo"].isin(tipos_visibles)
+        & df_cut["Tipo_Roca"].isin(rocas_visibles)
+        & df_cut["Operador_Filtro"].isin(operadores_visibles)
+    ].copy()
+    if df.empty:
+        return None, []
+
+    df["_hora"] = (
+        df["FechaHora"].dt.hour
+        + df["FechaHora"].dt.minute / 60
+        + df["FechaHora"].dt.second / 3600
+    )
+    if turno == "Noche":
+        df = df[(df["_hora"] >= 19) | (df["_hora"] < 7)].copy()
+        df["_hora_turno"] = np.where(df["_hora"] < 7, df["_hora"] + 24, df["_hora"])
+        x_range = [18.5, 31.5]
+        x_tickvals = [19, 21, 23, 25, 27, 29, 31]
+        x_ticktext = ["19:00", "21:00", "23:00", "01:00", "03:00", "05:00", "07:00"]
+        x_titulo = "Hora de inicio (turno noche 19:00–07:00)"
+        xs_tendencia = np.linspace(19, 31, 50)
+    else:
+        df = df[(df["_hora"] >= 7) & (df["_hora"] < 19)].copy()
+        df["_hora_turno"] = df["_hora"]
+        x_range = [6.5, 19.5]
+        x_tickvals = [7, 9, 11, 13, 15, 17, 19]
+        x_ticktext = ["07:00", "09:00", "11:00", "13:00", "15:00", "17:00", "19:00"]
+        x_titulo = "Hora de inicio (turno día 07:00–19:00)"
+        xs_tendencia = np.linspace(7, 19, 50)
+    if df.empty:
+        return None, []
+
+    all_jumbos = sorted(df_cut["Jumbo"].dropna().astype(str).unique())
+    visibles = sorted(df["Jumbo"].dropna().astype(str).unique())
+
+    fig = go.Figure()
+    resumen = []
+    for jumbo in visibles:
+        idx = all_jumbos.index(jumbo)
+        color = COLORES[idx % len(COLORES)]
+        g = df[df["Jumbo"].astype(str) == jumbo]
+
+        fig.add_trace(go.Scatter(
+            x=g["_hora_turno"], y=g["Mediana"], mode="markers", name=jumbo,
+            marker=dict(size=10, color=color, line=dict(color="#ffffff", width=1.2)),
+            customdata=g[["Ciclo", "Tipo_Disparo"]].to_numpy(),
+            hovertemplate=(
+                f"{jumbo}<br>Inicio: %{{x:.2f}} h"
+                "<br>Ciclo: %{customdata[0]}"
+                "<br>Mediana Cut: %{y:.2f} m<extra></extra>"
+            ),
+        ))
+
+        # Recta de tendencia: hace falta variación real en X (varios horarios distintos).
+        if len(g) >= 3 and g["_hora_turno"].std() > 0:
+            pendiente, intercepto = np.polyfit(g["_hora_turno"], g["Mediana"], 1)
+            r = float(np.corrcoef(g["_hora_turno"], g["Mediana"])[0, 1])
+            fig.add_trace(go.Scatter(
+                x=xs_tendencia, y=pendiente * xs_tendencia + intercepto, mode="lines",
+                line=dict(color=color, width=2, dash="dash"),
+                name=f"{jumbo} · tendencia", showlegend=False, hoverinfo="skip",
+            ))
+            resumen.append((jumbo, float(pendiente), r, int(len(g))))
+        else:
+            resumen.append((jumbo, None, None, int(len(g))))
+
+    # Rango de Y con un mínimo garantizado: si todos los ciclos tienen una longitud casi
+    # idéntica (poca varianza real, o incluso ruido de punto flotante), el autorango de
+    # Plotly puede acercarse a una escala microscópica y una línea en la práctica plana se
+    # ve como una escalera dramática. Se fuerza un span mínimo de 0.5 m para evitarlo.
+    y_min, y_max = float(df["Mediana"].min()), float(df["Mediana"].max())
+    span = max(y_max - y_min, 0.5)
+    centro = (y_max + y_min) / 2
+    pad = span * 0.15
+
+    fig.update_layout(**base_layout(
+        460, margin=dict(l=70, r=30, t=30, b=55),
+        xaxis=dict(
+            title=x_titulo, range=x_range,
+            tickvals=x_tickvals,
+            ticktext=x_ticktext,
+            gridcolor="#e6edf5",
+        ),
+        yaxis=dict(
+            title="Mediana de longitud perforada Cut (m)", gridcolor="#e6edf5",
+            range=[centro - span / 2 - pad, centro + span / 2 + pad],
+        ),
+        hovermode="closest",
+    ))
+    return fig, resumen
+
+
+def _mostrar_cut_por_hora_turno(df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, turno):
+    """Un bloque completo (subtítulo + gráfico + resumen en texto) para un turno."""
+    horario = "07:00–19:00" if turno == "Día" else "19:00–07:00"
+    st.markdown(f"**Turno {turno.lower()}** · {horario}")
+    fig_hora, resumen_tendencia = grafico_cut_por_hora_turno(
+        df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, turno,
+    )
+    if fig_hora is not None:
+        st.plotly_chart(fig_hora, width="stretch", config={"displaylogo": False})
+        lineas = []
+        for jumbo, pendiente, r, n in resumen_tendencia:
+            if pendiente is None:
+                lineas.append(f"**{jumbo}**: {n} ciclo(s), insuficientes u horario parejo para calcular una tendencia.")
+            else:
+                sentido = "menos" if pendiente < 0 else "más"
+                lineas.append(
+                    f"**{jumbo}**: {n} ciclos · por cada hora más tarde, {abs(pendiente):.2f} m {sentido} "
+                    f"en la tendencia (r = {r:+.2f})."
+                )
+        st.markdown("  \n".join(lineas))
+        st.caption(
+            "r es la correlación de Pearson: va de −1 a 1. Cerca de 0 significa que la hora "
+            "de inicio casi no explica la longitud alcanzada; mientras más se aleja de 0 "
+            "(en cualquier sentido), más fuerte es el patrón. Con pocos ciclos por jumbo, "
+            "tómalo como un indicio a seguir observando, no como una conclusión cerrada."
+        )
+    else:
+        st.info(f"No hay ciclos del turno {turno.lower()} ({horario}) con los filtros seleccionados.")
+
+
 @fragment
 def render_cut_section(
     df_resumen: pd.DataFrame,
@@ -5480,6 +5654,19 @@ def render_cut_section(
         st.info(
             "No hay ciclos visibles con los filtros globales seleccionados."
         )
+
+    st.divider()
+    st.markdown("##### Longitud alcanzada según la hora de inicio")
+    st.caption(
+        "Cada punto es un ciclo: en el eje X, la hora en que empezó dentro de su turno; en "
+        "el eje Y, la misma mediana de longitud Cut de arriba. La línea punteada es la "
+        "tendencia lineal de cada jumbo. Si baja de izquierda a derecha, es un indicio de "
+        "que arrancar tarde en el turno se asocia con menor longitud alcanzada; si es plana, "
+        "no hay un indicio claro en estos datos."
+    )
+    _mostrar_cut_por_hora_turno(df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, "Día")
+    st.markdown("---")
+    _mostrar_cut_por_hora_turno(df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, "Noche")
 
 
 # ==========================================================
@@ -5536,7 +5723,7 @@ def render_zda_section(
         }.issubset(df_zda.columns)
     ):
         st.info(
-            "Sin datos ZDA suficientes para mostrar tiempos de ciclo."
+            "Sin datos suficientes para mostrar tiempos de ciclo."
         )
         return
 
@@ -5546,7 +5733,7 @@ def render_zda_section(
     ].copy()
 
     if zda_all.empty:
-        st.info("Sin ventanas de perforación ZDA válidas.")
+        st.info("Sin ventanas de perforación válidas.")
         return
 
     st.caption(
@@ -5575,8 +5762,8 @@ def render_zda_section(
     # Los widgets se muestran siempre en el sidebar; aquí únicamente
     # se aplican los valores seleccionados a Tiempos de Ciclo.
     # ------------------------------------------------------
-    fecha_inicio_zda = st.session_state.get("fecha_inicio_zda_global")
-    fecha_fin_zda = st.session_state.get("fecha_fin_zda_global")
+    fecha_inicio_zda = st.session_state.get("fecha_inicio_global")
+    fecha_fin_zda = st.session_state.get("fecha_fin_global")
 
     if not zda_rows.empty:
         zda_rows["_Fecha_Operativa_Filtro"] = (
@@ -6172,8 +6359,8 @@ def render_classification_section(
 
         r1, r2, r3 = st.columns(3)
 
-        r1.metric("Archivos ZDA", len(filtrados))
-        r2.metric("Lectura ZDA OK", f"{zda_ok}/{len(zda_rows_all)}")
+        r1.metric("Archivos", len(filtrados))
+        r2.metric("Lectura OK", f"{zda_ok}/{len(zda_rows_all)}")
         r3.metric("Revisar lectura", f"{len(zda_rows_all) - zda_ok}")
 
         s1, s2, s3, s4 = st.columns(4)
@@ -6696,6 +6883,10 @@ def grafico_rop_por_barreno(
 # aparte y no entran en las curvas, el promedio ni las métricas del round (ver justo abajo).
 TIPO_SOSPECHOSO = "Sin identificar (posible rehecho)"
 
+# Colores originales de este gráfico (previos a la paleta de marca general): se mantienen
+# aquí porque, con 6 categorías a la vez en una sola curva superpuesta, se distinguen mejor
+# que los tonos de marca (dos de ellos muy claros: menta y gris). El resto de la app sigue
+# usando la paleta de marca; este es el único lugar que la excepciona, a pedido explícito.
 TIPO_COLOR_ROP = {
     "Bottom": "#8B5CF6", "Easer": "#F59E0B", "Cut": "#EF4444",
     "Contour": "#0EA5E9", "Reaming": "#10B981", "Reference": "#6B7280",
@@ -6859,6 +7050,59 @@ def grafico_rop_round_mapa(df_resumen: pd.DataFrame, perfil_nominal=None):
     return fig
 
 
+def grafico_rop_round_3d(df_curvas: pd.DataFrame, df_resumen: pd.DataFrame):
+    """Vista 3D opcional: cada barreno como una línea en su posición real (X, Z, igual que
+    el mapa del frente), extendida en un tercer eje de profundidad, coloreada por su ROP a lo
+    largo de esa profundidad. Combina el mapa y las curvas superpuestas en una sola vista,
+    a costa de ser más difícil de leer sin rotarla — ver la nota en la app.
+
+    No es la vista principal: con 50+ barrenos las líneas se amontonan y una captura fija se
+    lee peor que el mapa 2D; solo aporta si la persona la rota con el mouse para explorar.
+    """
+    if df_curvas is None or df_curvas.empty or df_resumen is None or df_resumen.empty:
+        return None
+
+    resumen_pos = df_resumen.dropna(subset=["X", "Z"]).set_index("Barreno_ID")
+    curvas = df_curvas[df_curvas["Barreno_ID"].isin(resumen_pos.index)]
+    if curvas.empty:
+        return None
+
+    rop_valido = pd.to_numeric(curvas["ROP_suave_m_min"], errors="coerce").dropna()
+    if rop_valido.empty:
+        return None
+    cmin, cmax = float(rop_valido.quantile(0.03)), float(rop_valido.quantile(0.97))
+
+    fig = go.Figure()
+    primero = True
+    for barreno_id, g in curvas.groupby("Barreno_ID", sort=False):
+        if barreno_id not in resumen_pos.index:
+            continue
+        x0 = float(resumen_pos.loc[barreno_id, "X"])
+        z0 = float(resumen_pos.loc[barreno_id, "Z"])
+        g = g.sort_values("Profundidad_m")
+        fig.add_trace(go.Scatter3d(
+            x=[x0] * len(g), y=g["Profundidad_m"], z=[z0] * len(g),
+            mode="lines",
+            line=dict(
+                width=7, color=g["ROP_suave_m_min"], colorscale="RdYlGn", cmin=cmin, cmax=cmax,
+                colorbar=dict(title="ROP<br>(m/min)") if primero else None,
+            ),
+            showlegend=False,
+            hovertemplate=f"Barreno {barreno_id}<br>Profundidad: %{{y:.2f}} m<extra></extra>",
+        ))
+        primero = False
+
+    fig.update_layout(
+        height=620, margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(
+            xaxis_title="X (m)", zaxis_title="Z (m)", yaxis_title="Profundidad (m)",
+            aspectmode="data",
+            camera=dict(eye=dict(x=0.15, y=-2.4, z=0.2)),
+        ),
+    )
+    return fig
+
+
 def render_rop_section(
     resultados_validos,
     df_reportes,
@@ -6889,7 +7133,7 @@ def render_rop_section(
 
     if not catalogo:
         st.info(
-            "No hay ciclos ZDA visibles con información MWD "
+            "No hay ciclos visibles con información MWD "
             "para los filtros seleccionados."
         )
         return
@@ -7117,7 +7361,7 @@ def render_rop_section(
     if df_rop.empty:
         st.warning(
             "No se pudo recuperar la curva ROP del barreno seleccionado. "
-            "Verifica que el archivo ZDA fuente siga disponible en la sesión."
+            "Verifica que el archivo fuente siga disponible en la sesión."
         )
         return
 
@@ -7337,8 +7581,8 @@ def render_rop_section(
 
     st.caption(
         "ROP = Rate of Penetration · unidad mostrada: metros por minuto (m/min). "
-        "Barreno corresponde al ID del plan ZDA; Brazo + Secuencia identifica "
-        "el registro MWD asociado dentro del ZDA."
+        "Barreno corresponde al ID del plan; Brazo + Secuencia identifica "
+        "el registro MWD asociado dentro del archivo."
     )
 
     # ------------------------------------------------------
@@ -7350,7 +7594,7 @@ def render_rop_section(
         "Todos los barrenos del ciclo seleccionado a la vez, en dos formas complementarias: "
         "las curvas ROP superpuestas (para ver la dispersión entre barrenos) y su posición real "
         "en el frente, coloreada por ROP promedio (para ver si algún sector o tipo de barreno "
-        "perfora más lento). Usa la posición ejecutada (X, Z) reconstruida del ZDA."
+        "perfora más lento). Usa la posición ejecutada (X, Z) reconstruida del archivo."
     )
 
     items = []
@@ -7396,7 +7640,7 @@ def render_rop_section(
 
     if df_curvas_round.empty:
         st.info(
-            "No se pudo reconstruir la vista de conjunto (el ZDA fuente ya no está disponible "
+            "No se pudo reconstruir la vista de conjunto (el archivo fuente ya no está disponible "
             "en esta sesión, o ningún barreno tiene curva MWD válida)."
         )
     else:
@@ -7444,7 +7688,7 @@ def render_rop_section(
 
         st.markdown("##### Mapa de ROP en el frente")
         if not perfil_nominal:
-            st.caption("No se pudo leer el perfil nominal (round-*.dat) de este ZDA; se muestra solo el frente sin contorno.")
+            st.caption("No se pudo leer el perfil nominal de este archivo; se muestra solo el frente sin contorno.")
         fig_mapa = grafico_rop_round_mapa(df_resumen_round, perfil_nominal)
         if fig_mapa is not None:
             st.plotly_chart(fig_mapa, width="stretch", config={"displaylogo": False})
@@ -7453,6 +7697,19 @@ def render_rop_section(
                 "No hay barrenos con posición ejecutada (X, Z) conocida para dibujar el mapa "
                 "del frente de este round."
             )
+
+        with st.expander("Vista 3D del round (opcional)", expanded=False):
+            st.caption(
+                "Combina las dos vistas de arriba: cada barreno en su posición real (X, Z) "
+                "extendido en profundidad, coloreado por su ROP. Con muchos barrenos las "
+                "líneas se amontonan y cuesta más leerla que el mapa; **arrastra con el mouse "
+                "para rotarla** — solo así se distingue bien cada barreno."
+            )
+            fig_3d = grafico_rop_round_3d(df_curvas_round, df_resumen_round)
+            if fig_3d is not None:
+                st.plotly_chart(fig_3d, width="stretch", config={"displaylogo": False})
+            else:
+                st.info("No hay suficientes barrenos con posición y curva ROP para esta vista.")
 
 
 def render_resultados_section(resultados_validos):
@@ -7481,12 +7738,10 @@ def render_resultados_section(resultados_validos):
 
     def _cycle_label(i):
         rr = resultados_validos[i].get("resumen_reporte", {})
-        fuente_i = rr.get("Fuente") or resultados_validos[i].get("fuente") or ""
         return (
             f"{rr.get('Jumbo', '-')} · "
             f"Ciclo {rr.get('Ciclo', '-')} · "
             f"{rr.get('Fecha_Inicio', '-')}"
-            + (f" · {fuente_i}" if fuente_i else "")
         )
 
     jump_key = "resultados_jump_cycle"
@@ -7550,16 +7805,10 @@ def render_resultados_section(resultados_validos):
 
     for idx, r in enumerate(resultados_validos[start:end], start=start):
         rep = r["resumen_reporte"]
-        fuente = (
-            rep.get("Fuente")
-            or r.get("fuente")
-            or "ZDA"
-        )
         titulo = (
             f"{rep.get('Jumbo','-')} · "
             f"Ciclo {rep.get('Ciclo','-')} · "
-            f"{rep.get('Fecha_Inicio','-')} · "
-            f"{fuente}"
+            f"{rep.get('Fecha_Inicio','-')}"
         )
 
         with st.expander(
@@ -7711,7 +7960,7 @@ def render_resultados_section(resultados_validos):
             with col_nav:
                 if nav_path:
                     st.caption(
-                        "Plano reconstruido desde ZDA · "
+                        "Plano reconstruido · "
                         f"sección {seccion_desde_plan_texto(rep.get('Plan_Perforacion'))}"
                     )
                     st.image(str(nav_path), width="stretch")
@@ -8377,8 +8626,8 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
             continue
         try:
             fecha_ciclo = datetime.strptime(str(rep.get("Fecha_Inicio")), "%d/%m/%Y").date()
-            desde = st.session_state.get("fecha_inicio_zda_global")
-            hasta = st.session_state.get("fecha_fin_zda_global")
+            desde = st.session_state.get("fecha_inicio_global")
+            hasta = st.session_state.get("fecha_fin_global")
             if (desde is not None and fecha_ciclo < desde) or (hasta is not None and fecha_ciclo > hasta):
                 continue
         except (TypeError, ValueError):
@@ -8403,7 +8652,7 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         etiqueta = (
             f"{rep.get('Jumbo') or '-'} · Ciclo {rep.get('Ciclo') or '-'} · "
             f"{rep.get('Fecha_Inicio') or '-'}{barrenos_txt} · "
-            f"{r.get('nombre_archivo') or Path(path_str).name} · DGT: {desviacion_txt} · Fuera: {fuera_txt} · No cubierto: {no_cubierto_txt}"
+            f"{_nombre_visible(r.get('nombre_archivo') or Path(path_str).name)} · DGT: {desviacion_txt} · Fuera: {fuera_txt} · No cubierto: {no_cubierto_txt}"
         )
         disponibles.append({
             "id": str(Path(path_str).resolve()), "etiqueta": etiqueta,
@@ -8414,7 +8663,7 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         })
 
     if not disponibles:
-        st.info("No hay ciclos ZDA que cumplan los filtros seleccionados.")
+        st.info("No hay ciclos que cumplan los filtros seleccionados.")
         return
 
     # Encabezado del selector. Los <style> son elementos vacíos que Streamlit separa con su hueco
@@ -8493,7 +8742,7 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
 
     try:
         stat = path.stat()
-        with st.spinner("Reconstruyendo geometría programada y real desde el ZDA..."):
+        with st.spinner("Reconstruyendo geometría programada y real..."):
             rr = _cargar_eficiencia_desde_path(
                 str(path), stat.st_mtime_ns, stat.st_size
             )
@@ -8506,16 +8755,16 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
     meta = rr.get("metadata") or {}
 
     if not isinstance(df, pd.DataFrame) or df.empty:
-        st.warning("El ZDA no contiene barrenos válidos para reconstruir la geometría.")
+        st.warning("El archivo no contiene barrenos válidos para reconstruir la geometría.")
         return
 
     # Conciliación documentada: todos los registros y sus coordenadas originales.
     aud = rr.get("auditoria_conteos") or {}
-    with st.expander("Auditoría ZDA · barrenos programados y ejecutados", expanded=False):
+    with st.expander("Auditoría · barrenos programados y ejecutados", expanded=False):
         if aud.get("conciliado"):
             st.success(
                 f"Conciliado: {aud['programados_extraidos']} programados y "
-                f"{aud['ejecutados_extraidos']} ejecutados recuperados del ZDA."
+                f"{aud['ejecutados_extraidos']} ejecutados recuperados del archivo."
             )
         else:
             st.warning("El número de registros recuperados no coincide con lo declarado en round.txt.")
@@ -8527,8 +8776,8 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
         st.download_button(
             "Descargar auditoría de coordenadas CSV",
             data=aud_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"Auditoria_ZDA_Ciclo_{meta.get('round', 'x')}.csv",
-            mime="text/csv", key=f"descargar_auditoria_zda_{meta.get('round', 'x')}",
+            file_name=f"Auditoria_Ciclo_{meta.get('round', 'x')}.csv",
+            mime="text/csv", key=f"descargar_auditoria_{meta.get('round', 'x')}",
         )
         st.caption("Los barrenos no perforados conservan su collar y fondo programados; "
                    "sus coordenadas ejecutadas permanecen vacías. Los extras no tienen plan.")
@@ -8877,7 +9126,7 @@ elif seccion_activa == "Resultados por archivo":
             st.dataframe(
                 pd.DataFrame([
                     {
-                        "Archivo": r.get("nombre_archivo"),
+                        "Archivo": _nombre_visible(r.get("nombre_archivo")),
                         "Error": r.get("error"),
                     }
                     for r in errores

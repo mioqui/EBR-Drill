@@ -142,6 +142,6 @@ def generar_reporte_pdf(mask_volume, masks_result, fig_3d, ciclo, logo_path=None
     _text(c,right_x+5,y-134,'Visualización exploratoria: geometría inferida de perforación.',8)
     _text(c,right_x+5,y-148,'No corresponde a sobrerotura medida después de la voladura.',8)
     c.setStrokeColor(HexColor(NAVY)); c.line(margin,29,W-margin,29)
-    _text(c,margin,15,'BNV - El Brocal  |  Análisis de perforación con datos ZDA',8)
+    _text(c,margin,15,'BNV - El Brocal  |  Análisis de perforación',8)
     c.setFont('Helvetica',8); c.drawRightString(W-margin,15,'Herramienta del sistema de gestión operativa')
     c.showPage(); c.save(); buf.seek(0); return buf.getvalue()

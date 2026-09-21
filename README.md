@@ -2,15 +2,15 @@
 
 **EBR Drill Analytics** is a Streamlit application for analyzing drilling round data from underground jumbo drilling equipment.
 
-The application processes one or multiple PDF and ZDA files, identifies drilling equipment and cycles, extracts and validates hole-level data, and provides consolidated analysis of drilling performance.
+The application processes one or multiple drilling report files (exported from the drilling rig's onboard system), identifies drilling equipment and cycles, extracts and validates hole-level data, and provides consolidated analysis of drilling performance.
 
-Key capabilities include drilling automation analysis by jumbo and boom, drilled-length analysis by hole type, cycle-time monitoring, drilling-round classification, spatial reconstruction of drilling patterns from ZDA data, and export of consolidated results to Excel.
+Key capabilities include drilling automation analysis by jumbo and boom, drilled-length analysis by hole type, cycle-time monitoring, drilling-round classification, spatial reconstruction of drilling patterns from the report file, and export of consolidated results to Excel.
 
 > This is an internal analytical tool intended to support operational analysis and review.
 
 ## Main features
 
-- Upload and process one or multiple PDF and ZDA files.
+- Upload and process one or multiple drilling report files.
 - Automatically identifies drilling equipment from serial numbers.
   - Known equipment aliases are mapped where configured.
   - New or unknown serial numbers are preserved as unique equipment instead of being grouped under a generic identifier.
@@ -41,12 +41,12 @@ Key capabilities include drilling automation analysis by jumbo and boom, drilled
 - Analyzes drilled length in Cut holes:
   - cycle-level median
   - global median by jumbo
-- Analyzes drilling-cycle timing from ZDA data:
+- Analyzes drilling-cycle timing from the report file:
   - real drilling start
   - real drilling end
   - drilling duration
   - average start time by jumbo and shift
-- Reconstructs a reference drilling pattern from ZDA spatial data.
+- Reconstructs a reference drilling pattern from the report file's spatial data.
   - The reference contour is adjusted according to the detected drilling section.
   - The plot automatically expands when holes extend beyond the standard display area.
 - Displays per-file and per-cycle validation details.
@@ -88,7 +88,7 @@ The operational month uses a 26–25 reporting period. For example:
 
 ### `Resumen_Reportes`
 
-One row per processed PDF or ZDA cycle, with cycle metadata, drilling totals, validation status, drilling-round classification, automation indicators, timing information, and reading-quality fields.
+One row per processed drilling report file, with cycle metadata, drilling totals, validation status, drilling-round classification, automation indicators, timing information, and reading-quality fields.
 
 ### `Resumen_Ciclos`
 
@@ -149,6 +149,6 @@ If a cycle displays `REVISAR`, the extracted data should not be considered valid
 
 ## Data handling
 
-When deployed on Streamlit Community Cloud, uploaded PDF and ZDA files are processed on the Streamlit-hosted server.
+When deployed on Streamlit Community Cloud, uploaded drilling report files are processed on the Streamlit-hosted server.
 
 Confirm that this is acceptable under your organization's information-security requirements before using operational, confidential, or sensitive files.

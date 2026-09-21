@@ -1266,7 +1266,7 @@ def generar_plano_zda_png(
     fig.text(
         0.5,
         0.012,
-        f"Plano reconstruido desde ZDA · Sección {etiqueta_seccion}",
+        f"Plano reconstruido · Sección {etiqueta_seccion}",
         ha="center",
         va="bottom",
         fontsize=6.7,
@@ -1298,10 +1298,10 @@ def procesar_zda(
         names = [n for n in zf.namelist() if not n.endswith("/")]
         round_name = next((n for n in names if re.match(r"^round-.*\.txt$", n, re.I) and not re.search(r"hole_comment", n, re.I)), None)
         if not round_name:
-            raise ValueError("El ZDA no contiene el archivo round-*.txt esperado.")
+            raise ValueError("El archivo no contiene el archivo round-*.txt esperado.")
         kv = _zda_kv(zf.read(round_name).decode("utf-8", errors="replace"))
         if not kv.get("rig") or not kv.get("round"):
-            raise ValueError("El round.txt no contiene rig/round; formato ZDA no reconocido.")
+            raise ValueError("El round.txt no contiene rig/round; formato no reconocido.")
 
         serie = _zda_base_serie(kv.get("rig"))
         operador_zda = _zda_operador_desde_tunnel_id(
@@ -1320,14 +1320,14 @@ def procesar_zda(
             "Operador": operador_zda,
             "Operador_ZDA_Raw": kv.get("tunnel_id") or None,
             "Fuente_Operador": (
-                "ZDA round.txt · tunnel_id / ID Auxiliar"
+                "round.txt · tunnel_id / ID Auxiliar"
                 if operador_zda else None
             ),
         }
 
         boom_name = next((n for n in names if re.search(r"-boom\.dat$", n, re.I)), None)
         if not boom_name:
-            raise ValueError("El ZDA no contiene boom.dat; no se puede reconstruir la tabla de barrenos.")
+            raise ValueError("El archivo no contiene boom.dat; no se puede reconstruir la tabla de barrenos.")
         detalle, boom_diag = _parse_zda_boom(zf.read(boom_name), nombre, metadata)
         if detalle.empty:
             raise ValueError("No se encontraron barrenos válidos en boom.dat.")
@@ -1373,7 +1373,7 @@ def procesar_zda(
             "Operador": operador_zda,
             "Operador_ZDA_Raw": kv.get("tunnel_id") or None,
             "Fuente_Operador": (
-                "ZDA round.txt · tunnel_id / ID Auxiliar"
+                "round.txt · tunnel_id / ID Auxiliar"
                 if operador_zda else None
             ),
             "Tabla_Curvas": kv.get("curve_table") or None, "PEG": float(kv["peg"]) if kv.get("peg") not in (None,"") else None,
@@ -1423,7 +1423,7 @@ def procesar_archivo(
 ) -> Dict:
     """Procesa exclusivamente archivos ZDA."""
     if path.suffix.lower() != ".zda":
-        raise ValueError("Formato no soportado. Use archivos .ZDA.")
+        raise ValueError("Formato no soportado.")
     return procesar_zda(
         path,
         nombre_archivo=nombre_archivo,
@@ -2112,7 +2112,7 @@ def process_zda_bytes(raw: bytes, filename: str = "archivo.zda") -> Dict:
         ), None)
 
         if boom_name is None:
-            raise ValueError("El ZDA no contiene boom.dat.")
+            raise ValueError("El archivo no contiene boom.dat.")
 
         meta = parse_round_txt(z.read(txt_name).decode("utf-8", "ignore")) if txt_name else {}
         holes = parse_boom_dat(z.read(boom_name))
