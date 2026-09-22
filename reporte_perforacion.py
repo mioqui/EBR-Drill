@@ -72,7 +72,7 @@ def generar_reporte_pdf(mask_volume, masks_result, fig_3d, ciclo, logo_path=None
     try:
         fig_png = fig_3d.to_image(format='png', width=1300, height=880, scale=1.5)
     except Exception as exc:
-        raise RuntimeError('No se pudo exportar la vista 3D. Instala kaleido (requirements.txt) y comprueba que Chrome/Chromium esté disponible para Kaleido 1.x.') from exc
+        raise RuntimeError('No se pudo exportar la vista 3D a imagen. Revisa que "kaleido" esté instalado (ver requirements.txt).') from exc
     from reportlab.lib.pagesizes import A3, landscape
     W,H=landscape(A3); buf=BytesIO(); c=canvas.Canvas(buf,pagesize=(W,H))
     margin=20; gap=8; usable=W-2*margin; panel=(usable-3*gap)/4

@@ -32,6 +32,7 @@ from procesador import (
     process_zda_bytes as procesar_eficiencia_zda,
     volumen_unico_ciclo,
     resumenes_eficiencia_lote,
+    resumenes_eficiencia_completos_lote,
     VERSION as PROCESADOR_EFICIENCIA_VERSION,
     CATALOGO_OPERADORES_ZDA,
     parse_round_dat_profile,
@@ -5459,6 +5460,7 @@ def grafico_cut_por_hora_turno(
     rocas_visibles,
     operadores_visibles,
     turno: str = "Día",
+    desde_cero: bool = False,
 ):
     """Longitud perforada en Cut vs. hora de inicio dentro del turno (Día 07:00-19:00 o
     Noche 19:00-07:00 del día siguiente).
@@ -5554,8 +5556,14 @@ def grafico_cut_por_hora_turno(
     # ve como una escalera dramática. Se fuerza un span mínimo de 0.5 m para evitarlo.
     y_min, y_max = float(df["Mediana"].min()), float(df["Mediana"].max())
     span = max(y_max - y_min, 0.5)
-    centro = (y_max + y_min) / 2
-    pad = span * 0.15
+    if desde_cero:
+        # A pedido: el eje arranca en 0 en vez de acercarse a los datos. El máximo conserva
+        # el mismo margen del 15% para que el punto más alto no quede pegado al borde.
+        rango_y = [0, max(y_max, span) * 1.15]
+    else:
+        centro = (y_max + y_min) / 2
+        pad = span * 0.15
+        rango_y = [centro - span / 2 - pad, centro + span / 2 + pad]
 
     fig.update_layout(**base_layout(
         460, margin=dict(l=70, r=30, t=30, b=55),
@@ -5567,7 +5575,7 @@ def grafico_cut_por_hora_turno(
         ),
         yaxis=dict(
             title="Mediana de longitud perforada Cut (m)", gridcolor="#e6edf5",
-            range=[centro - span / 2 - pad, centro + span / 2 + pad],
+            range=rango_y,
         ),
         hovermode="closest",
     ))
@@ -5577,9 +5585,15 @@ def grafico_cut_por_hora_turno(
 def _mostrar_cut_por_hora_turno(df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, turno):
     """Un bloque completo (subtítulo + gráfico + resumen en texto) para un turno."""
     horario = "07:00–19:00" if turno == "Día" else "19:00–07:00"
-    st.markdown(f"**Turno {turno.lower()}** · {horario}")
+    col_titulo, col_check = st.columns([3, 1.4], vertical_alignment="bottom")
+    col_titulo.markdown(f"**Turno {turno.lower()}** · {horario}")
+    desde_cero = col_check.checkbox(
+        "Eje Y desde 0", key=f"cut_hora_{turno}_desde_cero",
+        help="Restablece la escala del eje Y para que empiece en 0 m, en vez de acercarse al "
+             "rango real de los datos.",
+    )
     fig_hora, resumen_tendencia = grafico_cut_por_hora_turno(
-        df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, turno,
+        df_cut, sel_jumbos, sel_tipos, sel_rocas, sel_operadores, turno, desde_cero,
     )
     if fig_hora is not None:
         st.plotly_chart(fig_hora, width="stretch", config={"displaylogo": False})
@@ -8137,6 +8151,28 @@ def _resumenes_eficiencia_sesion(paths):
     return {p: cache.get(k) for p, k in claves.items()}
 
 
+def _resumenes_eficiencia_completos_sesion(paths):
+    """Como `_resumenes_eficiencia_sesion`, pero con el resumen completo (barrenos
+    programados/realizados y longitud incluidos) para exportar Eficiencia de Perforación.
+    Cachea por separado: no reemplaza el resumen liviano que ya usa el selector.
+    """
+    cache = st.session_state.setdefault("_eficiencia_resumenes_completos", {})
+    claves = {}
+    for p in paths:
+        try:
+            stt = Path(p).stat()
+            claves[str(p)] = (str(p), stt.st_mtime_ns, stt.st_size, PROCESADOR_EFICIENCIA_VERSION)
+        except OSError:
+            continue
+    faltan = [p for p, k in claves.items() if k not in cache]
+    if faltan:
+        with st.spinner(f"Calculando eficiencia de {len(faltan)} ciclo(s) para exportar..."):
+            nuevos = resumenes_eficiencia_completos_lote(faltan)
+        for p, resumen in nuevos.items():
+            cache[claves[p]] = resumen
+    return {p: cache.get(k) for p, k in claves.items()}
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def _cached_mask_3d(mask_sections):
     fig_3d = go.Figure()
@@ -8737,6 +8773,86 @@ def render_eficiencia_perforacion_section(resultados, sel_jumbos, sel_tipos, sel
             format_func=lambda identificador: por_id[identificador]["etiqueta"],
             key="eficiencia_ciclo_id",
         )
+
+    st.markdown("##### Exportar este indicador")
+    st.caption(
+        "Genera un Excel con Fecha, Equipo, Operador, Sección, barrenos programados/"
+        "realizados, longitud alcanzada, los volúmenes y las tres desviaciones (m³ y %) de "
+        "**todos los ciclos listados en el selector de arriba** (no solo el que tengas "
+        "abierto), para llevar un histórico de este indicador en tu propia base de datos."
+    )
+    if st.button(
+        f"Preparar Excel de Eficiencia ({len(disponibles)} ciclo(s))",
+        key="eficiencia_preparar_excel",
+    ):
+        rutas = [item["resultado"]["_source_path"] for item in disponibles]
+        completos = _resumenes_eficiencia_completos_sesion(rutas)
+
+        def _num(resumen, campo):
+            valor = resumen.get(campo)
+            try:
+                return round(float(valor), 2) if valor is not None and np.isfinite(valor) else None
+            except (TypeError, ValueError):
+                return None
+
+        filas = []
+        for item in disponibles:
+            r_item = item["resultado"]
+            rep_item = r_item.get("resumen_reporte") or {}
+            resumen = completos.get(str(r_item.get("_source_path"))) or {}
+            operador_item = rep_item.get("Operador_ZDA") or rep_item.get("Operador") or rep_item.get("Operario")
+            seccion_item = seccion_desde_plan_texto(rep_item.get("Plan_Perforacion")).replace(" ", "")
+            filas.append({
+                "Fecha": rep_item.get("Fecha_Inicio"),
+                "Ciclo": rep_item.get("Ciclo"),
+                "Equipo": rep_item.get("Jumbo"),
+                "Operador": operador_item if not asig.es_sin_operador(operador_item) else "Sin registrar",
+                "Sección": seccion_item if seccion_item not in ("", "-") else None,
+                "Barrenos programados": resumen.get("n_prog"),
+                "Barrenos realizados": resumen.get("n_real"),
+                "Longitud de perforación alcanzada (m)": _num(resumen, "depth_m"),
+                "Volumen programado (m³)": _num(resumen, "programado_m3"),
+                "Volumen real barrenado (m³)": _num(resumen, "real_m3"),
+                "Fuera del programado (m³)": _num(resumen, "outside_m3"),
+                "Fuera del programado (%)": _num(resumen, "fuera_pct"),
+                "No cubierto respecto al programado (m³)": _num(resumen, "not_covered_m3"),
+                "No cubierto respecto al programado (%)": _num(resumen, "no_cubierto_pct"),
+                "Desviación geométrica total - DGT (m³)": _num(resumen, "dgt_m3"),
+                "Desviación geométrica total - DGT (%)": _num(resumen, "dgt_pct"),
+                "Archivo": _nombre_visible(r_item.get("nombre_archivo")),
+            })
+
+        df_export = pd.DataFrame(filas)
+        buffer_ef = BytesIO()
+        with pd.ExcelWriter(buffer_ef, engine="openpyxl") as writer:
+            df_export.to_excel(writer, index=False, sheet_name="Eficiencia_Perforacion")
+        buffer_ef.seek(0)
+        wb_ef = load_workbook(buffer_ef)
+        ws_ef = wb_ef["Eficiencia_Perforacion"]
+        ws_ef.freeze_panes = "A2"
+        if ws_ef.max_row >= 1 and ws_ef.max_column >= 1:
+            ws_ef.auto_filter.ref = ws_ef.dimensions
+            fill_ef = PatternFill(fill_type="solid", fgColor="1F4E78")
+            font_ef = Font(color="FFFFFF", bold=True)
+            for celda in ws_ef[1]:
+                celda.fill = fill_ef
+                celda.font = font_ef
+                celda.alignment = Alignment(horizontal="center", vertical="center")
+        salida_ef = BytesIO()
+        wb_ef.save(salida_ef)
+        st.session_state["_eficiencia_excel_bytes"] = salida_ef.getvalue()
+        st.session_state["_eficiencia_excel_n"] = len(filas)
+
+    if st.session_state.get("_eficiencia_excel_bytes"):
+        st.download_button(
+            f"Descargar Excel de Eficiencia ({st.session_state.get('_eficiencia_excel_n', 0)} ciclo(s))",
+            data=st.session_state["_eficiencia_excel_bytes"],
+            file_name="Eficiencia_Perforacion.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="eficiencia_descargar_excel",
+        )
+
+    st.divider()
     rsel = por_id[seleccion_id]["resultado"]
     path = Path(rsel["_source_path"])
 

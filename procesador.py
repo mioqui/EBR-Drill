@@ -2196,6 +2196,59 @@ def resumen_eficiencia_desde_path(path_str: str) -> Optional[Dict]:
         return None          # ZDA defectuoso: el selector lo muestra como "No calculada"
 
 
+def resumen_completo_eficiencia_desde_path(path_str: str) -> Optional[Dict]:
+    """Como `resumen_eficiencia_desde_path`, pero conserva también barrenos programados,
+    barrenos realizados y la longitud de perforación alcanzada — los mismos campos que
+    muestran las tarjetas del ciclo seleccionado en Eficiencia de Perforación. No repite
+    el procesamiento: los tres campos ya están disponibles en el mismo `process_zda_file`.
+    Se usa para exportar el indicador completo (todos los ciclos del selector) a Excel.
+    """
+    try:
+        resultado = process_zda_file(path_str)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    holes = resultado.get("holes")
+    meta = resultado.get("metadata") or {}
+    m = resultado.get("mask_volumetry") or {}
+
+    n_prog = meta.get("planned_face_holes")
+    if n_prog is None and isinstance(holes, pd.DataFrame) and "Plan_X" in holes.columns:
+        n_prog = int(holes["Plan_X"].notna().sum())
+    n_real = meta.get("drilled_holes")
+    if n_real is None and isinstance(holes, pd.DataFrame):
+        n_real = int(len(holes))
+    depth_m = float(m["depth_m"]) if m.get("ok") and "depth_m" in m else None
+
+    salida = {"n_prog": n_prog, "n_real": n_real, "depth_m": depth_m}
+    unico = volumen_unico_ciclo(resultado)
+    if unico:
+        salida.update(unico)
+    return salida
+
+
+def _resumen_completo_worker(path_str: str):
+    return path_str, resumen_completo_eficiencia_desde_path(path_str)
+
+
+def resumenes_eficiencia_completos_lote(paths, max_workers: Optional[int] = None) -> Dict[str, Optional[Dict]]:
+    """Igual que `resumenes_eficiencia_lote`, pero con el resumen completo (ver arriba) para
+    poder exportar Eficiencia de Perforación de todos los ciclos a la vez."""
+    import os
+    lista = list(dict.fromkeys(str(p) for p in paths))
+    if max_workers is None:
+        max_workers = min(4, (os.cpu_count() or 1) - 1)
+    if max_workers >= 2 and len(lista) >= 4:
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as ex:
+                return dict(ex.map(_resumen_completo_worker, lista, chunksize=1))
+        except Exception:
+            pass
+    return dict(_resumen_completo_worker(p) for p in lista)
+
+
 def _resumen_worker(path_str: str):
     return path_str, resumen_eficiencia_desde_path(path_str)
 

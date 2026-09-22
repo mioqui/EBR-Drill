@@ -6,4 +6,10 @@ plotly>=5.20,<7
 openpyxl>=3.1,<4
 shapely>=2.0,<3
 reportlab>=4.0,<5
-kaleido>=1.0,<2
+# kaleido 1.x dejó de traer un Chromium propio: exporta imágenes llamando a un Chrome/Chromium
+# del sistema (vía "choreographer"), que no existe en el contenedor de Streamlit Community
+# Cloud por defecto. Ahí el botón "Generar reporte PDF" fallaba (aunque en un equipo local con
+# Chrome instalado, como en VS Code, sí funcionaba). kaleido 0.2.1 es la última versión que trae
+# su propio Chromium embebido (bundled), así que exporta sin depender de nada externo. Probado:
+# con plotly dentro del rango de abajo, kaleido 0.2.1 exporta la vista 3D sin Chrome del sistema.
+kaleido==0.2.1
